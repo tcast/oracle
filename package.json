@@ -10,7 +10,7 @@
     "dev:backend": "nodemon backend/src/app.js",
     "dev:frontend": "cd frontend && vite",
     "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
-    "build": "cd frontend && npm install && vite build",
+    "build": "cd frontend && npm install && npx vite build",
     "preview": "vite preview",
     "create-user": "node backend/scripts/createUser.js",
     "start": "node backend/src/app.js",
