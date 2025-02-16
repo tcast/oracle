@@ -9,7 +9,10 @@ console.log('DATABASE_URL:', process.env.DATABASE_URL);
 const poolConfig = process.env.DATABASE_URL
   ? {
       connectionString: process.env.DATABASE_URL,
-      ssl: { require: true, rejectUnauthorized: false }
+      ssl: { 
+        require: true, 
+        rejectUnauthorized: false 
+      }
     }
   : {
       user: process.env.DB_USER,
@@ -21,4 +24,15 @@ const poolConfig = process.env.DATABASE_URL
     };
 
 const pool = new Pool(poolConfig);
-module.exports = pool;
+
+// Export a function to get a new client
+const getClient = async () => {
+  const client = await pool.connect();
+  return client;
+};
+
+module.exports = {
+  pool,
+  getClient,
+  query: (text, params) => pool.query(text, params)
+};
