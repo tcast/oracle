@@ -26,16 +26,18 @@ const port = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Database configuration
-const dbConfig = {
-  user: process.env.DB_USER,
-  host: process.env.DB_HOST,
-  database: process.env.DB_NAME,
-  password: process.env.DB_PASSWORD,
-  port: process.env.DB_PORT,
-};
+// Import database pool
+const pool = require('./db');
 
-const pool = new Pool(dbConfig);
+// Test database connection
+pool.query('SELECT NOW()', (err, res) => {
+  if (err) {
+    console.error('Database connection error:', err);
+  } else {
+    console.log('Database connected successfully');
+  }
+});
+
 
 // Test database connection
 pool.query('SELECT NOW()', (err, res) => {

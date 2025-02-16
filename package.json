@@ -7,6 +7,7 @@
     "node": "18.x"
   },
   "scripts": {
+    
     "dev:backend": "nodemon backend/src/app.js",
     "dev:frontend": "cd frontend && vite",
     "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
