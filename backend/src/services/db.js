@@ -4,16 +4,12 @@ if (process.env.NODE_ENV !== 'production') {
   require('dotenv').config();
 }
 
-if (process.env.NODE_ENV === 'production' && !process.env.DATABASE_URL) {
-  throw new Error('DATABASE_URL must be set in production!');
-}
-
 console.log('DATABASE_URL:', process.env.DATABASE_URL);
 
 const poolConfig = process.env.DATABASE_URL
   ? {
       connectionString: process.env.DATABASE_URL,
-      ssl: { rejectUnauthorized: false }
+      ssl: { require: true, rejectUnauthorized: false }
     }
   : {
       user: process.env.DB_USER,
