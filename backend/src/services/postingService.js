@@ -2,6 +2,7 @@ const pool = require('./db');
 const openai = require('./openai');
 const seleniumService = require('./seleniumService');
 
+
 class PostingService {
   async createSimulatedPost(campaignId) {
     try {

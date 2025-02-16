@@ -8,7 +8,7 @@
   },
   "scripts": {
     "dev:backend": "nodemon backend/src/app.js",
-    "dev:frontend": "vite",
+    "dev:frontend": "cd frontend && vite",
     "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
     "build": "cd frontend && npm install && vite build",
     "preview": "vite preview",
