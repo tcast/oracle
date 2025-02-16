@@ -10,8 +10,8 @@ const fs = require('fs').promises;
 const postsRouter = require('./routes/posts');
 
 // Service imports
-const taskQueue = require('./services/taskQueue');
 const postingService = require('./services/postingService');
+const taskQueue = require('./services/taskQueue');
 const commentingService = require('./services/commentingService');
 const seleniumService = require('./services/seleniumService');
 const subredditService = require('./services/subredditService');
@@ -26,27 +26,44 @@ const port = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Import database pool
-const pool = require('./db');
+// Database configuration
+const dbConfig = process.env.DATABASE_URL
+  ? {
+      connectionString: process.env.DATABASE_URL,
+      ssl: { 
+        require: true, 
+        rejectUnauthorized: false 
+      }
+    }
+  : {
+      user: process.env.DB_USER,
+      host: process.env.DB_HOST,
+      database: process.env.DB_NAME,
+      password: process.env.DB_PASSWORD,
+      port: process.env.DB_PORT,
+    };
+
+const pool = new Pool(dbConfig);
 
 // Test database connection
-pool.query('SELECT NOW()', (err, res) => {
-  if (err) {
-    console.error('Database connection error:', err);
-  } else {
-    console.log('Database connected successfully');
-  }
-});
-
-
-// Test database connection
-pool.query('SELECT NOW()', (err, res) => {
-  if (err) {
-    console.error('Database connection error:', err);
-  } else {
-    console.log('Database connected successfully');
-  }
-});
+if (process.env.NODE_ENV === 'production') {
+  pool.query('SELECT NOW()', (err, res) => {
+    if (err) {
+      console.error('Production database connection error:', err);
+      process.exit(1); // Exit if we can't connect in production
+    } else {
+      console.log('Production database connected successfully');
+    }
+  });
+} else {
+  pool.query('SELECT NOW()', (err, res) => {
+    if (err) {
+      console.error('Local database connection error:', err);
+    } else {
+      console.log('Local database connected successfully');
+    }
+  });
+}
 
 // OpenAI configuration
 const configuration = new Configuration({
