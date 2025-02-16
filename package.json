@@ -1,0 +1,34 @@
+{
+  "name": "oracle",
+  "version": "1.0.0",
+  "description": "",
+  "main": "backend/src/app.js",
+  "engines": {
+    "node": "18.x"
+  },
+  "scripts": {
+    "dev:backend": "nodemon backend/src/app.js",
+    "dev:frontend": "vite",
+    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "build": "cd frontend && npm install && vite build",
+    "preview": "vite preview",
+    "create-user": "node backend/scripts/createUser.js",
+    "start": "node backend/src/app.js",
+    "heroku-postbuild": "npm install && npm run build"
+  },
+  "dependencies": {
+    "bcrypt": "^5.1.1",
+    "chromedriver": "^133.0.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^1.4.5-lts.1",
+    "openai": "^3.3.0",
+    "pg": "^8.13.3",
+    "pg-pool": "^3.6.1",
+    "pg-types": "^4.0.1",
+    "rxjs": "^7.8.1",
+    "selenium-webdriver": "^4.28.1"
+  }
+}
