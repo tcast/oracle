@@ -56,8 +56,8 @@ class CommentingService {
     try {
       console.log('Creating simulated comment for post:', post);
 
-      if (!post || !post.content) {
-        throw new Error('Invalid post data - missing content');
+      if (!post || !post.id) {
+        throw new Error('Invalid post data - missing post ID');
       }
 
       // Get a random account for commenting
@@ -71,12 +71,42 @@ class CommentingService {
       const content = await this.generateComment(post, campaign);
       console.log('Generated comment content:', content);
 
-      // Rest of the method...
+      // Insert the comment into the database
+      const query = `
+        INSERT INTO comments 
+        (post_id, social_account_id, content, status, sentiment_score, engagement_metrics, posted_at)
+        VALUES ($1, $2, $3, 'simulated', $4, $5, NOW())
+        RETURNING *`;
+
+      const values = [
+        post.id,                    // Use post.id here
+        account.id,
+        content,
+        Math.random() * 2 - 1,     // Random sentiment between -1 and 1
+        JSON.stringify({
+          likes: Math.floor(Math.random() * 50),
+          replies: Math.floor(Math.random() * 5)
+        })
+      ];
+
+      console.log('Executing comment insert query:', query);
+      console.log('With values:', values);
+
+      const result = await pool.query(query, values);
+      
+      if (!result.rows[0]) {
+        throw new Error('Failed to insert comment into database');
+      }
+
+      console.log('Successfully created comment:', result.rows[0]);
+      return result.rows[0];
+
     } catch (error) {
       console.error('Error creating simulated comment:', error);
       throw error;
     }
   }
+  
 
   generateCommentPersona(campaign, post) {
     if (!post || !post.content) {
