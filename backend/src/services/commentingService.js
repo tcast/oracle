@@ -187,64 +187,80 @@ class CommentingService {
     }
   }
 
-  async generateContent(type, campaign, context = {}) {
-    let prompt = `Create a ${type} for the following campaign:
-    
-Campaign Name: ${campaign.name}
-Goal: ${campaign.goal}
-Target Sentiment: ${campaign.target_sentiment}
-
-The content should:
-1. Be authentic and engaging
-2. Match the target sentiment
-3. Align with the campaign goal
-4. Feel natural for Reddit
-5. Encourage further discussion
-`;
-
-    if (type === 'reply') {
-      if (context.isAuthorReply) {
-        prompt += `\nYou are the original post author replying to this comment: "${context.commentContent}"
-Create a response that:
-1. Acknowledges you're the OP (original poster)
-2. Engages meaningfully with the commenter's points
-3. Maintains authenticity and furthers discussion`;
-      } else {
-        prompt += `\nRespond to this comment: "${context.commentContent}"`;
-      }
-    } else if (context.postContent) {
-      prompt += `\nRespond to this post content: "${context.postContent}"`;
-    }
-
+  async generateComment(post, campaign) {
     try {
+      // Create dynamic persona based on campaign and post context
+      const persona = this.generateCommentPersona(campaign, post);
+      const prompt = this.buildCommentPrompt(post, campaign);
+
+      console.log('Using comment persona:', persona);
+      console.log('Using comment prompt:', prompt);
+
       const completion = await openai.createChatCompletion({
         model: "gpt-4",
         messages: [
           {
             role: "system",
-            content: "You are an expert Reddit commenter who understands Reddit's culture and can create engaging, authentic responses that encourage discussion."
+            content: persona
           },
           {
             role: "user",
             content: prompt
           }
         ],
-        temperature: 0.7
+        temperature: 1.0,        // Maximum creativity
+        presence_penalty: 1.0,   // Strongly encourage unique content
+        frequency_penalty: 1.0,  // Strongly discourage repetitive patterns
+        top_p: 0.9              // Allow more diverse word choices
       });
 
-      return completion.data.choices[0].message.content.trim();
+      const comment = completion.data?.choices?.[0]?.message?.content.trim();
+      if (!comment) throw new Error('Failed to generate comment');
+
+      console.log('Generated comment:', comment);
+      return comment;
     } catch (error) {
-      console.error('Error generating content:', error);
-      if (type === 'reply' && context.isAuthorReply) {
-        return "OP here - thanks for your thoughtful comment! You raise some excellent points. I'd love to hear more about your perspective on this.";
-      } else if (type === 'reply') {
-        return "That's a really interesting point! I've been thinking about this a lot too. What made you come to that conclusion?";
-      } else {
-        return "This really resonates with me. Has anyone else had similar experiences? I'd love to hear your stories.";
-      }
+      console.error('Error generating comment:', error);
+      throw error;
     }
   }
 
+  generateCommentPersona(campaign, post) {
+    // Analyze the post content to understand context
+    const postContent = post.content.toLowerCase();
+    const campaignGoal = campaign.goal;
+
+    return `You are someone engaging naturally with this post about ${campaignGoal}.
+
+Your role: A genuine participant in this discussion who has relevant experience to share.
+Your style: Write conversationally, as if responding to a colleague or peer.
+Your approach: 
+- Vary your comment style (sometimes ask questions, sometimes share experiences, sometimes offer insights)
+- React to specific points in the post
+- Add value to the discussion
+- Stay authentic and avoid generic responses
+- Match the tone of the community
+
+Remember: Each comment should feel unique and natural, as if coming from a different real person.`;
+  }
+
+  buildCommentPrompt(post, campaign) {
+    return `Read this post and create a natural, engaging comment that adds value to the discussion:
+
+POST:
+${post.content}
+
+Your comment should:
+1. Reference specific points from the post
+2. Share relevant personal experience
+3. Encourage further discussion
+4. Feel like a genuine response
+
+Campaign context: ${campaign.goal}
+
+Create a unique comment that naturally fits this conversation.`;
+  }
+  
   async getRecentPosts(campaignId) {
     const result = await pool.query(
       `SELECT * FROM posts 
