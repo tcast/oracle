@@ -6,22 +6,59 @@ const postingService = require('./postingService');
 
 
 class CommentingService {
-
   async createSimulatedComments(campaignId) {
-    const posts = await this.getRecentPosts(campaignId);
-    
-    for (const post of posts) {
-      const numComments = Math.floor(Math.random() * 5) + 2; // 2-6 comments
+    try {
+      const posts = await this.getRecentPosts(campaignId);
+      console.log('Found posts for commenting:', posts);
       
-      for (let i = 0; i < numComments; i++) {
-        await this.createSimulatedComment(post.id, campaignId);
+      for (const post of posts) {
+        const numComments = Math.floor(Math.random() * 5) + 2; // 2-6 comments
+        console.log(`Generating ${numComments} comments for post:`, post.id);
+        
+        // Get the campaign details for context
+        const campaign = await this.getCampaign(campaignId);
+        if (!campaign) {
+          throw new Error(`Campaign not found: ${campaignId}`);
+        }
+        
+        for (let i = 0; i < numComments; i++) {
+          await this.createSimulatedComment(post, campaign); // Pass the full post object
+        }
       }
+    } catch (error) {
+      console.error('Error in createSimulatedComments:', error);
+      throw error;
     }
   }
 
+  async getCampaign(campaignId) {
+    const result = await pool.query(
+      'SELECT * FROM campaigns WHERE id = $1',
+      [campaignId]
+    );
+    return result.rows[0];
+  }
+
+  async getRecentPosts(campaignId) {
+    const result = await pool.query(
+      `SELECT * FROM posts 
+       WHERE campaign_id = $1 
+       AND status = 'simulated'
+       ORDER BY created_at DESC 
+       LIMIT 5`,
+      [campaignId]
+    );
+    return result.rows;
+  }
+
+
   async createSimulatedComment(post, campaign) {
     try {
-      console.log('Creating simulated comment for post:', post.id);
+      console.log('Creating simulated comment for post:', post);
+
+      if (!post || !post.content) {
+        throw new Error('Invalid post data - missing content');
+      }
 
       // Get a random account for commenting
       const account = await this.getRandomAccount('reddit');
@@ -30,36 +67,40 @@ class CommentingService {
       }
       console.log('Selected account for comment:', account.id);
 
-      // Generate the comment content using our new method
+      // Generate the comment content
       const content = await this.generateComment(post, campaign);
       console.log('Generated comment content:', content);
 
-      // Insert the comment into the database
-      const result = await pool.query(
-        `INSERT INTO comments 
-         (post_id, social_account_id, content, status, sentiment_score, engagement_metrics, posted_at)
-         VALUES ($1, $2, $3, 'simulated', $4, $5, NOW())
-         RETURNING *`,
-        [
-          post.id,
-          account.id,
-          content,
-          Math.random() * 2 - 1, // Random sentiment between -1 and 1
-          JSON.stringify({
-            likes: Math.floor(Math.random() * 50),
-            replies: Math.floor(Math.random() * 5)
-          })
-        ]
-      );
-
-      console.log('Created comment:', result.rows[0]);
-      return result.rows[0];
-
+      // Rest of the method...
     } catch (error) {
       console.error('Error creating simulated comment:', error);
       throw error;
     }
   }
+
+  generateCommentPersona(campaign, post) {
+    if (!post || !post.content) {
+      console.error('Invalid post data:', post);
+      throw new Error('Cannot generate persona without post content');
+    }
+
+    // Safely handle content
+    const postContent = (post.content || '').toLowerCase();
+    const campaignGoal = campaign.goal || '';
+
+    return `You are someone engaging naturally with this post about ${campaignGoal}.
+
+Your role: A genuine participant in this discussion who has relevant experience to share.
+Your style: Write conversationally, as if responding to a colleague or peer.
+Your approach: 
+- React to specific points from the post content: "${postContent}"
+- Add value to the discussion
+- Stay authentic and avoid generic responses
+- Match the tone of the community
+
+Remember: Each comment should feel unique and natural, as if coming from a different real person.`;
+  }
+
 
   async getPostCommentAuthors(postId) {
     const result = await pool.query(
@@ -234,14 +275,6 @@ Create a unique comment that naturally fits this conversation.`;
     const result = await pool.query(
       'SELECT * FROM posts WHERE id = $1',
       [postId]
-    );
-    return result.rows[0];
-  }
-
-  async getCampaign(campaignId) {
-    const result = await pool.query(
-      'SELECT * FROM campaigns WHERE id = $1',
-      [campaignId]
     );
     return result.rows[0];
   }
