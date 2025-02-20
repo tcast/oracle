@@ -6,34 +6,30 @@ class SubredditService {
     try {
       console.log('Generating subreddit suggestions for campaign:', campaignId, 'with goal:', goal);
 
-      const prompt = `Based on this campaign goal: "${goal}"
-                   Suggest as many relevant subreddits as needed where this content would be well-received.
-                   For each subreddit, provide:
-                   1. The exact subreddit name (without r/)
-                   2. A detailed reason why this community would be interested
-                   3. Estimated subscriber count
-                   4. Key content guidelines to follow
-                   
-                   Format your response as a JSON object with this exact structure:
-                   {
-                     "subreddits": [
-                       {
-                         "subreddit_name": "example",
-                         "reason": "Detailed explanation...",
-                         "subscriber_count": 50000,
-                         "content_guidelines": ["Guideline 1", "Guideline 2"]
-                       }
-                     ]
-                   }`;
+      // Check for API key first
+      if (!process.env.OPENAI_API_KEY) {
+        console.error('OpenAI API key is not configured in environment variables');
+        throw new Error('OpenAI API key is not configured');
+      }
 
-      console.log('Sending prompt to OpenAI:', prompt);
+      // Log that we have an API key (don't log the actual key)
+      console.log('OpenAI API key is configured');
 
-      const completion = await openai.createChatCompletion({
+      const prompt = `Based on this campaign goal: "${goal}"...`; // rest of your prompt
+
+      // Create a new configuration for each request to ensure we have the latest API key
+      const configuration = new Configuration({
+        apiKey: process.env.OPENAI_API_KEY,
+      });
+      const openaiClient = new OpenAIApi(configuration);
+
+      console.log('Making OpenAI API request...');
+      const completion = await openaiClient.createChatCompletion({
         model: "gpt-4",
         messages: [
           {
             role: "system",
-            content: "You are a Reddit expert who understands each subreddit's culture, rules, and engagement patterns. You analyze campaign goals and suggest the most relevant subreddits while being mindful of Reddit's promotion rules."
+            content: "You are a Reddit expert who understands each subreddit's culture, rules, and engagement patterns..."
           },
           {
             role: "user",
