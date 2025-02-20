@@ -8,6 +8,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs').promises;
 const postsRouter = require('./routes/posts');
+const subredditsRouter = require('./routes/subreddits');
 
 // Service imports
 const postingService = require('./services/postingService');
@@ -339,54 +340,6 @@ app.get('/api/campaigns/:id/simulation/stats', async (req, res) => {
   }
 });
 
-// Subreddit Routes
-app.get('/api/campaigns/:id/subreddits', async (req, res) => {
-  try {
-    const suggestions = await subredditService.getSubredditsForCampaign(req.params.id);
-    res.json(suggestions);
-  } catch (err) {
-    console.error('Error fetching subreddits:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/campaigns/:id/generate-subreddits', async (req, res) => {
-  try {
-    const campaignId = req.params.id;
-    const campaign = await pool.query(
-      'SELECT * FROM campaigns WHERE id = $1',
-      [campaignId]
-    );
-
-    if (campaign.rows.length === 0) {
-      throw new Error('Campaign not found');
-    }
-
-    const suggestions = await subredditService.suggestSubreddits(
-      campaignId,
-      campaign.rows[0].goal
-    );
-
-    res.json(suggestions);
-  } catch (err) {
-    console.error('Error generating subreddits:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.patch('/api/subreddit-suggestions/:id', async (req, res) => {
-  try {
-    const suggestion = await subredditService.updateSubredditStatus(
-      req.params.id,
-      req.body.status
-    );
-    res.json(suggestion);
-  } catch (err) {
-    console.error('Error updating subreddit status:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // Add this with the other analytics routes
 app.get('/api/campaigns/:id/analytics', async (req, res) => {
   try {
@@ -527,6 +480,7 @@ app.post('/api/auth/logout', async (req, res) => {
 // Serve uploaded files
 app.use('/uploads', express.static('uploads'));
 app.use('/api', postsRouter);
+app.use('/api', subredditsRouter);
 
 if (process.env.NODE_ENV === 'production') {
   // Serve static files from the frontend build directory

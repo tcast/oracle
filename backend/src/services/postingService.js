@@ -20,59 +20,40 @@ class PostingService {
       
       const campaign = await this.getCampaign(campaignId);
       if (!campaign) {
-        console.error('Campaign not found:', campaignId);
-        return;
+        throw new Error('Campaign not found');
       }
-      console.log('Found campaign:', campaign);
 
-      // Get an approved subreddit for the campaign
       const subreddit = await this.getRandomApprovedSubreddit(campaignId);
       if (!subreddit) {
-        console.error('No approved subreddits found for campaign:', campaignId);
-        return;
+        throw new Error('No approved subreddits found for campaign');
       }
       console.log('Selected subreddit:', subreddit);
 
       const content = await this.generateContent('post', campaign, {
         platform: 'reddit',
-        subreddit: subreddit.subreddit_name,
-        contentRules: subreddit.content_rules
+        subreddit: subreddit.subreddit_name
       });
-      console.log('Generated content:', content);
+      console.log('Final content to be posted:', content);
 
       const account = await this.getRandomAccount('reddit');
       if (!account) {
-        console.error('No available Reddit account found');
-        return;
+        throw new Error('No available Reddit account found');
       }
-      console.log('Selected account:', account.id);
 
-      // Insert with explicit 'simulated' status and use subreddit column
       const query = `
         INSERT INTO posts 
-        (campaign_id, social_account_id, subreddit, content, status, 
-         posted_at, sentiment_score, engagement_metrics)
-        VALUES ($1, $2, $3, $4, 'simulated', NOW(), $5, $6)
+        (campaign_id, social_account_id, subreddit, content, status, posted_at)
+        VALUES ($1, $2, $3, $4, 'simulated', NOW())
         RETURNING *`;
       
-      const values = [
-        campaignId,
-        account.id,
-        subreddit.subreddit_name,
-        content,
-        Math.random() * 2 - 1, // sentiment score between -1 and 1
-        JSON.stringify({
-          upvotes: Math.floor(Math.random() * 100) + 10,
-          shares: Math.floor(Math.random() * 20)
-        })
-      ];
-
-      console.log('Executing query:', query);
-      console.log('With values:', values);
-
+      const values = [campaignId, account.id, subreddit.subreddit_name, content];
+      
+      console.log('Executing post creation query with values:', values);
       const result = await pool.query(query, values);
       console.log('Created post:', result.rows[0]);
+      
       return result.rows[0];
+
     } catch (error) {
       console.error('Error creating simulated post:', error);
       throw error;
@@ -119,22 +100,51 @@ class PostingService {
 
   async getRandomApprovedSubreddit(campaignId) {
     try {
-      const query = `
-        SELECT rs.* 
-        FROM reddit_subreddits rs
-        JOIN campaign_subreddits cs ON cs.subreddit_id = rs.id
-        JOIN campaign_networks cn ON cs.campaign_network_id = cn.id
-        WHERE cn.campaign_id = $1 
-        AND cs.status = 'approved'
-        ORDER BY RANDOM()
-        LIMIT 1`;
+      console.log('Getting random approved subreddit for campaign:', campaignId);
       
-      console.log('Executing subreddit query:', query);
-      console.log('For campaign:', campaignId);
-      
-      const result = await pool.query(query, [campaignId]);
-      console.log('Subreddit query result:', result.rows);
-      return result.rows[0];
+      // First try the subreddit_suggestions table
+      const suggestionsResult = await pool.query(
+        `SELECT subreddit_name, reason
+         FROM subreddit_suggestions
+         WHERE campaign_id = $1
+         AND status = 'approved'
+         ORDER BY RANDOM()
+         LIMIT 1`,
+        [campaignId]
+      );
+
+      // If we find an approved suggestion, use it
+      if (suggestionsResult.rows.length > 0) {
+        console.log('Found approved subreddit from suggestions:', suggestionsResult.rows[0]);
+        return {
+          subreddit_name: suggestionsResult.rows[0].subreddit_name,
+          content_rules: [], // Add any rules if needed
+        };
+      }
+
+      // Fallback to the original campaign_subreddits table
+      const originalResult = await pool.query(
+        `SELECT rs.*
+         FROM reddit_subreddits rs
+         JOIN campaign_subreddits cs ON cs.subreddit_id = rs.id
+         JOIN campaign_networks cn ON cs.campaign_network_id = cn.id
+         WHERE cn.campaign_id = $1
+         AND cs.status = 'approved'
+         ORDER BY RANDOM()
+         LIMIT 1`,
+        [campaignId]
+      );
+
+      if (originalResult.rows.length === 0) {
+        throw new Error('No approved subreddits found for this campaign');
+      }
+
+      console.log('Found approved subreddit from original table:', originalResult.rows[0]);
+      return {
+        subreddit_name: originalResult.rows[0].name,
+        content_rules: originalResult.rows[0].content_rules || [],
+      };
+
     } catch (error) {
       console.error('Error getting random subreddit:', error);
       throw error;
@@ -177,131 +187,88 @@ class PostingService {
       throw error;
     }
   }
-  generateFallbackContent() {
-    // Generate a unique fallback message with timestamp and random elements
-    const topics = [
-      'resilience', 'healing', 'personal growth', 'memoir writing',
-      'life experiences', 'overcoming challenges', 'self-discovery'
-    ];
-    const questions = [
-      'What memoirs have impacted you the most?',
-      'How do you process difficult experiences?',
-      'What helps you stay resilient?',
-      'Have you ever considered writing your story?',
-      'What life experiences shaped who you are today?'
-    ];
-    
-    const randomTopic = topics[Math.floor(Math.random() * topics.length)];
-    const randomQuestion = questions[Math.floor(Math.random() * questions.length)];
-    const uniqueId = Date.now().toString(36) + Math.random().toString(36).substr(2);
-    
-    return `Exploring ${randomTopic} through the lens of personal experience. ${randomQuestion} [${uniqueId}]`;
-  }
 
   async generateContent(type, campaign, context = {}) {
     try {
       console.log('Generating content with context:', context);
       
+      // Create dynamic persona and prompt
+      const persona = this.generatePersona(campaign);
       const prompt = this.buildPrompt(type, campaign, context);
-      console.log('Generated prompt:', prompt);
+      
+      console.log('Using persona:', persona);
+      console.log('Using prompt:', prompt);
       
       if (!process.env.OPENAI_API_KEY) {
-        console.error('OPENAI_API_KEY not found in environment variables');
-        return this.generateFallbackContent();
+        throw new Error('OpenAI API key not configured');
       }
 
-      let content;
-      let attempts = 0;
-      const maxAttempts = 3;
+      const completion = await openai.createChatCompletion({
+        model: "gpt-4",
+        messages: [
+          {
+            role: "system",
+            content: persona
+          },
+          {
+            role: "user",
+            content: prompt
+          }
+        ],
+        temperature: 1.0,
+        presence_penalty: 1.0,
+        frequency_penalty: 1.0,
+        top_p: 0.9
+      });
 
-      // Keep trying until we get unique content or hit max attempts
-      do {
-        console.log('Attempting OpenAI API call... Attempt:', attempts + 1);
-        const completion = await openai.createChatCompletion({
-          model: "gpt-4",
-          messages: [
-            {
-              role: "system",
-              content: context.platform === 'reddit' 
-                ? "You are an expert Reddit user who understands Reddit's culture and how to create engaging, authentic posts that follow each subreddit's rules and conventions. You never use hashtags or emojis in Reddit posts. Each response must be unique and different from previous responses."
-                : "You are an expert social media content creator who understands each platform's unique style and engagement patterns. Each response must be unique and different from previous responses."
-            },
-            {
-              role: "user",
-              content: prompt + (attempts > 0 ? "\n\nPlease generate a completely different variation from previous attempts." : "")
-            }
-          ],
-          // Increase temperature slightly for more variation
-          temperature: 0.8 + (attempts * 0.1)
-        });
-
-        content = completion.data?.choices?.[0]?.message?.content.trim();
-        
-        // Check if this content is unique
-        if (content && !this.recentContentCache.has(content)) {
-          this.recentContentCache.add(content);
-          break;
-        }
-
-        attempts++;
-      } while (attempts < maxAttempts);
-
-      // If we couldn't generate unique content after max attempts, generate a unique fallback
-      if (!content || this.recentContentCache.has(content)) {
-        content = this.generateFallbackContent();
-        this.recentContentCache.add(content);
+      let content = completion.data?.choices?.[0]?.message?.content.trim();
+      
+      if (!content) {
+        throw new Error('Failed to generate content');
       }
 
-      console.log('Successfully generated unique content:', content);
+      console.log('Generated content:', content);
       return content;
 
     } catch (error) {
       console.error('Error in generateContent:', error);
-      if (error.response) {
-        console.error('OpenAI API error response:', error.response.data);
-      }
-      return this.generateFallbackContent();
+      throw error;
     }
   }
-
 
   buildPrompt(type, campaign, context) {
-    let prompt = `Create a ${type} for the following campaign:
-    
-Campaign Name: ${campaign.name}
-Goal: ${campaign.goal}
-Target Sentiment: ${campaign.target_sentiment}
-`;
-
     if (context.platform === 'reddit') {
-      prompt += `\nSubreddit: r/${context.subreddit}
+      return `Create a ${type} for r/${context.subreddit} based on this goal: ${campaign.goal}
 
-The post should:
-1. Follow Reddit's style and format (no hashtags, no emojis)
-2. Match the subreddit's content rules and culture
-3. Feel authentic and engaging
-4. Encourage discussion
-5. Include a clear call-to-action (like asking for thoughts/experiences)`;
-
-      if (context.contentRules) {
-        prompt += `\n\nSubreddit rules to follow:\n${context.contentRules.map(rule => `- ${rule}`).join('\n')}`;
-      }
-    } else {
-      prompt += `\nThe content should:
-1. Be authentic and engaging
-2. Match the target sentiment
-3. Align with the campaign goal
-4. Feel natural for the platform
-5. Encourage discussion and interaction`;
+Share your experience in a way that naturally fits the subreddit's community.
+Focus on providing value and encouraging discussion.`;
     }
 
-    if (context.postContent) {
-      prompt += `\n\nRespond to this post content: "${context.postContent}"`;
-    }
-
-    return prompt;
+    return `Create a ${type} that shares your experience related to: ${campaign.goal}`;
   }
 
+  
+  generatePersona(campaign) {
+    // Analyze the campaign goal to understand the context
+    const goal = campaign.goal;
+    
+    // Extract key elements from the goal
+    const words = goal.toLowerCase().split(' ');
+    const actionWords = words.filter(word => word.endsWith('ing') || word.includes('promote') || word.includes('recommend'));
+    const subjects = words.filter(word => word.length > 3 && !actionWords.includes(word));
+    
+    // Create a dynamic persona based on the goal's context
+    return `You are someone who ${actionWords[0] || 'uses'} ${subjects[0] || 'this'} regularly.
+
+Your perspective: ${goal}
+
+Write as if you're naturally sharing your genuine experience with others who might benefit from it. 
+Each response should feel unique - vary your tone, style, and structure organically.
+Draw from the context of the campaign goal but express it through your own authentic voice.
+
+Remember: You're a real person having a real conversation, not following a script.`;
+  }
+ 
   async getCampaign(campaignId) {
     try {
       const query = 'SELECT * FROM campaigns WHERE id = $1';

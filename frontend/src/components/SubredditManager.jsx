@@ -32,17 +32,33 @@ const SubredditManager = ({ campaignId }) => {
   const generateSuggestions = async () => {
     try {
       setLoading(true);
+      setError(null);
+      
+      console.log('Generating suggestions for campaign:', campaignId);
+      
       const response = await fetch(`/api/campaigns/${campaignId}/generate-subreddits`, {
-        method: 'POST'
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        }
       });
+      
       if (!response.ok) {
-        throw new Error('Failed to generate suggestions');
+        const errorData = await response.json();
+        console.error('Server error details:', errorData);
+        throw new Error(errorData.error || `Server error: ${response.status}`);
       }
+      
       const data = await response.json();
-      setSuggestions(Array.isArray(data) ? data : []);
+      if (!Array.isArray(data)) {
+        console.error('Invalid response format:', data);
+        throw new Error('Invalid response format from server');
+      }
+      
+      setSuggestions(data);
     } catch (err) {
       console.error('Error generating suggestions:', err);
-      setError('Failed to generate suggestions');
+      setError(err.message || 'Failed to generate suggestions');
     } finally {
       setLoading(false);
     }
@@ -50,25 +66,31 @@ const SubredditManager = ({ campaignId }) => {
 
   const updateSuggestionStatus = async (suggestionId, status) => {
     try {
+      setLoading(true);
       const response = await fetch(`/api/subreddit-suggestions/${suggestionId}`, {
         method: 'PATCH',
         headers: {
-          'Content-Type': 'application/json',
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify({ status })
       });
+
       if (!response.ok) {
-        throw new Error('Failed to update status');
+        const errorData = await response.json();
+        throw new Error(errorData.error || 'Failed to update status');
       }
+
       const updatedSuggestion = await response.json();
-      setSuggestions(prev => 
-        prev.map(sug => 
-          sug.id === suggestionId ? { ...sug, status } : sug
+      setSuggestions(prevSuggestions => 
+        prevSuggestions.map(s => 
+          s.id === suggestionId ? { ...s, status } : s
         )
       );
     } catch (err) {
       console.error('Error updating suggestion:', err);
-      setError('Failed to update suggestion status');
+      setError(err.message);
+    } finally {
+      setLoading(false);
     }
   };
 
