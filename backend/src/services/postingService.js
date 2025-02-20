@@ -4,6 +4,16 @@ const seleniumService = require('./seleniumService');
 
 
 class PostingService {
+
+  constructor() {
+    // Add a cache to track recently generated content
+    this.recentContentCache = new Set();
+    // Clear cache every 24 hours to prevent unbounded growth
+    setInterval(() => this.recentContentCache.clear(), 24 * 60 * 60 * 1000);
+  }
+
+
+
   async createSimulatedPost(campaignId) {
     try {
       console.log('Starting createSimulatedPost for campaign:', campaignId);
@@ -167,6 +177,26 @@ class PostingService {
       throw error;
     }
   }
+  generateFallbackContent() {
+    // Generate a unique fallback message with timestamp and random elements
+    const topics = [
+      'resilience', 'healing', 'personal growth', 'memoir writing',
+      'life experiences', 'overcoming challenges', 'self-discovery'
+    ];
+    const questions = [
+      'What memoirs have impacted you the most?',
+      'How do you process difficult experiences?',
+      'What helps you stay resilient?',
+      'Have you ever considered writing your story?',
+      'What life experiences shaped who you are today?'
+    ];
+    
+    const randomTopic = topics[Math.floor(Math.random() * topics.length)];
+    const randomQuestion = questions[Math.floor(Math.random() * questions.length)];
+    const uniqueId = Date.now().toString(36) + Math.random().toString(36).substr(2);
+    
+    return `Exploring ${randomTopic} through the lens of personal experience. ${randomQuestion} [${uniqueId}]`;
+  }
 
   async generateContent(type, campaign, context = {}) {
     try {
@@ -177,42 +207,60 @@ class PostingService {
       
       if (!process.env.OPENAI_API_KEY) {
         console.error('OPENAI_API_KEY not found in environment variables');
-        return "This is a test post about Haunted Victory - discussing resilience and healing through memoir writing. What memoirs have impacted you the most?";
+        return this.generateFallbackContent();
       }
 
-      console.log('Attempting OpenAI API call...');
-      const completion = await openai.createChatCompletion({
-        model: "gpt-4",
-        messages: [
-          {
-            role: "system",
-            content: context.platform === 'reddit' 
-              ? "You are an expert Reddit user who understands Reddit's culture and how to create engaging, authentic posts that follow each subreddit's rules and conventions. You never use hashtags or emojis in Reddit posts."
-              : "You are an expert social media content creator who understands each platform's unique style and engagement patterns."
-          },
-          {
-            role: "user",
-            content: prompt
-          }
-        ],
-        temperature: 0.7
-      });
+      let content;
+      let attempts = 0;
+      const maxAttempts = 3;
 
-      if (!completion.data?.choices?.[0]?.message?.content) {
-        console.error('Unexpected OpenAI response format:', completion.data);
-        return "This is a test post about Haunted Victory - discussing resilience and healing through memoir writing. What memoirs have impacted you the most?";
+      // Keep trying until we get unique content or hit max attempts
+      do {
+        console.log('Attempting OpenAI API call... Attempt:', attempts + 1);
+        const completion = await openai.createChatCompletion({
+          model: "gpt-4",
+          messages: [
+            {
+              role: "system",
+              content: context.platform === 'reddit' 
+                ? "You are an expert Reddit user who understands Reddit's culture and how to create engaging, authentic posts that follow each subreddit's rules and conventions. You never use hashtags or emojis in Reddit posts. Each response must be unique and different from previous responses."
+                : "You are an expert social media content creator who understands each platform's unique style and engagement patterns. Each response must be unique and different from previous responses."
+            },
+            {
+              role: "user",
+              content: prompt + (attempts > 0 ? "\n\nPlease generate a completely different variation from previous attempts." : "")
+            }
+          ],
+          // Increase temperature slightly for more variation
+          temperature: 0.8 + (attempts * 0.1)
+        });
+
+        content = completion.data?.choices?.[0]?.message?.content.trim();
+        
+        // Check if this content is unique
+        if (content && !this.recentContentCache.has(content)) {
+          this.recentContentCache.add(content);
+          break;
+        }
+
+        attempts++;
+      } while (attempts < maxAttempts);
+
+      // If we couldn't generate unique content after max attempts, generate a unique fallback
+      if (!content || this.recentContentCache.has(content)) {
+        content = this.generateFallbackContent();
+        this.recentContentCache.add(content);
       }
 
-      const content = completion.data.choices[0].message.content.trim();
-      console.log('Successfully generated content:', content);
+      console.log('Successfully generated unique content:', content);
       return content;
+
     } catch (error) {
       console.error('Error in generateContent:', error);
       if (error.response) {
         console.error('OpenAI API error response:', error.response.data);
       }
-      // Return fallback content for testing
-      return "This is a test post about Haunted Victory - discussing resilience and healing through memoir writing. What memoirs have impacted you the most?";
+      return this.generateFallbackContent();
     }
   }
 
