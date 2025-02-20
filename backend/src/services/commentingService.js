@@ -19,84 +19,42 @@ class CommentingService {
     }
   }
 
-  async createSimulatedComment(postId, campaignId, parentCommentId = null) {
+  async createSimulatedComment(post, campaign) {
     try {
-      const campaign = await this.getCampaign(campaignId);
-      if (!campaign) return;
+      console.log('Creating simulated comment for post:', post.id);
 
-      const post = await this.getPost(postId);
-      if (!post) return;
-
-      // Get all existing comment authors for this post
-      const existingAuthors = await this.getPostCommentAuthors(postId);
-      const usedIds = [...existingAuthors, post.social_account_id];
-
-      // Decide if this should be a post author reply
-      const shouldBeAuthorReply = !parentCommentId && Math.random() < 0.2; // 20% chance
-      
-      let account;
-      let content;
-
-      if (shouldBeAuthorReply) {
-        // Get the original post author and ensure we're replying to a comment
-        account = await this.getAccountById(post.social_account_id);
-        const randomComment = await this.getRandomPostComment(postId);
-        if (!randomComment) {
-          // If no comment to reply to, make a regular comment instead
-          account = await postingService.getRandomAccount('reddit', usedIds);
-          content = await this.generateContent('comment', campaign, { 
-            postContent: post.content 
-          });
-        } else {
-          parentCommentId = randomComment.id;
-          content = await this.generateContent('reply', campaign, { 
-            postContent: post.content,
-            commentContent: randomComment.content,
-            isAuthorReply: true
-          });
-        }
-      } else {
-        // Get a random account that's not the post author or previous commenters
-        account = await postingService.getRandomAccount('reddit', usedIds);
-        
-        if (parentCommentId) {
-          // If this is a reply to a comment, get the parent comment
-          const parentComment = await this.getCommentById(parentCommentId);
-          content = await this.generateContent('reply', campaign, { 
-            postContent: post.content,
-            commentContent: parentComment.content
-          });
-        } else {
-          content = await this.generateContent('comment', campaign, { 
-            postContent: post.content 
-          });
-        }
+      // Get a random account for commenting
+      const account = await this.getRandomAccount('reddit');
+      if (!account) {
+        throw new Error('No available Reddit account found');
       }
+      console.log('Selected account for comment:', account.id);
 
-      const comment = await pool.query(
+      // Generate the comment content using our new method
+      const content = await this.generateComment(post, campaign);
+      console.log('Generated comment content:', content);
+
+      // Insert the comment into the database
+      const result = await pool.query(
         `INSERT INTO comments 
-         (post_id, social_account_id, parent_comment_id, content, status, 
-          posted_at, sentiment_score, engagement_metrics)
-         VALUES ($1, $2, $3, $4, 'simulated', NOW(), $5, $6)
+         (post_id, social_account_id, content, status, sentiment_score, engagement_metrics, posted_at)
+         VALUES ($1, $2, $3, 'simulated', $4, $5, NOW())
          RETURNING *`,
         [
-          postId,
+          post.id,
           account.id,
-          parentCommentId,
           content,
-          Math.random() * 2 - 1,
+          Math.random() * 2 - 1, // Random sentiment between -1 and 1
           JSON.stringify({
-            upvotes: Math.floor(Math.random() * 30) + 5
+            likes: Math.floor(Math.random() * 50),
+            replies: Math.floor(Math.random() * 5)
           })
         ]
       );
 
-      // 30% chance to create a reply to this comment if it's not already a reply
-      if (!parentCommentId && Math.random() < 0.3) {
-        await this.createSimulatedComment(postId, campaignId, comment.rows[0].id);
-      }
+      console.log('Created comment:', result.rows[0]);
+      return result.rows[0];
 
-      return comment.rows[0];
     } catch (error) {
       console.error('Error creating simulated comment:', error);
       throw error;
@@ -260,7 +218,7 @@ Campaign context: ${campaign.goal}
 
 Create a unique comment that naturally fits this conversation.`;
   }
-  
+
   async getRecentPosts(campaignId) {
     const result = await pool.query(
       `SELECT * FROM posts 
