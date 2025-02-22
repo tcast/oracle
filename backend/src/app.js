@@ -9,6 +9,7 @@ const path = require('path');
 const fs = require('fs').promises;
 const postsRouter = require('./routes/posts');
 const subredditsRouter = require('./routes/subreddits');
+const socialAccountsRouter = require('./routes/socialAccounts');
 
 // Service imports
 const postingService = require('./services/postingService');
@@ -484,6 +485,7 @@ app.post('/api/auth/logout', async (req, res) => {
 app.use('/uploads', express.static('uploads'));
 app.use('/api', postsRouter);
 app.use('/api', subredditsRouter);
+app.use('/api', socialAccountsRouter);
 
 if (process.env.NODE_ENV === 'production') {
   // Serve static files from the frontend build directory

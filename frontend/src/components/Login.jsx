@@ -18,7 +18,7 @@ const Login = () => {
     
     try {
       await login(email, password);
-      navigate('/dashboard'); // Redirect to dashboard after successful login
+      navigate('/');
     } catch (err) {
       setError(err.message);
     } finally {
@@ -33,15 +33,6 @@ const Login = () => {
           <h2 className="mt-6 text-center text-3xl font-extrabold text-gray-900">
             Sign in to Oracle
           </h2>
-          <p className="mt-2 text-center text-sm text-gray-600">
-            Or{' '}
-            <button
-              onClick={() => navigate('/register')}
-              className="font-medium text-indigo-600 hover:text-indigo-500"
-            >
-              create a new account
-            </button>
-          </p>
         </div>
         
         <form className="mt-8 space-y-6" onSubmit={handleSubmit}>
