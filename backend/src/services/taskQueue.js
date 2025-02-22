@@ -90,17 +90,20 @@ class TaskQueue {
 
   async stopCampaign(campaignId) {
     try {
+      // Clear any scheduled intervals
       const intervalId = this.activeIntervals.get(campaignId);
       if (intervalId) {
         clearInterval(intervalId);
         this.activeIntervals.delete(campaignId);
       }
 
-      // Update database state
+      // Update database state immediately
       await pool.query(
         'UPDATE campaigns SET is_running = false WHERE id = $1',
         [campaignId]
       );
+
+      console.log(`Campaign ${campaignId} stopped successfully`);
     } catch (error) {
       console.error(`Error stopping campaign ${campaignId}:`, error);
       throw error;
@@ -131,32 +134,41 @@ class TaskQueue {
 
   async handleSimulationTask(campaignId) {
     try {
-      // Create a post
-      const post = await postingService.createSimulatedPost(campaignId);
-      
-      // If post is null, it means we've hit all post limits
-      if (!post) {
-        console.log('Campaign has reached all post limits - stopping simulation');
-        await this.stopCampaign(campaignId);
-        return;
+      let shouldContinue = true;
+
+      // Try to create a post
+      try {
+        const post = await postingService.createSimulatedPost(campaignId);
+        if (!post) {
+          console.log('Campaign has reached all post limits - continuing for comments only');
+        }
+      } catch (error) {
+        if (!error.message.includes('Post limit reached')) {
+          console.error('Error creating post:', error.message);
+        }
       }
 
-      // Generate comments for the post
-      await commentingService.createSimulatedComments(campaignId);
+      // Always try to generate comments, even if post creation failed
+      try {
+        await commentingService.createSimulatedComments(campaignId);
+      } catch (error) {
+        console.error('Error creating comments:', error.message);
+      }
 
-      // Schedule next task with random delay
-      const delay = Math.floor(Math.random() * 2000) + 1000; // 1-3 seconds
-      setTimeout(() => this.addTask(campaignId, 'simulation'), delay);
-    } catch (error) {
-      console.error('Error handling simulation task:', error.message);
-      // Don't stop on error, try again after delay unless it's a critical error
-      if (!error.message.includes('Post limit reached')) {
-        const delay = Math.floor(Math.random() * 5000) + 5000; // 5-10 seconds
+      // Check if we should continue (only if campaign is still marked as running)
+      const status = await this.getCampaignStatus(campaignId);
+      shouldContinue = status.isRunning;
+
+      if (shouldContinue) {
+        // Schedule next task with random delay
+        const delay = Math.floor(Math.random() * 2000) + 1000; // 1-3 seconds
         setTimeout(() => this.addTask(campaignId, 'simulation'), delay);
-      } else {
-        console.log('Stopping simulation due to reaching post limits');
-        await this.stopCampaign(campaignId);
       }
+    } catch (error) {
+      console.error('Error handling simulation task:', error);
+      // Don't stop on error unless it's critical
+      const delay = Math.floor(Math.random() * 5000) + 5000; // 5-10 seconds
+      setTimeout(() => this.addTask(campaignId, 'simulation'), delay);
     }
   }
 

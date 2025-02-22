@@ -3,6 +3,7 @@ const pool = require('./db');
 const openai = require('./openai');
 const seleniumService = require('./seleniumService');
 const postingService = require('./postingService');
+const contentStyleService = require('./contentStyleService');
 
 // Platform-specific comment handlers
 const platformHandlers = {
@@ -40,22 +41,20 @@ const platformHandlers = {
       };
     },
 
-    buildPrompt: (post, campaign) => {
-      return `Read this Reddit post and create a natural, engaging comment that adds value to the discussion:
+    buildPrompt: (post, campaign, account) => {
+      const traits = account.persona_traits || {};
+      return `Read this Reddit post and write a brief, ${traits.tone || 'natural'} comment:
 
 POST:
 ${post.content}
 
-Your comment should:
-1. Reference specific points from the post
-2. Share relevant personal experience
-3. Encourage further discussion
-4. Feel like a genuine response
-5. Match the tone of Reddit and the specific subreddit (r/${post.subreddit})
+Quick guidelines:
+1. Get straight to your point - no greetings or introductions
+2. Keep it under 50 words
+3. React to one specific point${traits.expertise ? ` - mention your ${traits.expertise[0]} experience if relevant` : ''}
+${traits.quirks?.includes('shares_personal_stories') ? '4. Add a quick personal example' : ''}
 
-Campaign context: ${campaign.comment_goal}
-
-Create a unique comment that naturally fits this conversation.`;
+Write like you're in the middle of a conversation - direct and natural.`;
     }
   },
 
@@ -93,22 +92,20 @@ Create a unique comment that naturally fits this conversation.`;
       };
     },
 
-    buildPrompt: (post, campaign) => {
-      return `Read this LinkedIn post and create a professional, insightful comment that adds value to the discussion:
+    buildPrompt: (post, campaign, account) => {
+      const traits = account.persona_traits || {};
+      return `Read this LinkedIn post and write a brief, ${traits.tone || 'professional'} comment:
 
 POST:
 ${post.content}
 
-Your comment should:
-1. Demonstrate professional expertise
-2. Share relevant industry experience
-3. Add meaningful business insights
-4. Maintain a professional tone
-5. Encourage networking and professional discussion
+Quick guidelines:
+1. Get straight to your point - no introductions or formalities
+2. Keep it under 50 words
+3. Focus on one key insight${traits.expertise ? ` - mention your ${traits.expertise[0]} perspective if relevant` : ''}
+${traits.quirks?.includes('technical_jargon') ? '4. Use one industry term naturally' : ''}
 
-Campaign context: ${campaign.comment_goal}
-
-Create a unique comment that naturally fits this professional conversation.`;
+Write like you're continuing an ongoing professional discussion.`;
     }
   }
 };
@@ -121,43 +118,66 @@ class CommentingService {
   async createComments(campaignId, isLive = false) {
     try {
       const posts = await this.getRecentPosts(campaignId);
+      if (!posts.length) {
+        console.log(`No recent posts found for campaign ${campaignId}`);
+        return;
+      }
+
       const campaign = await this.getCampaign(campaignId);
-      
-      if (!campaign) throw new Error(`Campaign not found: ${campaignId}`);
+      if (!campaign) {
+        console.log(`Campaign not found: ${campaignId}`);
+        return;
+      }
 
       for (const post of posts) {
-        // Get existing comment authors for this post to exclude them
-        const existingAuthors = await this.getPostCommentAuthors(post.id);
-        console.log(`Post ${post.id} has existing authors:`, existingAuthors);
-
-        const numComments = Math.floor(Math.random() * 3) + 2; // 2-4 comments
-        console.log(`Generating ${numComments} comments for post ${post.id}`);
-
-        for (let i = 0; i < numComments; i++) {
-          try {
-            await this.createComment(post, campaign, isLive, existingAuthors);
-            // Add a small delay between comments
-            await new Promise(resolve => setTimeout(resolve, Math.random() * 500 + 500));
-          } catch (error) {
-            if (error.message.includes('No available accounts')) {
-              console.log('No more unique accounts available for commenting');
-              break;
-            }
-            console.error(`Error creating comment ${i + 1}:`, error);
+        try {
+          // Verify post still exists
+          const postExists = await pool.query(
+            'SELECT id FROM posts WHERE id = $1',
+            [post.id]
+          );
+          
+          if (!postExists.rows.length) {
+            console.log(`Post ${post.id} no longer exists, skipping comments`);
+            continue;
           }
-        }
 
-        // 30% chance to create a reply to an existing comment
-        if (Math.random() < 0.3) {
-          const randomComment = await this.getRandomPostComment(post.id);
-          if (randomComment) {
-            const existingReplyAuthors = await this.getCommentReplyAuthors(randomComment.id);
+          // Get existing comment authors for this post to exclude them
+          const existingAuthors = await this.getPostCommentAuthors(post.id);
+          console.log(`Post ${post.id} has existing authors:`, existingAuthors);
+
+          const numComments = Math.floor(Math.random() * 3) + 2; // 2-4 comments
+          console.log(`Generating ${numComments} comments for post ${post.id}`);
+
+          for (let i = 0; i < numComments; i++) {
             try {
-              await this.createComment(post, campaign, isLive, [...existingAuthors, ...existingReplyAuthors], randomComment.id);
+              await this.createComment(post, campaign, isLive, existingAuthors);
+              // Add a small delay between comments
+              await new Promise(resolve => setTimeout(resolve, Math.random() * 500 + 500));
             } catch (error) {
-              console.error('Error creating reply:', error);
+              if (error.message.includes('No available accounts')) {
+                console.log('No more unique accounts available for commenting');
+                break;
+              }
+              console.error(`Error creating comment ${i + 1}:`, error);
             }
           }
+
+          // 30% chance to create a reply to an existing comment
+          if (Math.random() < 0.3) {
+            const randomComment = await this.getRandomPostComment(post.id);
+            if (randomComment) {
+              const existingReplyAuthors = await this.getCommentReplyAuthors(randomComment.id);
+              try {
+                await this.createComment(post, campaign, isLive, [...existingAuthors, ...existingReplyAuthors], randomComment.id);
+              } catch (error) {
+                console.error('Error creating reply:', error);
+              }
+            }
+          }
+        } catch (error) {
+          console.error(`Error processing comments for post ${post.id}:`, error);
+          continue; // Continue with next post if there's an error
         }
       }
     } catch (error) {
@@ -198,7 +218,7 @@ class CommentingService {
       const account = await this.getRandomAccount(post.platform, excludeAccountIds);
       if (!account) throw new Error(`No available ${post.platform} accounts found for commenting`);
 
-      const content = await this.generateComment(post, campaign, handler);
+      const content = await this.generateComment(post, campaign, account);
 
       const commentData = await (isLive ?
         handler.createLiveComment(post, campaign, account, content, parentCommentId) :
@@ -229,16 +249,29 @@ class CommentingService {
     }
   }
 
-  async generateComment(post, campaign, handler) {
+  async generateComment(post, campaign, account) {
     try {
-      const persona = this.generateCommentPersona(campaign, post);
-      const prompt = handler.buildPrompt(post, campaign);
+      // Get network-specific style guidelines
+      const networkStyle = await contentStyleService.getNetworkStyle(post.platform, 'comment');
+      
+      // Generate base prompt from network style
+      const basePrompt = contentStyleService.generateBasePrompt(networkStyle, 'comment', {
+        post_title: post.title,
+        post_content: post.content,
+        post_type: post.type
+      });
+      
+      // Generate persona
+      const persona = this.generatePersona(campaign, account);
+      
+      // Combine network style with persona
+      const finalPrompt = contentStyleService.combineWithPersona(basePrompt, persona);
 
       const completion = await openai.createChatCompletion({
         model: "gpt-4",
         messages: [
-          { role: "system", content: persona },
-          { role: "user", content: prompt }
+          { role: "system", content: finalPrompt },
+          { role: "user", content: platformHandlers[post.platform].buildPrompt(post, campaign, account) }
         ],
         temperature: 1.0,
         presence_penalty: 1.0,
@@ -256,14 +289,56 @@ class CommentingService {
     }
   }
 
-  generateCommentPersona(campaign, post) {
-    return `You are someone engaging naturally with this ${post.platform} post about ${campaign.campaign_goal}.
+  generatePersona(campaign, account) {
+    const traits = account.persona_traits;
+    if (!traits) return this.generateDefaultPersona(campaign, account);
+
+    let persona = `You are a ${traits.tone} commenter with a ${traits.writingStyle} writing style.
+Your expertise is in ${traits.expertise.join(' and ')}.
+You tend to write ${traits.responseLength} responses and engage as a ${traits.engagementStyle}.
+
+Your quirks: ${traits.quirks.map(quirk => quirk.replace(/_/g, ' ')).join(', ')}.
+
+When commenting:
+- Maintain your ${traits.writingStyle} style consistently
+- Show your expertise in ${traits.expertise.join(' and ')} when relevant
+- Keep responses ${traits.responseLength} in length
+- Maintain a ${traits.tone} tone
+- Incorporate your quirks naturally
+- Stay in character as a ${traits.engagementStyle}
+
+Context:
+- Campaign goal: ${campaign.campaign_goal}
+- Your role: A genuine participant with the above personality traits
+
+Remember: You are a real person with consistent traits - your comments should reflect your unique personality while engaging naturally with the content.`;
+
+    // Add platform-specific persona elements
+    if (traits.writingStyle === 'casual') {
+      persona += '\nFeel free to use common expressions and informal language.';
+    } else if (traits.writingStyle === 'formal') {
+      persona += '\nMaintain professional language while showing expertise.';
+    }
+
+    // Add quirk-specific instructions
+    if (traits.quirks.includes('uses_emojis')) {
+      persona += '\nOccasionally use relevant emojis, but don\'t overdo it.';
+    }
+    if (traits.quirks.includes('occasional_typos')) {
+      persona += '\nOccasionally make minor, realistic typos or typing mistakes.';
+    }
+
+    return persona;
+  }
+
+  generateDefaultPersona(campaign, account) {
+    return `You are someone engaging naturally with this content about ${campaign.campaign_goal}.
 
 Your role: A genuine participant in this discussion who has relevant experience to share.
-Your style: Write conversationally, matching the tone of ${post.platform}.
+Your style: Write conversationally and naturally.
 Your approach: 
 - Vary your comment style (sometimes ask questions, sometimes share experiences, sometimes offer insights)
-- React to specific points in the post
+- React to specific points in the content
 - Add value to the discussion
 - Stay authentic and avoid generic responses
 - Match the tone of the platform and community
@@ -283,7 +358,8 @@ Remember: Each comment should feel unique and natural, as if coming from a diffe
     const result = await pool.query(
       `SELECT * FROM posts 
        WHERE campaign_id = $1 
-       AND status = 'simulated'
+       AND status IN ('simulated', 'posted')
+       AND created_at >= NOW() - INTERVAL '1 hour'
        ORDER BY created_at DESC 
        LIMIT 5`,
       [campaignId]
@@ -396,20 +472,34 @@ Remember: Each comment should feel unique and natural, as if coming from a diffe
       const result = await pool.query(query, params);
       
       if (!result.rows[0]) {
-        // If no accounts are available (excluding the excluded ones), create a new one
+        // If no accounts are available, create a new one with persona traits
+        const persona = await this.generatePersonalityTraits();
         const username = `user_${Math.floor(Math.random() * 10000)}`;
         const newAccount = await pool.query(
           `INSERT INTO social_accounts 
-           (platform, username, credentials, status)
-           VALUES ($1, $2, $3, 'active')
+           (platform, username, credentials, status, persona_traits)
+           VALUES ($1, $2, $3, 'active', $4)
            RETURNING *`,
           [
             platform,
             username,
-            JSON.stringify({ password: 'default_password' })
+            JSON.stringify({ password: 'default_password' }),
+            JSON.stringify(persona)
           ]
         );
         return newAccount.rows[0];
+      }
+
+      // If account exists but has no persona, generate one
+      if (!result.rows[0].persona_traits) {
+        const persona = await this.generatePersonalityTraits();
+        await pool.query(
+          `UPDATE social_accounts 
+           SET persona_traits = $1
+           WHERE id = $2`,
+          [JSON.stringify(persona), result.rows[0].id]
+        );
+        result.rows[0].persona_traits = persona;
       }
 
       return result.rows[0];
@@ -419,7 +509,72 @@ Remember: Each comment should feel unique and natural, as if coming from a diffe
     }
   }
 
-  async shouldCreateComment(post) {
+  async generatePersonalityTraits() {
+    // Generate a unique personality profile
+    const traits = {
+      writingStyle: this.pickRandom([
+        'formal',
+        'casual',
+        'enthusiastic',
+        'sarcastic',
+        'technical',
+        'storyteller'
+      ]),
+      responseLength: this.pickRandom([
+        'concise',
+        'moderate',
+        'detailed',
+        'verbose'
+      ]),
+      tone: this.pickRandom([
+        'positive',
+        'neutral',
+        'skeptical',
+        'humorous',
+        'professional'
+      ]),
+      quirks: this.pickRandomMultiple([
+        'uses_emojis',
+        'occasional_typos',
+        'technical_jargon',
+        'casual_slang',
+        'asks_questions',
+        'shares_personal_stories',
+        'uses_bullet_points',
+        'likes_analogies'
+      ], 2),
+      expertise: this.pickRandomMultiple([
+        'technology',
+        'business',
+        'science',
+        'arts',
+        'gaming',
+        'sports',
+        'finance',
+        'education'
+      ], 2),
+      engagementStyle: this.pickRandom([
+        'supportive',
+        'debater',
+        'questioner',
+        'advisor',
+        'storyteller'
+      ])
+    };
+
+    return traits;
+  }
+
+  pickRandom(array) {
+    return array[Math.floor(Math.random() * array.length)];
+  }
+
+  pickRandomMultiple(array, count) {
+    const shuffled = [...array].sort(() => 0.5 - Math.random());
+    return shuffled.slice(0, count);
+  }
+
+  shouldCreateComment(post) {
     const timeSincePost = Date.now() - new Date(post.posted_at).getTime();
     const hoursSincePost = timeSincePost / (1000 * 60 * 60);
     

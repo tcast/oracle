@@ -1,6 +1,8 @@
 const pool = require('./db');
 const openai = require('./openai');
 const seleniumService = require('./seleniumService');
+const commentingService = require('./commentingService');
+const contentStyleService = require('./contentStyleService');
 
 class PostingService {
   constructor() {
@@ -49,12 +51,22 @@ class PostingService {
           };
         },
 
-        buildPrompt: (type, campaign, context) => {
-          return `Create a ${type} for r/${context.subreddit} based on this goal: ${campaign.post_goal}
+        buildPrompt: (type, campaign, context, account) => {
+          const traits = account.persona_traits || {};
+          let prompt = `Create a brief, ${traits.tone || 'natural'} Reddit post for r/${context.subreddit.subreddit_name}. Goal: ${campaign.post_goal}
 
-Share your experience in a way that naturally fits the subreddit's community.
-Focus on providing value and encouraging discussion.
-Follow these community rules: ${JSON.stringify(context.contentRules || [])}`;
+Keep it concise and authentic - like a real Reddit user would write.
+${JSON.stringify(context.subreddit.content_rules || [])}
+
+Quick guidelines:
+1. Share a real experience${traits.expertise ? ` about ${traits.expertise[0]}` : ''}
+2. Keep it under 150 words
+3. Sound natural, not promotional
+${traits.quirks?.includes('shares_personal_stories') ? '4. Include a brief personal example' : ''}
+
+Write like you're casually sharing with friends, not writing an essay.`;
+
+          return prompt;
         },
 
         getPostContext: async (campaignId) => {
@@ -101,18 +113,24 @@ Follow these community rules: ${JSON.stringify(context.contentRules || [])}`;
           };
         },
 
-        buildPrompt: (type, campaign, context) => {
-          let prompt = `Create a professional ${type} for LinkedIn based on this goal: ${campaign.post_goal}
+        buildPrompt: (type, campaign, context, account) => {
+          const traits = account.persona_traits || {};
+          let prompt = `Create a concise, ${traits.tone || 'professional'} LinkedIn post. Goal: ${campaign.post_goal}
 
-Share insights and experience in a way that resonates with a professional audience.
-Focus on providing value and encouraging meaningful business connections.`;
+Keep it brief and focused - busy professionals should be able to read it in 30 seconds.
+
+Quick guidelines:
+1. Share one key insight${traits.expertise ? ` about ${traits.expertise[0]}` : ''}
+2. Keep it under 150 words
+3. Be direct and clear
+${traits.quirks?.includes('technical_jargon') ? '4. Use 1-2 industry terms naturally' : ''}`;
 
           if (context.targetUrl) {
-            prompt += `\nInclude a natural reference to this URL: ${context.targetUrl}`;
+            prompt += `\nInclude this link naturally: ${context.targetUrl}`;
           }
 
           if (context.mediaAssets?.length > 0) {
-            prompt += `\nThe post will include ${context.mediaAssets.length} supporting image(s). Reference them naturally.`;
+            prompt += `\nReference the attached image briefly.`;
           }
 
           return prompt;
@@ -201,6 +219,10 @@ Focus on providing value and encouraging meaningful business connections.`;
           if (network.network_type === 'reddit') {
             try {
               const subreddit = await this.getRandomApprovedSubreddit(campaignId);
+              if (!subreddit) {
+                console.log('No available subreddits for Reddit posts');
+                continue;
+              }
               const subredditPostCount = await this.getSubredditPostCount(campaignId, subreddit.subreddit_name);
               if (subredditPostCount >= campaign.posts_per_subreddit) {
                 const error = `Post limit reached for subreddit ${subreddit.subreddit_name} (${subredditPostCount}/${campaign.posts_per_subreddit})`;
@@ -276,24 +298,22 @@ Focus on providing value and encouraging meaningful business connections.`;
       }
 
       // If we get here, all platforms failed
-      const limitErrors = errors.filter(e => e.includes('Post limit reached'));
-      const otherErrors = errors.filter(e => !e.includes('Post limit reached'));
+      const limitErrors = errors.filter(e => e.includes('Post limit reached') || e.includes('No available subreddits'));
+      const otherErrors = errors.filter(e => !e.includes('Post limit reached') && !e.includes('No available subreddits'));
 
       if (limitErrors.length === networks.length) {
-        // All platforms have reached their post limits - this is normal
-        console.log('All platforms have reached their post limits:', limitErrors.join('\n'));
+        // All platforms have reached their limits or have no available subreddits - this is normal
+        console.log('All platforms have reached their limits or have no available posting locations:', limitErrors.join('\n'));
         return null;
       } else if (otherErrors.length > 0) {
         // We have actual errors to report
         const errorMessage = `Failed to create post on any platform:\n${otherErrors.join('\n')}`;
         console.error(errorMessage);
         throw new Error(errorMessage);
-      } else {
-        // Mixed state - some platforms hit limits, others had errors
-        const errorMessage = `Failed to create post on any platform:\n${errors.join('\n')}`;
-        console.error(errorMessage);
-        throw new Error(errorMessage);
       }
+      
+      // If we get here, return null to indicate no post was created
+      return null;
     } catch (error) {
       console.error('Error creating post:', error);
       throw error;
@@ -314,14 +334,26 @@ Focus on providing value and encouraging meaningful business connections.`;
       const handler = this.platformHandlers[context.platform];
       if (!handler) throw new Error(`Unsupported platform: ${context.platform}`);
 
-      const persona = this.generatePersona(campaign);
-      const prompt = handler.buildPrompt(type, campaign, context);
+      // Get the account and its personality
+      const account = await this.getRandomAccount(context.platform);
+      
+      // Get network-specific style guidelines
+      const networkStyle = await contentStyleService.getNetworkStyle(context.platform, type);
+      
+      // Generate base prompt from network style
+      const basePrompt = contentStyleService.generateBasePrompt(networkStyle, type, context);
+      
+      // Generate persona
+      const persona = this.generatePersona(campaign, account);
+      
+      // Combine network style with persona
+      const finalPrompt = contentStyleService.combineWithPersona(basePrompt, persona);
 
       const completion = await openai.createChatCompletion({
         model: "gpt-4",
         messages: [
-          { role: "system", content: persona },
-          { role: "user", content: prompt }
+          { role: "system", content: finalPrompt },
+          { role: "user", content: handler.buildPrompt(type, campaign, context, account) }
         ],
         temperature: 1.0,
         presence_penalty: 1.0,
@@ -339,16 +371,73 @@ Focus on providing value and encouraging meaningful business connections.`;
     }
   }
 
+  generatePersona(campaign, account) {
+    const traits = account.persona_traits;
+    if (!traits) return this.generateDefaultPersona(campaign);
+
+    return `You are a ${traits.tone} social media user with a ${traits.writingStyle} writing style.
+Your expertise is in ${traits.expertise.join(' and ')}.
+You tend to write ${traits.responseLength} posts and engage as a ${traits.engagementStyle}.
+
+Your quirks: ${traits.quirks.map(quirk => quirk.replace(/_/g, ' ')).join(', ')}.
+
+When posting:
+- Maintain your ${traits.writingStyle} style consistently
+- Show your expertise in ${traits.expertise.join(' and ')} when relevant
+- Keep posts ${traits.responseLength} in length
+- Maintain a ${traits.tone} tone
+- Incorporate your quirks naturally
+- Stay in character as a ${traits.engagementStyle}
+
+Campaign context: ${campaign.campaign_goal}
+
+Remember: You are a real person with consistent traits - your posts should reflect your unique personality while achieving the campaign goals.`;
+  }
+
+  generateDefaultPersona(campaign) {
+    // Analyze the campaign goal to understand the context
+    const goal = campaign.post_goal;
+    
+    // Extract key elements from the goal
+    const words = goal.toLowerCase().split(' ');
+    const actionWords = words.filter(word => word.endsWith('ing') || word.includes('promote') || word.includes('recommend'));
+    const subjects = words.filter(word => word.length > 3 && !actionWords.includes(word));
+    
+    // Create a dynamic persona based on the goal's context
+    return `You are someone who ${actionWords[0] || 'uses'} ${subjects[0] || 'this'} regularly.
+
+Your perspective: ${goal}
+
+Write as if you're naturally sharing your genuine experience with others who might benefit from it. 
+Each response should feel unique - vary your tone, style, and structure organically.
+Draw from the context of the campaign goal but express it through your own authentic voice.
+
+Remember: You're a real person having a real conversation, not following a script.`;
+  }
+
   async getRandomApprovedSubreddit(campaignId) {
     try {
       console.log('Getting random approved subreddit for campaign:', campaignId);
       
-      // Try the subreddit_suggestions table
+      // Get all approved subreddits that haven't reached their post limit
       const query = `
-        SELECT subreddit_name, reason
-        FROM subreddit_suggestions
-        WHERE campaign_id = $1
-        AND status = 'approved'
+        WITH subreddit_posts AS (
+          SELECT subreddit, COUNT(*) as post_count
+          FROM posts
+          WHERE campaign_id = $1 
+          AND status IN ('simulated', 'posted')
+          GROUP BY subreddit
+        )
+        SELECT s.subreddit_name, s.reason
+        FROM subreddit_suggestions s
+        LEFT JOIN subreddit_posts p ON p.subreddit = s.subreddit_name
+        WHERE s.campaign_id = $1
+        AND s.status = 'approved'
+        AND (p.post_count IS NULL OR p.post_count < (
+          SELECT posts_per_subreddit 
+          FROM campaigns 
+          WHERE id = $1
+        ))
         ORDER BY RANDOM()
         LIMIT 1`;
       
@@ -358,7 +447,7 @@ Focus on providing value and encouraging meaningful business connections.`;
       const suggestionsResult = await pool.query(query, [campaignId]);
       console.log('Query result:', suggestionsResult.rows);
 
-      // If we find an approved suggestion, use it
+      // If we find an approved suggestion that hasn't reached its limit, use it
       if (suggestionsResult.rows.length > 0) {
         console.log('Found approved subreddit from suggestions:', suggestionsResult.rows[0]);
         return {
@@ -367,8 +456,8 @@ Focus on providing value and encouraging meaningful business connections.`;
         };
       }
 
-      console.warn('No approved subreddits found in database for campaign:', campaignId);
-      throw new Error('No approved subreddits found for this campaign - please approve some subreddit suggestions first');
+      console.log('No available subreddits found for campaign:', campaignId);
+      return null;
     } catch (error) {
       console.error('Error getting random subreddit:', error);
       throw error;
@@ -389,20 +478,34 @@ Focus on providing value and encouraging meaningful business connections.`;
       const result = await pool.query(query, params);
       
       if (!result.rows[0]) {
-        // If no accounts are available (excluding the excluded ones), create a new one
+        // If no accounts are available, create a new one with persona traits
+        const persona = await commentingService.generatePersonalityTraits();
         const username = `user_${Math.floor(Math.random() * 10000)}`;
         const newAccount = await pool.query(
           `INSERT INTO social_accounts 
-           (platform, username, credentials, status)
-           VALUES ($1, $2, $3, 'active')
+           (platform, username, credentials, status, persona_traits)
+           VALUES ($1, $2, $3, 'active', $4)
            RETURNING *`,
           [
             platform,
             username,
-            JSON.stringify({ password: 'default_password' })
+            JSON.stringify({ password: 'default_password' }),
+            JSON.stringify(persona)
           ]
         );
         return newAccount.rows[0];
+      }
+
+      // If account exists but has no persona, generate one
+      if (!result.rows[0].persona_traits) {
+        const persona = await commentingService.generatePersonalityTraits();
+        await pool.query(
+          `UPDATE social_accounts 
+           SET persona_traits = $1
+           WHERE id = $2`,
+          [JSON.stringify(persona), result.rows[0].id]
+        );
+        result.rows[0].persona_traits = persona;
       }
 
       return result.rows[0];
@@ -410,27 +513,6 @@ Focus on providing value and encouraging meaningful business connections.`;
       console.error('Error getting random account:', error);
       throw error;
     }
-  }
-
-  generatePersona(campaign) {
-    // Analyze the campaign goal to understand the context
-    const goal = campaign.post_goal;
-    
-    // Extract key elements from the goal
-    const words = goal.toLowerCase().split(' ');
-    const actionWords = words.filter(word => word.endsWith('ing') || word.includes('promote') || word.includes('recommend'));
-    const subjects = words.filter(word => word.length > 3 && !actionWords.includes(word));
-    
-    // Create a dynamic persona based on the goal's context
-    return `You are someone who ${actionWords[0] || 'uses'} ${subjects[0] || 'this'} regularly.
-
-Your perspective: ${goal}
-
-Write as if you're naturally sharing your genuine experience with others who might benefit from it. 
-Each response should feel unique - vary your tone, style, and structure organically.
-Draw from the context of the campaign goal but express it through your own authentic voice.
-
-Remember: You're a real person having a real conversation, not following a script.`;
   }
 
   async getCampaign(campaignId) {
@@ -528,16 +610,54 @@ Remember: You're a real person having a real conversation, not following a scrip
   }
 
   async getPostCount(campaignId, platform) {
-    const result = await pool.query(
-      'SELECT COUNT(*) as count FROM posts WHERE campaign_id = $1 AND platform = $2',
-      [campaignId, platform]
-    );
-    return parseInt(result.rows[0].count);
+    if (platform === 'reddit') {
+      // For Reddit, we need to check if any subreddit has available slots
+      const result = await pool.query(
+        `WITH subreddit_posts AS (
+          SELECT subreddit, COUNT(*) as post_count
+          FROM posts
+          WHERE campaign_id = $1 
+          AND platform = 'reddit'
+          AND status IN ('simulated', 'posted')
+          GROUP BY subreddit
+        ),
+        campaign_subreddits AS (
+          SELECT subreddit_name
+          FROM subreddit_suggestions
+          WHERE campaign_id = $1
+          AND status = 'approved'
+        )
+        SELECT COUNT(*) as available_subreddits
+        FROM campaign_subreddits cs
+        LEFT JOIN subreddit_posts sp ON cs.subreddit_name = sp.subreddit
+        WHERE sp.post_count IS NULL 
+        OR sp.post_count < (
+          SELECT posts_per_subreddit 
+          FROM campaigns 
+          WHERE id = $1
+        )`,
+        [campaignId]
+      );
+      
+      // If no subreddits are available (count = 0), we've reached the limit
+      return result.rows[0].available_subreddits === 0 ? 1 : 0;
+    } else {
+      // For other platforms, use the original total count logic
+      const result = await pool.query(
+        'SELECT COUNT(*) as count FROM posts WHERE campaign_id = $1 AND platform = $2',
+        [campaignId, platform]
+      );
+      return parseInt(result.rows[0].count);
+    }
   }
 
   async getSubredditPostCount(campaignId, subreddit) {
     const result = await pool.query(
-      'SELECT COUNT(*) as count FROM posts WHERE campaign_id = $1 AND subreddit = $2',
+      `SELECT COUNT(*) as count 
+       FROM posts 
+       WHERE campaign_id = $1 
+       AND subreddit = $2 
+       AND status IN ('simulated', 'posted')`,
       [campaignId, subreddit]
     );
     return parseInt(result.rows[0].count);
