@@ -27,11 +27,11 @@ router.post('/campaigns/:id/generate-subreddits', async (req, res) => {
         return res.status(404).json({ error: 'Campaign not found' });
       }
   
-      console.log(`Generating suggestions for campaign ${campaignId} with goal:`, campaign.rows[0].goal);
+      console.log(`Generating suggestions for campaign ${campaignId} with goal:`, campaign.rows[0].campaign_goal);
   
       const suggestions = await subredditService.suggestSubreddits(
         campaignId,
-        campaign.rows[0].goal
+        campaign.rows[0].campaign_goal
       );
   
       res.json(suggestions);

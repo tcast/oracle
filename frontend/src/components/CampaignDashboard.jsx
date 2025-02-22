@@ -14,7 +14,9 @@ const CampaignDashboard = () => {
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [newCampaign, setNewCampaign] = useState({
     name: '',
-    goal: '',
+    campaign_goal: '',
+    post_goal: '',
+    comment_goal: '',
     target_sentiment: 'positive',
     is_live: false,
     networks: [],
@@ -82,7 +84,9 @@ const CampaignDashboard = () => {
       setSelectedCampaign(campaign);
       setNewCampaign({
         name: '',
-        goal: '',
+        campaign_goal: '',
+        post_goal: '',
+        comment_goal: '',
         target_sentiment: 'positive',
         is_live: false,
         networks: [],
@@ -140,10 +144,35 @@ const CampaignDashboard = () => {
             <label className="block text-sm font-medium text-gray-700">Campaign Goal</label>
             <textarea
               className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
-              value={newCampaign.goal}
-              onChange={(e) => setNewCampaign({...newCampaign, goal: e.target.value})}
+              value={newCampaign.campaign_goal}
+              onChange={(e) => setNewCampaign({...newCampaign, campaign_goal: e.target.value})}
               required
               rows={3}
+              placeholder="What is the overall objective of this campaign?"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700">Post Goal</label>
+            <textarea
+              className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+              value={newCampaign.post_goal}
+              onChange={(e) => setNewCampaign({...newCampaign, post_goal: e.target.value})}
+              required
+              rows={3}
+              placeholder="What should each post aim to achieve?"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700">Comment Goal</label>
+            <textarea
+              className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+              value={newCampaign.comment_goal}
+              onChange={(e) => setNewCampaign({...newCampaign, comment_goal: e.target.value})}
+              required
+              rows={3}
+              placeholder="How should comments support and validate the posts?"
             />
           </div>
 
@@ -253,7 +282,7 @@ const CampaignDashboard = () => {
                   onClick={() => setSelectedCampaign(campaign)}
                 >
                   <h3 className="font-semibold">{campaign.name}</h3>
-                  <p className="text-sm text-gray-600 mt-1">{campaign.goal}</p>
+                  <p className="text-sm text-gray-600 mt-1">{campaign.campaign_goal}</p>
                   <div className="mt-2 flex justify-between text-sm text-gray-500">
                     <span>Sentiment: {campaign.target_sentiment}</span>
                     <span>Created: {new Date(campaign.created_at).toLocaleDateString()}</span>

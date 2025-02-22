@@ -285,7 +285,7 @@ Your comment should:
 3. Encourage further discussion
 4. Feel like a genuine response
 
-Campaign context: ${campaign.goal}
+Campaign context: ${campaign.comment_goal}
 
 Create a unique comment that naturally fits this conversation.`;
   }

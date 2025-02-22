@@ -83,15 +83,15 @@ app.get('/api/campaigns', async (req, res) => {
 });
 
 app.post('/api/campaigns', async (req, res) => {
-  const { name, goal, target_sentiment, is_live, networks, target_url, media_assets } = req.body;
+  const { name, campaign_goal, post_goal, comment_goal, target_sentiment, is_live, networks, target_url, media_assets } = req.body;
   const client = await pool.connect();
   
   try {
     await client.query('BEGIN');
     
     const campaignResult = await client.query(
-      'INSERT INTO campaigns (name, goal, target_sentiment, is_live) VALUES ($1, $2, $3, $4) RETURNING *',
-      [name, goal, target_sentiment, is_live]
+      'INSERT INTO campaigns (name, campaign_goal, post_goal, comment_goal, target_sentiment, is_live) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+      [name, campaign_goal, post_goal, comment_goal, target_sentiment, is_live]
     );
     
     if (networks && networks.length > 0) {

@@ -6,10 +6,10 @@ const NetworkSelector = ({ onNetworksChange, campaign }) => {
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    if (campaign?.goal && isRedditSelected()) {
+    if (campaign?.campaign_goal && isRedditSelected()) {
       fetchSubredditSuggestions();
     }
-  }, [campaign?.goal]);
+  }, [campaign?.campaign_goal]);
 
   const fetchSubredditSuggestions = async () => {
     try {
@@ -20,7 +20,7 @@ const NetworkSelector = ({ onNetworksChange, campaign }) => {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ 
-          goal: campaign.goal, 
+          goal: campaign.campaign_goal, 
           target_sentiment: campaign.target_sentiment 
         }),
       });

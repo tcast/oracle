@@ -238,19 +238,19 @@ class PostingService {
 
   buildPrompt(type, campaign, context) {
     if (context.platform === 'reddit') {
-      return `Create a ${type} for r/${context.subreddit} based on this goal: ${campaign.goal}
+      return `Create a ${type} for r/${context.subreddit} based on this goal: ${campaign.post_goal}
 
 Share your experience in a way that naturally fits the subreddit's community.
 Focus on providing value and encouraging discussion.`;
     }
 
-    return `Create a ${type} that shares your experience related to: ${campaign.goal}`;
+    return `Create a ${type} that shares your experience related to: ${campaign.post_goal}`;
   }
 
   
   generatePersona(campaign) {
     // Analyze the campaign goal to understand the context
-    const goal = campaign.goal;
+    const goal = campaign.post_goal;
     
     // Extract key elements from the goal
     const words = goal.toLowerCase().split(' ');
