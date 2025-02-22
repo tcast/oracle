@@ -16,19 +16,26 @@ class TaskQueue {
     // Handle simulation tasks
     this.taskSubject.pipe(
       filter(task => task.type === 'simulation')
-    ).subscribe(task => {
-      this.handleSimulationTask(task);
+    ).subscribe(async task => {
+      await this.handleSimulationTask(task.campaignId);
     });
 
     // Handle live tasks
     this.taskSubject.pipe(
       filter(task => task.type === 'live')
-    ).subscribe(task => {
-      this.handleLiveTask(task);
+    ).subscribe(async task => {
+      await this.handleLiveTask(task);
     });
 
     // Restore active campaigns on server start
     await this.restoreActiveCampaigns();
+  }
+
+  addTask(campaignId, type = 'simulation') {
+    this.taskSubject.next({
+      type,
+      campaignId
+    });
   }
 
   async restoreActiveCampaigns() {
@@ -63,32 +70,15 @@ class TaskQueue {
 
       const taskType = isLive ? 'live' : 'simulation';
       
-      // Schedule initial posts
-      this.taskSubject.next({
-        type: taskType,
-        action: 'post',
-        campaignId
-      });
+      // Start initial task
+      this.addTask(campaignId, taskType);
 
-      // Set up recurring checks for comments
+      // Set up recurring checks
       const intervalTime = isLive ? 5 * 60 * 1000 : 30 * 1000; // 5 mins for live, 30 secs for simulation
       console.log(`Setting up ${taskType} mode with interval: ${intervalTime}ms`);
 
       const intervalId = setInterval(() => {
-        // For simulation mode, also create new posts more frequently
-        if (!isLive && Math.random() < 0.3) { // 30% chance of new post in simulation
-          this.taskSubject.next({
-            type: taskType,
-            action: 'post',
-            campaignId
-          });
-        }
-
-        this.taskSubject.next({
-          type: taskType,
-          action: 'comment',
-          campaignId
-        });
+        this.addTask(campaignId, taskType);
       }, intervalTime);
 
       this.activeIntervals.set(campaignId, intervalId);
@@ -139,34 +129,49 @@ class TaskQueue {
     }
   }
 
-  async handleSimulationTask(task) {
-    const { action, campaignId } = task;
-    
+  async handleSimulationTask(campaignId) {
     try {
-      if (action === 'post') {
-        // Create 1-2 posts in simulation mode
-        const numPosts = Math.floor(Math.random() * 2) + 1;
-        for (let i = 0; i < numPosts; i++) {
-          await postingService.createSimulatedPost(campaignId);
-        }
-      } else if (action === 'comment') {
-        // Create more comments in simulation mode
-        await commentingService.createSimulatedComments(campaignId);
+      // Create a post
+      const post = await postingService.createSimulatedPost(campaignId);
+      
+      // If post is null, it means we've hit all post limits
+      if (!post) {
+        console.log('Campaign has reached all post limits - stopping simulation');
+        await this.stopCampaign(campaignId);
+        return;
       }
+
+      // Generate comments for the post
+      await commentingService.createSimulatedComments(campaignId);
+
+      // Schedule next task with random delay
+      const delay = Math.floor(Math.random() * 2000) + 1000; // 1-3 seconds
+      setTimeout(() => this.addTask(campaignId, 'simulation'), delay);
     } catch (error) {
-      console.error(`Error handling simulation task: ${error.message}`);
+      console.error('Error handling simulation task:', error.message);
+      // Don't stop on error, try again after delay unless it's a critical error
+      if (!error.message.includes('Post limit reached')) {
+        const delay = Math.floor(Math.random() * 5000) + 5000; // 5-10 seconds
+        setTimeout(() => this.addTask(campaignId, 'simulation'), delay);
+      } else {
+        console.log('Stopping simulation due to reaching post limits');
+        await this.stopCampaign(campaignId);
+      }
     }
   }
 
   async handleLiveTask(task) {
-    const { action, campaignId } = task;
-    
     try {
-      if (action === 'post') {
-        await postingService.createLivePost(campaignId);
-      } else if (action === 'comment') {
-        await commentingService.createLiveComments(campaignId);
+      const campaign = await pool.query('SELECT * FROM campaigns WHERE id = $1', [task.campaignId]);
+      if (!campaign.rows[0]) {
+        throw new Error('Campaign not found');
       }
+
+      // Create a post
+      await postingService.createPost(task.campaignId, true);
+      
+      // Generate comments
+      await commentingService.createComments(task.campaignId, true);
     } catch (error) {
       console.error(`Error handling live task: ${error.message}`);
     }

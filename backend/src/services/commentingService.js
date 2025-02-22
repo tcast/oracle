@@ -4,31 +4,271 @@ const openai = require('./openai');
 const seleniumService = require('./seleniumService');
 const postingService = require('./postingService');
 
+// Platform-specific comment handlers
+const platformHandlers = {
+  reddit: {
+    createSimulatedComment: async (post, campaign, account, content) => {
+      return {
+        post_id: post.id,
+        social_account_id: account.id,
+        content,
+        status: 'simulated',
+        sentiment_score: Math.random() * 2 - 1,
+        engagement_metrics: {
+          likes: Math.floor(Math.random() * 50),
+          replies: Math.floor(Math.random() * 5)
+        }
+      };
+    },
+
+    createLiveComment: async (post, campaign, account, content, parentCommentId = null) => {
+      const platformCommentId = await seleniumService.postComment(
+        'reddit',
+        account.id,
+        post.platform_post_id,
+        content,
+        parentCommentId
+      );
+
+      return {
+        post_id: post.id,
+        social_account_id: account.id,
+        parent_comment_id: parentCommentId,
+        platform_comment_id: platformCommentId,
+        content,
+        status: 'posted'
+      };
+    },
+
+    buildPrompt: (post, campaign) => {
+      return `Read this Reddit post and create a natural, engaging comment that adds value to the discussion:
+
+POST:
+${post.content}
+
+Your comment should:
+1. Reference specific points from the post
+2. Share relevant personal experience
+3. Encourage further discussion
+4. Feel like a genuine response
+5. Match the tone of Reddit and the specific subreddit (r/${post.subreddit})
+
+Campaign context: ${campaign.comment_goal}
+
+Create a unique comment that naturally fits this conversation.`;
+    }
+  },
+
+  linkedin: {
+    createSimulatedComment: async (post, campaign, account, content) => {
+      return {
+        post_id: post.id,
+        social_account_id: account.id,
+        content,
+        status: 'simulated',
+        sentiment_score: Math.random() * 2 - 1,
+        engagement_metrics: {
+          likes: Math.floor(Math.random() * 30),
+          replies: Math.floor(Math.random() * 3)
+        }
+      };
+    },
+
+    createLiveComment: async (post, campaign, account, content, parentCommentId = null) => {
+      const platformCommentId = await seleniumService.postComment(
+        'linkedin',
+        account.id,
+        post.platform_post_id,
+        content,
+        parentCommentId
+      );
+
+      return {
+        post_id: post.id,
+        social_account_id: account.id,
+        parent_comment_id: parentCommentId,
+        platform_comment_id: platformCommentId,
+        content,
+        status: 'posted'
+      };
+    },
+
+    buildPrompt: (post, campaign) => {
+      return `Read this LinkedIn post and create a professional, insightful comment that adds value to the discussion:
+
+POST:
+${post.content}
+
+Your comment should:
+1. Demonstrate professional expertise
+2. Share relevant industry experience
+3. Add meaningful business insights
+4. Maintain a professional tone
+5. Encourage networking and professional discussion
+
+Campaign context: ${campaign.comment_goal}
+
+Create a unique comment that naturally fits this professional conversation.`;
+    }
+  }
+};
 
 class CommentingService {
   async createSimulatedComments(campaignId) {
+    return this.createComments(campaignId, false);
+  }
+
+  async createComments(campaignId, isLive = false) {
     try {
       const posts = await this.getRecentPosts(campaignId);
-      console.log('Found posts for commenting:', posts);
+      const campaign = await this.getCampaign(campaignId);
       
+      if (!campaign) throw new Error(`Campaign not found: ${campaignId}`);
+
       for (const post of posts) {
-        const numComments = Math.floor(Math.random() * 5) + 2; // 2-6 comments
-        console.log(`Generating ${numComments} comments for post:`, post.id);
-        
-        // Get the campaign details for context
-        const campaign = await this.getCampaign(campaignId);
-        if (!campaign) {
-          throw new Error(`Campaign not found: ${campaignId}`);
-        }
-        
+        // Get existing comment authors for this post to exclude them
+        const existingAuthors = await this.getPostCommentAuthors(post.id);
+        console.log(`Post ${post.id} has existing authors:`, existingAuthors);
+
+        const numComments = Math.floor(Math.random() * 3) + 2; // 2-4 comments
+        console.log(`Generating ${numComments} comments for post ${post.id}`);
+
         for (let i = 0; i < numComments; i++) {
-          await this.createSimulatedComment(post, campaign); // Pass the full post object
+          try {
+            await this.createComment(post, campaign, isLive, existingAuthors);
+            // Add a small delay between comments
+            await new Promise(resolve => setTimeout(resolve, Math.random() * 500 + 500));
+          } catch (error) {
+            if (error.message.includes('No available accounts')) {
+              console.log('No more unique accounts available for commenting');
+              break;
+            }
+            console.error(`Error creating comment ${i + 1}:`, error);
+          }
+        }
+
+        // 30% chance to create a reply to an existing comment
+        if (Math.random() < 0.3) {
+          const randomComment = await this.getRandomPostComment(post.id);
+          if (randomComment) {
+            const existingReplyAuthors = await this.getCommentReplyAuthors(randomComment.id);
+            try {
+              await this.createComment(post, campaign, isLive, [...existingAuthors, ...existingReplyAuthors], randomComment.id);
+            } catch (error) {
+              console.error('Error creating reply:', error);
+            }
+          }
         }
       }
     } catch (error) {
-      console.error('Error in createSimulatedComments:', error);
+      console.error('Error creating comments:', error);
       throw error;
     }
+  }
+
+  async createComment(post, campaign, isLive = false, excludeAccountIds = [], parentCommentId = null) {
+    try {
+      // Check live mode constraints
+      if (isLive) {
+        const now = new Date();
+        const startDate = campaign.start_date ? new Date(campaign.start_date) : null;
+        const endDate = campaign.end_date ? new Date(campaign.end_date) : null;
+
+        if (startDate && now < startDate) {
+          throw new Error('Campaign has not started yet');
+        }
+        if (endDate && now > endDate) {
+          throw new Error('Campaign has ended');
+        }
+
+        // Check if enough time has passed since last comment
+        const lastComment = await this.getLastComment(campaign.id);
+        if (lastComment) {
+          const hoursSinceLastComment = (now - new Date(lastComment.posted_at)) / (1000 * 60 * 60);
+          if (hoursSinceLastComment < campaign.min_reply_interval_hours) {
+            throw new Error('Minimum reply interval not reached');
+          }
+        }
+      }
+
+      const handler = platformHandlers[post.platform];
+      if (!handler) throw new Error(`Unsupported platform: ${post.platform}`);
+
+      // Get a random account that hasn't commented on this post yet
+      const account = await this.getRandomAccount(post.platform, excludeAccountIds);
+      if (!account) throw new Error(`No available ${post.platform} accounts found for commenting`);
+
+      const content = await this.generateComment(post, campaign, handler);
+
+      const commentData = await (isLive ?
+        handler.createLiveComment(post, campaign, account, content, parentCommentId) :
+        handler.createSimulatedComment(post, campaign, account, content));
+
+      const result = await pool.query(
+        `INSERT INTO comments 
+         (post_id, social_account_id, parent_comment_id, platform_comment_id,
+          content, status, sentiment_score, engagement_metrics, posted_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+         RETURNING *`,
+        [
+          commentData.post_id,
+          commentData.social_account_id,
+          parentCommentId,
+          commentData.platform_comment_id,
+          commentData.content,
+          commentData.status,
+          commentData.sentiment_score,
+          commentData.engagement_metrics
+        ]
+      );
+
+      return result.rows[0];
+    } catch (error) {
+      console.error('Error creating comment:', error);
+      throw error;
+    }
+  }
+
+  async generateComment(post, campaign, handler) {
+    try {
+      const persona = this.generateCommentPersona(campaign, post);
+      const prompt = handler.buildPrompt(post, campaign);
+
+      const completion = await openai.createChatCompletion({
+        model: "gpt-4",
+        messages: [
+          { role: "system", content: persona },
+          { role: "user", content: prompt }
+        ],
+        temperature: 1.0,
+        presence_penalty: 1.0,
+        frequency_penalty: 1.0,
+        top_p: 0.9
+      });
+
+      const comment = completion.data?.choices?.[0]?.message?.content.trim();
+      if (!comment) throw new Error('Failed to generate comment');
+
+      return comment;
+    } catch (error) {
+      console.error('Error generating comment:', error);
+      throw error;
+    }
+  }
+
+  generateCommentPersona(campaign, post) {
+    return `You are someone engaging naturally with this ${post.platform} post about ${campaign.campaign_goal}.
+
+Your role: A genuine participant in this discussion who has relevant experience to share.
+Your style: Write conversationally, matching the tone of ${post.platform}.
+Your approach: 
+- Vary your comment style (sometimes ask questions, sometimes share experiences, sometimes offer insights)
+- React to specific points in the post
+- Add value to the discussion
+- Stay authentic and avoid generic responses
+- Match the tone of the platform and community
+
+Remember: Each comment should feel unique and natural, as if coming from a different real person.`;
   }
 
   async getCampaign(campaignId) {
@@ -50,87 +290,6 @@ class CommentingService {
     );
     return result.rows;
   }
-
-
-  async createSimulatedComment(post, campaign) {
-    try {
-      console.log('Creating simulated comment for post:', post);
-
-      if (!post || !post.id) {
-        throw new Error('Invalid post data - missing post ID');
-      }
-
-      // Get a random account for commenting
-      const account = await this.getRandomAccount('reddit');
-      if (!account) {
-        throw new Error('No available Reddit account found');
-      }
-      console.log('Selected account for comment:', account.id);
-
-      // Generate the comment content
-      const content = await this.generateComment(post, campaign);
-      console.log('Generated comment content:', content);
-
-      // Insert the comment into the database
-      const query = `
-        INSERT INTO comments 
-        (post_id, social_account_id, content, status, sentiment_score, engagement_metrics, posted_at)
-        VALUES ($1, $2, $3, 'simulated', $4, $5, NOW())
-        RETURNING *`;
-
-      const values = [
-        post.id,                    // Use post.id here
-        account.id,
-        content,
-        Math.random() * 2 - 1,     // Random sentiment between -1 and 1
-        JSON.stringify({
-          likes: Math.floor(Math.random() * 50),
-          replies: Math.floor(Math.random() * 5)
-        })
-      ];
-
-      console.log('Executing comment insert query:', query);
-      console.log('With values:', values);
-
-      const result = await pool.query(query, values);
-      
-      if (!result.rows[0]) {
-        throw new Error('Failed to insert comment into database');
-      }
-
-      console.log('Successfully created comment:', result.rows[0]);
-      return result.rows[0];
-
-    } catch (error) {
-      console.error('Error creating simulated comment:', error);
-      throw error;
-    }
-  }
-  
-
-  generateCommentPersona(campaign, post) {
-    if (!post || !post.content) {
-      console.error('Invalid post data:', post);
-      throw new Error('Cannot generate persona without post content');
-    }
-
-    // Safely handle content
-    const postContent = (post.content || '').toLowerCase();
-    const campaignGoal = campaign.goal || '';
-
-    return `You are someone engaging naturally with this post about ${campaignGoal}.
-
-Your role: A genuine participant in this discussion who has relevant experience to share.
-Your style: Write conversationally, as if responding to a colleague or peer.
-Your approach: 
-- React to specific points from the post content: "${postContent}"
-- Add value to the discussion
-- Stay authentic and avoid generic responses
-- Match the tone of the community
-
-Remember: Each comment should feel unique and natural, as if coming from a different real person.`;
-  }
-
 
   async getPostCommentAuthors(postId) {
     const result = await pool.query(
@@ -166,7 +325,6 @@ Remember: Each comment should feel unique and natural, as if coming from a diffe
     );
     return result.rows[0];
   }
-
 
   async createLiveComments(campaignId) {
     const posts = await this.getRecentPosts(campaignId);
@@ -216,91 +374,6 @@ Remember: Each comment should feel unique and natural, as if coming from a diffe
     }
   }
 
-  async generateComment(post, campaign) {
-    try {
-      // Create dynamic persona based on campaign and post context
-      const persona = this.generateCommentPersona(campaign, post);
-      const prompt = this.buildCommentPrompt(post, campaign);
-
-      console.log('Using comment persona:', persona);
-      console.log('Using comment prompt:', prompt);
-
-      const completion = await openai.createChatCompletion({
-        model: "gpt-4",
-        messages: [
-          {
-            role: "system",
-            content: persona
-          },
-          {
-            role: "user",
-            content: prompt
-          }
-        ],
-        temperature: 1.0,        // Maximum creativity
-        presence_penalty: 1.0,   // Strongly encourage unique content
-        frequency_penalty: 1.0,  // Strongly discourage repetitive patterns
-        top_p: 0.9              // Allow more diverse word choices
-      });
-
-      const comment = completion.data?.choices?.[0]?.message?.content.trim();
-      if (!comment) throw new Error('Failed to generate comment');
-
-      console.log('Generated comment:', comment);
-      return comment;
-    } catch (error) {
-      console.error('Error generating comment:', error);
-      throw error;
-    }
-  }
-
-  generateCommentPersona(campaign, post) {
-    // Analyze the post content to understand context
-    const postContent = post.content.toLowerCase();
-    const campaignGoal = campaign.goal;
-
-    return `You are someone engaging naturally with this post about ${campaignGoal}.
-
-Your role: A genuine participant in this discussion who has relevant experience to share.
-Your style: Write conversationally, as if responding to a colleague or peer.
-Your approach: 
-- Vary your comment style (sometimes ask questions, sometimes share experiences, sometimes offer insights)
-- React to specific points in the post
-- Add value to the discussion
-- Stay authentic and avoid generic responses
-- Match the tone of the community
-
-Remember: Each comment should feel unique and natural, as if coming from a different real person.`;
-  }
-
-  buildCommentPrompt(post, campaign) {
-    return `Read this post and create a natural, engaging comment that adds value to the discussion:
-
-POST:
-${post.content}
-
-Your comment should:
-1. Reference specific points from the post
-2. Share relevant personal experience
-3. Encourage further discussion
-4. Feel like a genuine response
-
-Campaign context: ${campaign.comment_goal}
-
-Create a unique comment that naturally fits this conversation.`;
-  }
-
-  async getRecentPosts(campaignId) {
-    const result = await pool.query(
-      `SELECT * FROM posts 
-       WHERE campaign_id = $1 
-       AND posted_at > NOW() - INTERVAL '24 hours'
-       ORDER BY posted_at DESC`,
-      [campaignId]
-    );
-    return result.rows;
-  }
-
   async getPost(postId) {
     const result = await pool.query(
       'SELECT * FROM posts WHERE id = $1',
@@ -309,15 +382,41 @@ Create a unique comment that naturally fits this conversation.`;
     return result.rows[0];
   }
 
-  async getRandomAccount(platform) {
-    const result = await pool.query(
-      `SELECT * FROM social_accounts 
-       WHERE platform = $1 AND status = 'active'
-       ORDER BY last_used_at ASC NULLS FIRST
-       LIMIT 1`,
-      [platform]
-    );
-    return result.rows[0];
+  async getRandomAccount(platform, excludeIds = []) {
+    try {
+      const query = `
+        SELECT * FROM social_accounts 
+        WHERE platform = $1 
+        AND status = 'active'
+        ${excludeIds.length > 0 ? 'AND id != ANY($2)' : ''}
+        ORDER BY RANDOM()
+        LIMIT 1`;
+      
+      const params = excludeIds.length > 0 ? [platform, excludeIds] : [platform];
+      const result = await pool.query(query, params);
+      
+      if (!result.rows[0]) {
+        // If no accounts are available (excluding the excluded ones), create a new one
+        const username = `user_${Math.floor(Math.random() * 10000)}`;
+        const newAccount = await pool.query(
+          `INSERT INTO social_accounts 
+           (platform, username, credentials, status)
+           VALUES ($1, $2, $3, 'active')
+           RETURNING *`,
+          [
+            platform,
+            username,
+            JSON.stringify({ password: 'default_password' })
+          ]
+        );
+        return newAccount.rows[0];
+      }
+
+      return result.rows[0];
+    } catch (error) {
+      console.error('Error getting random account:', error);
+      throw error;
+    }
   }
 
   async shouldCreateComment(post) {
@@ -328,6 +427,25 @@ Create a unique comment that naturally fits this conversation.`;
     if (hoursSincePost > 24) return false;
     
     return Math.random() < (1 / hoursSincePost);
+  }
+
+  async getLastComment(campaignId) {
+    const result = await pool.query(
+      `SELECT c.* FROM comments c
+       JOIN posts p ON c.post_id = p.id
+       WHERE p.campaign_id = $1
+       ORDER BY c.posted_at DESC LIMIT 1`,
+      [campaignId]
+    );
+    return result.rows[0];
+  }
+
+  async getCommentReplyAuthors(commentId) {
+    const result = await pool.query(
+      'SELECT DISTINCT social_account_id FROM comments WHERE parent_comment_id = $1',
+      [commentId]
+    );
+    return result.rows.map(row => row.social_account_id);
   }
 }
 

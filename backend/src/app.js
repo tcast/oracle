@@ -90,20 +90,24 @@ app.post('/api/campaigns', async (req, res) => {
     await client.query('BEGIN');
     
     const campaignResult = await client.query(
-      'INSERT INTO campaigns (name, campaign_goal, post_goal, comment_goal, target_sentiment, is_live) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-      [name, campaign_goal, post_goal, comment_goal, target_sentiment, is_live]
+      `INSERT INTO campaigns 
+       (name, campaign_goal, post_goal, comment_goal, target_sentiment, is_live, platform, target_url, media_assets)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::text[], $8, $9::jsonb)
+       RETURNING *`,
+      [
+        name, 
+        campaign_goal, 
+        post_goal, 
+        comment_goal, 
+        target_sentiment, 
+        is_live, 
+        networks || [], 
+        target_url, 
+        media_assets ? JSON.stringify(media_assets) : null
+      ]
     );
     
-    if (networks && networks.length > 0) {
-      for (const network of networks) {
-        await client.query(
-          'INSERT INTO campaign_networks (campaign_id, network_type, settings) VALUES ($1, $2, $3)',
-          [campaignResult.rows[0].id, network, {}]
-        );
-      }
-    }
-    
-    if (is_live && networks.includes('reddit')) {
+    if (is_live && networks?.includes('reddit')) {
       const accounts = await seleniumService.verifyAccounts('reddit');
       if (!accounts.length) {
         throw new Error('No valid Reddit accounts available for live mode');
@@ -114,6 +118,7 @@ app.post('/api/campaigns', async (req, res) => {
     res.json(campaignResult.rows[0]);
   } catch (err) {
     await client.query('ROLLBACK');
+    console.error('Error creating campaign:', err);
     res.status(500).json({ error: err.message });
   } finally {
     client.release();
@@ -130,6 +135,14 @@ app.delete('/api/campaigns/:id', async (req, res) => {
     // Stop any running tasks
     await taskQueue.stopCampaign(campaignId);
 
+    // Delete in order of dependencies
+    // 1. Delete subreddit suggestions
+    await client.query(
+      'DELETE FROM subreddit_suggestions WHERE campaign_id = $1',
+      [campaignId]
+    );
+
+    // 2. Delete comments
     await client.query(
       `DELETE FROM comments c
        USING posts p
@@ -138,24 +151,13 @@ app.delete('/api/campaigns/:id', async (req, res) => {
       [campaignId]
     );
 
+    // 3. Delete posts
     await client.query(
       'DELETE FROM posts WHERE campaign_id = $1',
       [campaignId]
     );
 
-    await client.query(
-      `DELETE FROM campaign_subreddits cs
-       USING campaign_networks cn
-       WHERE cs.campaign_network_id = cn.id
-       AND cn.campaign_id = $1`,
-      [campaignId]
-    );
-
-    await client.query(
-      'DELETE FROM campaign_networks WHERE campaign_id = $1',
-      [campaignId]
-    );
-
+    // 4. Finally delete the campaign
     await client.query(
       'DELETE FROM campaigns WHERE id = $1',
       [campaignId]
@@ -171,6 +173,7 @@ app.delete('/api/campaigns/:id', async (req, res) => {
     client.release();
   }
 });
+
 app.get('/api/campaigns/:id/simulation/status', async (req, res) => {
   try {
     const status = await taskQueue.getCampaignStatus(req.params.id);

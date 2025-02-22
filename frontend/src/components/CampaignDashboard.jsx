@@ -21,7 +21,15 @@ const CampaignDashboard = () => {
     is_live: false,
     networks: [],
     target_url: '',
-    media_assets: []
+    media_assets: [],
+    start_date: '',
+    end_date: '',
+    posts_per_subreddit: 1,
+    posts_per_linkedin: 1,
+    min_post_interval_hours: 1,
+    max_post_interval_hours: 24,
+    min_reply_interval_hours: 0.5,
+    max_reply_interval_hours: 12
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -91,7 +99,15 @@ const CampaignDashboard = () => {
         is_live: false,
         networks: [],
         target_url: '',
-        media_assets: []
+        media_assets: [],
+        start_date: '',
+        end_date: '',
+        posts_per_subreddit: 1,
+        posts_per_linkedin: 1,
+        min_post_interval_hours: 1,
+        max_post_interval_hours: 24,
+        min_reply_interval_hours: 0.5,
+        max_reply_interval_hours: 12
       });
     } catch (err) {
       setError(err.message);
@@ -234,6 +250,115 @@ const CampaignDashboard = () => {
             onNetworksChange={(networks) => setNewCampaign({...newCampaign, networks})}
             campaign={newCampaign}
           />
+
+          {/* Campaign Schedule */}
+          <div className="space-y-4">
+            <h3 className="text-lg font-medium">Campaign Schedule</h3>
+            
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700">Posts per Subreddit</label>
+                <input
+                  type="number"
+                  min="1"
+                  className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                  value={newCampaign.posts_per_subreddit}
+                  onChange={(e) => setNewCampaign({...newCampaign, posts_per_subreddit: parseInt(e.target.value)})}
+                />
+              </div>
+              
+              <div>
+                <label className="block text-sm font-medium text-gray-700">Posts per LinkedIn</label>
+                <input
+                  type="number"
+                  min="1"
+                  className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                  value={newCampaign.posts_per_linkedin}
+                  onChange={(e) => setNewCampaign({...newCampaign, posts_per_linkedin: parseInt(e.target.value)})}
+                />
+              </div>
+            </div>
+
+            {/* Live Mode Settings */}
+            <div className={`space-y-4 ${newCampaign.is_live ? '' : 'opacity-50 pointer-events-none'}`}>
+              <h4 className="text-md font-medium">Live Mode Settings</h4>
+              
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700">Start Date</label>
+                  <input
+                    type="date"
+                    className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                    value={newCampaign.start_date}
+                    onChange={(e) => setNewCampaign({...newCampaign, start_date: e.target.value})}
+                  />
+                </div>
+                
+                <div>
+                  <label className="block text-sm font-medium text-gray-700">End Date</label>
+                  <input
+                    type="date"
+                    className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                    value={newCampaign.end_date}
+                    onChange={(e) => setNewCampaign({...newCampaign, end_date: e.target.value})}
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700">Min Post Interval (hours)</label>
+                  <input
+                    type="number"
+                    min="0.1"
+                    step="0.1"
+                    className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                    value={newCampaign.min_post_interval_hours}
+                    onChange={(e) => setNewCampaign({...newCampaign, min_post_interval_hours: parseFloat(e.target.value)})}
+                  />
+                </div>
+                
+                <div>
+                  <label className="block text-sm font-medium text-gray-700">Max Post Interval (hours)</label>
+                  <input
+                    type="number"
+                    min="0.1"
+                    step="0.1"
+                    className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                    value={newCampaign.max_post_interval_hours}
+                    onChange={(e) => setNewCampaign({...newCampaign, max_post_interval_hours: parseFloat(e.target.value)})}
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-gray-700">Min Reply Interval (hours)</label>
+                  <input
+                    type="number"
+                    min="0.1"
+                    step="0.1"
+                    className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                    value={newCampaign.min_reply_interval_hours}
+                    onChange={(e) => setNewCampaign({...newCampaign, min_reply_interval_hours: parseFloat(e.target.value)})}
+                  />
+                </div>
+                
+                <div>
+                  <label className="block text-sm font-medium text-gray-700">Max Reply Interval (hours)</label>
+                  <input
+                    type="number"
+                    min="0.1"
+                    step="0.1"
+                    className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                    value={newCampaign.max_reply_interval_hours}
+                    onChange={(e) => setNewCampaign({...newCampaign, max_reply_interval_hours: parseFloat(e.target.value)})}
+                  />
+                </div>
+              </div>
+              <p className="text-sm text-gray-500 italic">
+                These settings only apply in live mode and control when the campaign runs and how frequently posts and replies are made.
+              </p>
+            </div>
+          </div>
 
           <div className="flex items-center">
             <input
