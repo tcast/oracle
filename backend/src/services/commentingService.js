@@ -159,6 +159,59 @@ ${traits.quirks?.includes('uses_emojis') ? '4. Use one relevant emoji' : ''}
 
 Write like you're in the middle of a Twitter thread - direct and engaging.`;
     }
+  },
+
+  tiktok: {
+    createSimulatedComment: async (post, campaign, account, content) => {
+      return {
+        post_id: post.id,
+        social_account_id: account.id,
+        content,
+        status: 'simulated',
+        sentiment_score: Math.random() * 2 - 1,
+        engagement_metrics: {
+          likes: Math.floor(Math.random() * 1000),
+          replies: Math.floor(Math.random() * 50),
+          shares: Math.floor(Math.random() * 100)
+        }
+      };
+    },
+
+    createLiveComment: async (post, campaign, account, content, parentCommentId = null) => {
+      const platformCommentId = await seleniumService.postComment(
+        'tiktok',
+        account.id,
+        post.platform_post_id,
+        content,
+        parentCommentId
+      );
+
+      return {
+        post_id: post.id,
+        social_account_id: account.id,
+        parent_comment_id: parentCommentId,
+        platform_comment_id: platformCommentId,
+        content,
+        status: 'posted'
+      };
+    },
+
+    buildPrompt: (post, campaign, account) => {
+      const traits = account.persona_traits || {};
+      return `Read this TikTok post and write a brief, ${traits.tone || 'engaging'} comment:
+
+VIDEO CAPTION:
+${post.caption}
+
+Quick guidelines:
+1. Get straight to your point - no greetings or introductions
+2. Keep it under 150 characters
+3. Add value to the conversation
+${traits.quirks?.includes('uses_emojis') ? '4. Use one relevant emoji' : ''}
+${traits.quirks?.includes('casual_slang') ? '4. Use casual, trendy language' : ''}
+
+Write like you're commenting on a TikTok - brief, engaging, and authentic.`;
+    }
   }
 };
 

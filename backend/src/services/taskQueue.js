@@ -12,6 +12,11 @@ class TaskQueue {
     this.initialize();
   }
 
+  // Add getter for activeCampaigns
+  get activeCampaigns() {
+    return Array.from(this.activeIntervals.keys()).map(id => parseInt(id));
+  }
+
   async initialize() {
     // Handle simulation tasks
     this.taskSubject.pipe(
@@ -140,11 +145,15 @@ class TaskQueue {
       try {
         const post = await postingService.createSimulatedPost(campaignId);
         if (!post) {
-          console.log('Campaign has reached all post limits - continuing for comments only');
+          console.log('Post limit reached for campaign - continuing for comments only');
         }
       } catch (error) {
-        if (!error.message.includes('Post limit reached')) {
-          console.error('Error creating post:', error.message);
+        // Check if this is a post limit message (expected behavior)
+        if (error.message.includes('post limit') || error.message.includes('posts limit')) {
+          console.log(`Post limit reached for campaign ${campaignId} - continuing for comments only`);
+        } else {
+          console.error('Error creating simulated post:', error);
+          throw error; // Only throw if it's not a post limit error
         }
       }
 
@@ -152,7 +161,12 @@ class TaskQueue {
       try {
         await commentingService.createSimulatedComments(campaignId);
       } catch (error) {
-        console.error('Error creating comments:', error.message);
+        if (error.message.includes('comment limit')) {
+          console.log(`Comment limit reached for campaign ${campaignId}`);
+        } else {
+          console.error('Error creating comments:', error);
+          throw error; // Only throw if it's not a comment limit error
+        }
       }
 
       // Check if we should continue (only if campaign is still marked as running)
@@ -165,10 +179,12 @@ class TaskQueue {
         setTimeout(() => this.addTask(campaignId, 'simulation'), delay);
       }
     } catch (error) {
-      console.error('Error handling simulation task:', error);
-      // Don't stop on error unless it's critical
-      const delay = Math.floor(Math.random() * 5000) + 5000; // 5-10 seconds
-      setTimeout(() => this.addTask(campaignId, 'simulation'), delay);
+      if (!error.message.includes('post limit') && !error.message.includes('comment limit')) {
+        console.error('Error handling simulation task:', error);
+        // Don't stop on error unless it's critical
+        const delay = Math.floor(Math.random() * 5000) + 5000; // 5-10 seconds
+        setTimeout(() => this.addTask(campaignId, 'simulation'), delay);
+      }
     }
   }
 

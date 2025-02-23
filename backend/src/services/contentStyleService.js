@@ -19,7 +19,7 @@ class ContentStyleService {
   }
 
   generateBasePrompt(networkStyle, contentType, context) {
-    const { tone_guidelines, structure_guidelines, purpose_guidelines } = networkStyle;
+    const { tone_guidelines = {}, structure_guidelines = {}, purpose_guidelines = {} } = networkStyle || {};
 
     if (contentType === 'post') {
       return this.generatePostPrompt(networkStyle, context);
@@ -38,15 +38,27 @@ Campaign goal: ${context.campaign_goal}
 Post goal: ${context.post_goal}
 
 Tone:
-${Object.entries(tone_guidelines).map(([key, value]) => `- ${key}: ${value}`).join('\n')}
+${Array.isArray(tone_guidelines) ? tone_guidelines.map(guideline => `- ${guideline}`).join('\n') : 
+  Object.entries(tone_guidelines).map(([key, value]) => 
+    Array.isArray(value) ? `- ${key}: ${value.join(', ')}` : `- ${key}: ${value}`
+  ).join('\n')}
 
 Purpose:
-${Object.entries(purpose_guidelines).map(([key, value]) => `- ${key}: ${value}`).join('\n')}
+${Array.isArray(purpose_guidelines) ? purpose_guidelines.map(guideline => `- ${guideline}`).join('\n') : 
+  Object.entries(purpose_guidelines).map(([key, value]) => 
+    Array.isArray(value) ? `- ${key}: ${value.join(', ')}` : `- ${key}: ${value}`
+  ).join('\n')}
 
 Format Rules:
-${Array.isArray(format_rules) && format_rules.length > 0 
-  ? format_rules.join('\n') 
-  : '- Keep it natural and authentic'}`;
+${Array.isArray(format_rules) ? format_rules.map(rule => `- ${rule}`).join('\n') : 
+  format_rules?.formatting_options ? format_rules.formatting_options.map(format => {
+    switch(format) {
+      case 'bullet_points': return '- If using bullet points, each must be on a new line starting with •';
+      case 'paragraphs': return '- Separate distinct ideas into paragraphs with blank lines between them';
+      case 'links': return '- Format any links using markdown: [text](url)';
+      default: return '';
+    }
+  }).filter(Boolean).join('\n') : '- Keep it natural and authentic'}`;
 
     // Add platform-specific structure guidelines
     if (context.platform === 'reddit') {
@@ -66,19 +78,23 @@ Subreddit-specific guidelines:
 ${contentRules.length > 0 
   ? contentRules.map(rule => `- ${rule}`).join('\n')
   : '- Follow general Reddit etiquette and be respectful of the community'}`;
-    } else if (context.platform === 'linkedin') {
-      const opening = structure_guidelines.opening || {};
-      const body = structure_guidelines.body || {};
-      const closing = structure_guidelines.closing || {};
+    } else if (context.platform === 'tiktok') {
+      const { length = {}, formats = [], elements = [] } = structure_guidelines;
       
       prompt += `
-- Opening: Start with a ${opening.style || 'professional'} ${opening.elements ? opening.elements.join(' or ') : 'introduction'}
-- Body:
-  * Use clear paragraphs
-  * Include specific examples or experiences
-  * ${body.format ? `Format using ${body.format.join(' or ')}` : 'Use professional formatting'}
-  * ${body.elements ? `Include all these elements: ${body.elements.join(', ')}` : 'Structure content professionally'}
-- Closing: ${closing.type ? `End with a ${closing.type} using ${closing.elements ? closing.elements.join(' or ') : 'call to action'}` : 'End with a clear conclusion or call to action'}`;
+Video Requirements:
+- Maximum duration: ${format_rules?.video_requirements?.max_duration || 180} seconds
+- Preferred duration: ${format_rules?.video_requirements?.preferred_duration || 60} seconds
+- Allowed formats: ${format_rules?.video_requirements?.formats?.join(', ') || 'mp4, mov'}
+
+Caption Requirements:
+- Maximum length: ${length.max_chars || 150} characters
+- Optimal range: ${length.optimal_range || '50-100'} characters
+- Required elements: ${elements.join(', ')}
+- Allowed formats: ${formats.join(', ')}
+
+Allowed Elements:
+${format_rules?.allowed_elements?.map(element => `- ${element}`).join('\n') || '- text\n- hashtags\n- mentions\n- emojis'}`;
     } else if (context.platform === 'x') {
       const tweet = structure_guidelines.tweet || {};
       
@@ -92,19 +108,7 @@ ${contentRules.length > 0
   * End with a ${tweet.closing || 'clear call to action or thought-provoking point'}`;
     }
 
-    prompt += `
-
-Format Requirements:
-${format_rules?.formatting_options ? format_rules.formatting_options.map(format => {
-  switch(format) {
-    case 'bullet_points': return '- If using bullet points, each must be on a new line starting with •';
-    case 'paragraphs': return '- Separate distinct ideas into paragraphs with blank lines between them';
-    case 'links': return '- Format any links using markdown: [text](url)';
-    default: return '';
-  }
-}).filter(Boolean).join('\n') : '- Use clear, readable formatting'}
-
-Important: Your response MUST follow all these requirements exactly. Do not skip any requirements.`;
+    prompt += `\n\nImportant: Your response MUST follow all these requirements exactly. Do not skip any requirements.`;
 
     return prompt;
   }

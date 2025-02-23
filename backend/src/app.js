@@ -83,6 +83,19 @@ app.get('/api/campaigns', async (req, res) => {
   }
 });
 
+app.get('/api/campaigns/:id', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM campaigns WHERE id = $1', [req.params.id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Campaign not found' });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error fetching campaign:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/campaigns', async (req, res) => {
   const { 
     name, 
@@ -134,6 +147,115 @@ app.post('/api/campaigns', async (req, res) => {
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('Error creating campaign:', err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.put('/api/campaigns/:id', async (req, res) => {
+  const { 
+    name, 
+    campaign_overview,
+    campaign_goal, 
+    post_goal, 
+    comment_goal, 
+    target_sentiment, 
+    is_live, 
+    platform, 
+    target_url, 
+    media_assets,
+    posts_per_subreddit,
+    posts_per_linkedin,
+    posts_per_x,
+    posts_per_tiktok,
+    total_x_posts,
+    total_tiktok_posts,
+    min_post_interval_hours,
+    max_post_interval_hours,
+    min_reply_interval_hours,
+    max_reply_interval_hours
+  } = req.body;
+  
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
+    
+    // Check if campaign exists
+    const existingCampaign = await client.query(
+      'SELECT * FROM campaigns WHERE id = $1',
+      [req.params.id]
+    );
+
+    if (existingCampaign.rows.length === 0) {
+      throw new Error('Campaign not found');
+    }
+
+    // Update campaign
+    const campaignResult = await client.query(
+      `UPDATE campaigns 
+       SET name = $1,
+           campaign_overview = $2,
+           campaign_goal = $3,
+           post_goal = $4,
+           comment_goal = $5,
+           target_sentiment = $6,
+           is_live = $7,
+           platform = $8::text[],
+           target_url = $9,
+           media_assets = $10::jsonb,
+           posts_per_subreddit = $11,
+           posts_per_linkedin = $12,
+           posts_per_x = $13,
+           posts_per_tiktok = $14,
+           total_x_posts = $15,
+           total_tiktok_posts = $16,
+           min_post_interval_hours = $17,
+           max_post_interval_hours = $18,
+           min_reply_interval_hours = $19,
+           max_reply_interval_hours = $20,
+           updated_at = NOW()
+       WHERE id = $21
+       RETURNING *`,
+      [
+        name,
+        campaign_overview,
+        campaign_goal,
+        post_goal,
+        comment_goal,
+        target_sentiment,
+        is_live,
+        platform || [],
+        target_url,
+        media_assets ? JSON.stringify(media_assets) : null,
+        posts_per_subreddit,
+        posts_per_linkedin,
+        posts_per_x,
+        posts_per_tiktok,
+        total_x_posts,
+        total_tiktok_posts,
+        min_post_interval_hours,
+        max_post_interval_hours,
+        min_reply_interval_hours,
+        max_reply_interval_hours,
+        req.params.id
+      ]
+    );
+    
+    // If switching to live mode, verify accounts
+    if (is_live && platform?.includes('reddit') && !existingCampaign.rows[0].is_live) {
+      const accounts = await seleniumService.verifyAccounts('reddit');
+      if (!accounts.length) {
+        throw new Error('No valid Reddit accounts available for live mode');
+      }
+    }
+    
+    await client.query('COMMIT');
+    res.json(campaignResult.rows[0]);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Error updating campaign:', err);
     res.status(500).json({ error: err.message });
   } finally {
     client.release();
@@ -291,22 +413,25 @@ app.get('/api/campaigns/:id/posts', async (req, res) => {
     const organizedPosts = {
       reddit: {},
       linkedin: [],
-      x: []
+      x: [],
+      tiktok: []
     };
 
+    // Organize posts into their respective platforms
     postsResult.rows.forEach(post => {
       post.comments = buildCommentTree(commentsByPost[post.id] || []);
       
-      if (post.platform === 'linkedin') {
-        organizedPosts.linkedin.push(post);
-      } else if (post.platform === 'x') {
-        organizedPosts.x.push(post);
-      } else {
-        // Reddit posts are organized by subreddit
+      if (post.platform === 'reddit') {
         if (!organizedPosts.reddit[post.subreddit]) {
           organizedPosts.reddit[post.subreddit] = [];
         }
         organizedPosts.reddit[post.subreddit].push(post);
+      } else if (post.platform === 'linkedin') {
+        organizedPosts.linkedin.push(post);
+      } else if (post.platform === 'x') {
+        organizedPosts.x.push(post);
+      } else if (post.platform === 'tiktok') {
+        organizedPosts.tiktok.push(post);
       }
     });
 
@@ -399,8 +524,11 @@ app.get('/api/campaigns/:id/analytics', async (req, res) => {
     // Transform dates to timestamps for the chart
     const analytics = result.rows.map(row => ({
       ...row,
-      date: row.date.getTime() // Convert to timestamp for the chart
-    }));
+      date: row.date ? row.date.getTime() : null,
+      posts: parseInt(row.posts || 0, 10),
+      comments: parseInt(row.comments || 0, 10),
+      engagement: parseInt(row.engagement || 0, 10)
+    })).filter(row => row.date !== null);
 
     res.json(analytics);
   } catch (err) {
@@ -428,12 +556,22 @@ const storage = multer.diskStorage({
 const upload = multer({
   storage: storage,
   limits: {
-    fileSize: 5 * 1024 * 1024 // 5MB limit
+    fileSize: 100 * 1024 * 1024 // 100MB limit for videos
   },
   fileFilter: (req, file, cb) => {
-    if (!file.mimetype.startsWith('image/')) {
-      return cb(new Error('Only images are allowed'));
+    // Allow both images and videos
+    if (!file.mimetype.startsWith('image/') && !file.mimetype.startsWith('video/')) {
+      return cb(new Error('Only images and videos are allowed'));
     }
+    
+    // Additional check for video files
+    if (file.mimetype.startsWith('video/')) {
+      const allowedVideoTypes = ['video/mp4', 'video/quicktime'];
+      if (!allowedVideoTypes.includes(file.mimetype)) {
+        return cb(new Error('Only MP4 and MOV video formats are allowed'));
+      }
+    }
+    
     cb(null, true);
   }
 });
@@ -446,9 +584,19 @@ app.post('/api/upload', upload.single('media'), async (req, res) => {
     }
 
     const url = `/uploads/${req.file.filename}`;
+    
+    // For video files, get the duration
+    let duration;
+    if (req.file.mimetype.startsWith('video/')) {
+      // You might want to use ffmpeg or another library to get video duration
+      // For now, we'll just return a placeholder duration
+      duration = 0;
+    }
+
     res.json({
       url,
-      type: req.file.mimetype
+      type: req.file.mimetype,
+      duration
     });
   } catch (err) {
     console.error('Error uploading file:', err);

@@ -263,6 +263,121 @@ Content Requirements:
             mentions: campaign.metadata?.mentions || []
           };
         }
+      },
+
+      tiktok: {
+        createSimulatedPost: async (campaign, account, content, context) => {
+          // For TikTok, we need both a video and a caption
+          const mediaResult = await pool.query(
+            `SELECT media_assets FROM campaigns WHERE id = $1`,
+            [campaign.id]
+          );
+          
+          const mediaAssets = mediaResult.rows[0]?.media_assets || [];
+          const videoAsset = mediaAssets.find(asset => 
+            asset.type.startsWith('video/')
+          );
+          
+          if (!videoAsset) {
+            throw new Error('No video assets available for TikTok post');
+          }
+
+          const caption = await this.generateContent('caption', campaign, {
+            platform: 'tiktok',
+            videoContext: 'TikTok video showcasing the campaign message'
+          });
+
+          return {
+            campaign_id: campaign.id,
+            social_account_id: account.id,
+            platform: 'tiktok',
+            video_url: videoAsset.url,
+            caption,
+            status: 'simulated',
+            metadata: {
+              videoContext: 'TikTok video showcasing the campaign message'
+            }
+          };
+        },
+
+        createLivePost: async (campaign, account, content, context) => {
+          // For TikTok, we need both a video and a caption
+          const mediaResult = await pool.query(
+            `SELECT media_assets FROM campaigns WHERE id = $1`,
+            [campaign.id]
+          );
+          
+          const mediaAssets = mediaResult.rows[0]?.media_assets || [];
+          const videoAsset = mediaAssets.find(asset => 
+            asset.type.startsWith('video/')
+          );
+          
+          if (!videoAsset) {
+            throw new Error('No video assets available for TikTok post');
+          }
+
+          const caption = await this.generateContent('caption', campaign, {
+            platform: 'tiktok',
+            videoContext: 'TikTok video showcasing the campaign message'
+          });
+
+          const platformPostId = await seleniumService.createTikTokPost(
+            account.id,
+            videoAsset.url,
+            caption
+          );
+
+          return {
+            campaign_id: campaign.id,
+            social_account_id: account.id,
+            platform: 'tiktok',
+            platform_post_id: platformPostId,
+            video_url: videoAsset.url,
+            caption,
+            status: 'posted',
+            metadata: {
+              videoContext: 'TikTok video showcasing the campaign message'
+            }
+          };
+        },
+
+        buildPrompt: (type, campaign, context, account) => {
+          const traits = account.persona_traits || {};
+          let prompt = `Create a ${traits.tone || 'professional'} TikTok post that aligns with this campaign:
+
+Campaign Overview: ${campaign.campaign_overview}
+Campaign Goal: ${campaign.campaign_goal}
+Post Goal: ${campaign.post_goal}
+
+Writing Guidelines:
+1. Write in a ${traits.tone || 'professional'} style
+2. Keep the content focused on the campaign's message
+3. Adapt the tone to match the campaign's goals
+4. Share relevant insights naturally
+5. End with a clear call to action
+${traits.quirks?.includes('technical_jargon') ? '6. Use relevant industry terminology naturally' : ''}
+
+Content Requirements:
+- Keep it concise and impactful
+- Use clear, professional language
+- Structure thoughts logically
+- Include specific examples or data points`;
+
+          if (context.videoContext) {
+            prompt += `\n\nInclude this context naturally: ${context.videoContext}`;
+          }
+
+          prompt += `\n\nRemember: Maintain professionalism while effectively delivering the campaign's message.`;
+
+          return prompt;
+        },
+
+        getPostContext: async (campaignId) => {
+          const campaign = await this.getCampaign(campaignId);
+          return {
+            videoContext: campaign.metadata?.videoContext
+          };
+        }
       }
     };
 
@@ -276,7 +391,194 @@ Content Requirements:
   }
 
   async createSimulatedPost(campaignId) {
-    return this.createPost(campaignId, false);
+    try {
+      const campaign = await this.getCampaign(campaignId);
+      if (!campaign) throw new Error('Campaign not found');
+
+      const networks = await this.getCampaignNetworks(campaignId);
+      if (!networks.length) throw new Error('No networks configured');
+
+      // Randomly select a network
+      const network = networks[Math.floor(Math.random() * networks.length)];
+      
+      // Get a random account for the selected network
+      const account = await this.getRandomAccount(network.network_type);
+      if (!account) throw new Error(`No available accounts for ${network.network_type}`);
+
+      // Check post limits
+      await this.validatePostLimits(campaignId, network.network_type, account.id);
+
+      let post;
+      if (network.network_type === 'reddit') {
+        const subreddit = await this.getRandomApprovedSubreddit(campaignId);
+        if (!subreddit) throw new Error('No available subreddits');
+        
+        const content = await this.generateContent('post', campaign, {
+          platform: network.network_type,
+          subreddit: subreddit.subreddit_name
+        });
+
+        post = await pool.query(
+          `INSERT INTO posts (campaign_id, platform, content, subreddit, social_account_id, status, posted_at)
+           VALUES ($1, $2, $3, $4, $5, 'simulated', NOW())
+           RETURNING *`,
+          [campaignId, network.network_type, content, subreddit.subreddit_name, account.id]
+        );
+      } else if (network.network_type === 'tiktok') {
+        // For TikTok, we need both a video and a caption
+        const mediaResult = await pool.query(
+          `SELECT media_assets FROM campaigns WHERE id = $1`,
+          [campaignId]
+        );
+        
+        const mediaAssets = mediaResult.rows[0]?.media_assets || [];
+        const videoAsset = mediaAssets.find(asset => 
+          asset.type.startsWith('video/')
+        );
+        
+        if (!videoAsset) {
+          throw new Error('No video assets available for TikTok post');
+        }
+
+        const caption = await this.generateContent('caption', campaign, {
+          platform: network.network_type,
+          videoContext: 'TikTok video showcasing the campaign message'
+        });
+
+        post = await pool.query(
+          `INSERT INTO posts (
+            campaign_id, platform, content, video_url, 
+            caption, social_account_id, status, posted_at
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, 'simulated', NOW())
+          RETURNING *`,
+          [
+            campaignId,
+            network.network_type,
+            caption, // Store caption as content for consistency
+            videoAsset.url,
+            caption,
+            account.id
+          ]
+        );
+      } else {
+        // LinkedIn or X post
+        const content = await this.generateContent('post', campaign, {
+          platform: network.network_type
+        });
+
+        post = await pool.query(
+          `INSERT INTO posts (campaign_id, platform, content, social_account_id, status, posted_at)
+           VALUES ($1, $2, $3, $4, 'simulated', NOW())
+           RETURNING *`,
+          [campaignId, network.network_type, content, account.id]
+        );
+      }
+
+      // Generate engagement metrics
+      const engagement = this.generateEngagementMetrics(network.network_type);
+      await pool.query(
+        `UPDATE posts 
+         SET engagement_metrics = $1
+         WHERE id = $2`,
+        [engagement, post.rows[0].id]
+      );
+
+      return post.rows[0];
+    } catch (error) {
+      console.error('Error creating simulated post:', error);
+      throw error;
+    }
+  }
+
+  generateEngagementMetrics(platform) {
+    const baseMetrics = {
+      views: Math.floor(Math.random() * 10000),
+      shares: Math.floor(Math.random() * 100),
+    };
+
+    switch (platform) {
+      case 'reddit':
+        return {
+          ...baseMetrics,
+          upvotes: Math.floor(Math.random() * 1000),
+          downvotes: Math.floor(Math.random() * 100),
+          awards: Math.floor(Math.random() * 5)
+        };
+      case 'linkedin':
+        return {
+          ...baseMetrics,
+          likes: Math.floor(Math.random() * 500),
+          comments: Math.floor(Math.random() * 50),
+          impressions: Math.floor(Math.random() * 20000)
+        };
+      case 'x':
+        return {
+          ...baseMetrics,
+          likes: Math.floor(Math.random() * 1000),
+          retweets: Math.floor(Math.random() * 200),
+          quotes: Math.floor(Math.random() * 50)
+        };
+      case 'tiktok':
+        return {
+          ...baseMetrics,
+          likes: Math.floor(Math.random() * 10000),
+          comments: Math.floor(Math.random() * 1000),
+          shares: Math.floor(Math.random() * 500),
+          favorites: Math.floor(Math.random() * 2000),
+          watchTime: Math.floor(Math.random() * 3600), // in seconds
+          completionRate: (Math.random() * 0.4 + 0.6).toFixed(2) // 60-100%
+        };
+      default:
+        return baseMetrics;
+    }
+  }
+
+  async validatePostLimits(campaignId, platform, accountId) {
+    const campaign = await this.getCampaign(campaignId);
+    if (!campaign) throw new Error('Campaign not found');
+
+    // Get total posts for this platform
+    const totalPosts = await this.getPostCount(campaignId, platform);
+    
+    // Get posts for this specific account
+    const accountPosts = await this.getAccountPostCount(campaignId, accountId);
+
+    let limitMessage = null;
+
+    switch (platform) {
+      case 'reddit':
+        if (accountPosts >= campaign.posts_per_subreddit) {
+          limitMessage = 'Subreddit post limit reached';
+        }
+        break;
+      case 'linkedin':
+        if (accountPosts >= campaign.posts_per_linkedin) {
+          limitMessage = 'LinkedIn post limit reached';
+        }
+        break;
+      case 'x':
+        if (totalPosts >= campaign.total_x_posts) {
+          limitMessage = 'Total X posts limit reached';
+        }
+        if (accountPosts >= campaign.posts_per_x) {
+          limitMessage = 'X account post limit reached';
+        }
+        break;
+      case 'tiktok':
+        if (totalPosts >= campaign.total_tiktok_posts) {
+          limitMessage = 'Total TikTok posts limit reached';
+        }
+        if (accountPosts >= campaign.posts_per_tiktok) {
+          limitMessage = 'TikTok account post limit reached';
+        }
+        break;
+    }
+
+    if (limitMessage) {
+      console.log(`Post limit reached for ${platform}: ${limitMessage}`);
+      throw new Error(limitMessage);
+    }
   }
 
   async createPost(campaignId, isLive = false) {
@@ -438,7 +740,12 @@ Content Requirements:
       const networkStyle = await contentStyleService.getNetworkStyle(context.platform, type);
       
       // Generate base prompt from network style
-      const basePrompt = contentStyleService.generateBasePrompt(networkStyle, type, context);
+      const basePrompt = contentStyleService.generateBasePrompt(networkStyle, type, {
+        ...context,
+        campaign_overview: campaign.campaign_overview,
+        campaign_goal: campaign.campaign_goal,
+        post_goal: campaign.post_goal
+      });
       
       // Generate persona
       const persona = this.generatePersona(campaign, account);
@@ -739,47 +1046,6 @@ Remember: You're a real person having a real conversation, not following a scrip
       console.error('Error getting account post count:', error);
       throw error;
     }
-  }
-
-  async validatePostLimits(campaignId, platform, accountId) {
-    const campaign = await this.getCampaign(campaignId);
-    
-    if (platform === 'reddit') {
-      const subreddit = await this.getRandomApprovedSubreddit(campaignId);
-      const count = await this.getSubredditPostCount(campaignId, subreddit);
-      if (count >= campaign.posts_per_subreddit) {
-        throw new Error(`Post limit reached for subreddit ${subreddit}`);
-      }
-    } else if (platform === 'linkedin') {
-      const count = await this.getPostCount(campaignId, 'linkedin');
-      if (count >= campaign.posts_per_linkedin) {
-        throw new Error('LinkedIn post limit reached');
-      }
-    } else if (platform === 'x') {
-      // Check total X posts limit
-      const totalXPosts = await this.getPostCount(campaignId, 'x');
-      if (totalXPosts >= campaign.total_x_posts) {
-        throw new Error('Total X posts limit reached');
-      }
-
-      // Check posts per X account limit
-      const accountPosts = await this.getAccountPostCount(campaignId, accountId);
-      if (accountPosts >= campaign.posts_per_x) {
-        throw new Error(`Post limit reached for X account ${accountId}`);
-      }
-    }
-  }
-
-  async getSubredditPostCount(campaignId, subreddit) {
-    const result = await pool.query(
-      `SELECT COUNT(*) as count 
-       FROM posts 
-       WHERE campaign_id = $1 
-       AND subreddit = $2 
-       AND status IN ('simulated', 'posted')`,
-      [campaignId, subreddit]
-    );
-    return parseInt(result.rows[0].count);
   }
 }
 
