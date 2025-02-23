@@ -51,7 +51,7 @@ ${post.content}
 Quick guidelines:
 1. Get straight to your point - no greetings or introductions
 2. Keep it under 50 words
-3. React to one specific point${traits.expertise ? ` - mention your ${traits.expertise[0]} experience if relevant` : ''}
+3. React to one specific point with relevant insight
 ${traits.quirks?.includes('shares_personal_stories') ? '4. Add a quick personal example' : ''}
 
 Write like you're in the middle of a conversation - direct and natural.`;
@@ -102,10 +102,62 @@ ${post.content}
 Quick guidelines:
 1. Get straight to your point - no introductions or formalities
 2. Keep it under 50 words
-3. Focus on one key insight${traits.expertise ? ` - mention your ${traits.expertise[0]} perspective if relevant` : ''}
+3. Add a thoughtful insight to the discussion
 ${traits.quirks?.includes('technical_jargon') ? '4. Use one industry term naturally' : ''}
 
 Write like you're continuing an ongoing professional discussion.`;
+    }
+  },
+
+  x: {
+    createSimulatedComment: async (post, campaign, account, content) => {
+      return {
+        post_id: post.id,
+        social_account_id: account.id,
+        content,
+        status: 'simulated',
+        sentiment_score: Math.random() * 2 - 1,
+        engagement_metrics: {
+          likes: Math.floor(Math.random() * 100),
+          retweets: Math.floor(Math.random() * 20),
+          replies: Math.floor(Math.random() * 10)
+        }
+      };
+    },
+
+    createLiveComment: async (post, campaign, account, content, parentCommentId = null) => {
+      const platformCommentId = await seleniumService.postComment(
+        'x',
+        account.id,
+        post.platform_post_id,
+        content,
+        parentCommentId
+      );
+
+      return {
+        post_id: post.id,
+        social_account_id: account.id,
+        parent_comment_id: parentCommentId,
+        platform_comment_id: platformCommentId,
+        content,
+        status: 'posted'
+      };
+    },
+
+    buildPrompt: (post, campaign, account) => {
+      const traits = account.persona_traits || {};
+      return `Read this X (Twitter) post and write a brief, ${traits.tone || 'engaging'} reply:
+
+POST:
+${post.content}
+
+Quick guidelines:
+1. Get straight to your point - no greetings or introductions
+2. Keep it under 280 characters
+3. Add value to the conversation
+${traits.quirks?.includes('uses_emojis') ? '4. Use one relevant emoji' : ''}
+
+Write like you're in the middle of a Twitter thread - direct and engaging.`;
     }
   }
 };
@@ -294,14 +346,14 @@ class CommentingService {
     if (!traits) return this.generateDefaultPersona(campaign, account);
 
     let persona = `You are a ${traits.tone} commenter with a ${traits.writingStyle} writing style.
-Your expertise is in ${traits.expertise.join(' and ')}.
+You have background in ${traits.expertise.join(' and ')}.
 You tend to write ${traits.responseLength} responses and engage as a ${traits.engagementStyle}.
 
 Your quirks: ${traits.quirks.map(quirk => quirk.replace(/_/g, ' ')).join(', ')}.
 
 When commenting:
-- Maintain your ${traits.writingStyle} style consistently
-- Show your expertise in ${traits.expertise.join(' and ')} when relevant
+- Write naturally in your ${traits.writingStyle} style
+- Draw from your background when relevant, but don't explicitly state it
 - Keep responses ${traits.responseLength} in length
 - Maintain a ${traits.tone} tone
 - Incorporate your quirks naturally
@@ -309,15 +361,15 @@ When commenting:
 
 Context:
 - Campaign goal: ${campaign.campaign_goal}
-- Your role: A genuine participant with the above personality traits
+- Your role: A genuine participant with authentic insights
 
-Remember: You are a real person with consistent traits - your comments should reflect your unique personality while engaging naturally with the content.`;
+Remember: You are a real person sharing authentic thoughts - let your knowledge and experience come through naturally in your writing style and examples.`;
 
     // Add platform-specific persona elements
     if (traits.writingStyle === 'casual') {
       persona += '\nFeel free to use common expressions and informal language.';
     } else if (traits.writingStyle === 'formal') {
-      persona += '\nMaintain professional language while showing expertise.';
+      persona += '\nMaintain professional language while sharing insights.';
     }
 
     // Add quirk-specific instructions

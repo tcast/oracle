@@ -53,25 +53,44 @@ class PostingService {
 
         buildPrompt: (type, campaign, context, account) => {
           const traits = account.persona_traits || {};
-          let prompt = `Create a brief, ${traits.tone || 'natural'} Reddit post for r/${context.subreddit.subreddit_name}. Goal: ${campaign.post_goal}
+          let prompt = `Create a ${traits.tone || 'engaging'} Reddit post that aligns with this campaign:
 
-Keep it concise and authentic - like a real Reddit user would write.
-${JSON.stringify(context.subreddit.content_rules || [])}
+Campaign Overview: ${campaign.campaign_overview}
+Campaign Goal: ${campaign.campaign_goal}
+Post Goal: ${campaign.post_goal}
 
-Quick guidelines:
-1. Share a real experience${traits.expertise ? ` about ${traits.expertise[0]}` : ''}
-2. Keep it under 150 words
-3. Sound natural, not promotional
-${traits.quirks?.includes('shares_personal_stories') ? '4. Include a brief personal example' : ''}
+Target Subreddit: r/${context.subreddit.subreddit_name}
+${context.subreddit.content_rules ? `\nSubreddit Rules:\n${context.subreddit.content_rules.join('\n')}` : ''}
 
-Write like you're casually sharing with friends, not writing an essay.`;
+Writing Guidelines:
+1. Write in a ${traits.tone || 'natural'} style
+2. Keep the content focused on the campaign's message
+3. Adapt the tone to match the campaign's goals
+4. Share relevant experiences naturally
+5. End with a thought-provoking point or call to action
+${traits.quirks?.includes('shares_personal_stories') ? '6. Include a relevant personal story or anecdote' : ''}
+
+Remember: Stay authentic while delivering the campaign's message effectively.`;
 
           return prompt;
         },
 
         getPostContext: async (campaignId) => {
           const subreddit = await this.getRandomApprovedSubreddit(campaignId);
-          if (!subreddit) throw new Error('No approved subreddits found for campaign');
+          if (!subreddit) {
+            // Check if there are any approved subreddits at all
+            const result = await pool.query(
+              'SELECT COUNT(*) FROM subreddit_suggestions WHERE campaign_id = $1 AND status = \'approved\'',
+              [campaignId]
+            );
+            const hasApprovedSubreddits = parseInt(result.rows[0].count) > 0;
+            
+            if (hasApprovedSubreddits) {
+              throw new Error('All approved subreddits have reached their post limit');
+            } else {
+              throw new Error('No approved subreddits found for campaign');
+            }
+          }
           return { subreddit };
         }
       },
@@ -115,23 +134,35 @@ Write like you're casually sharing with friends, not writing an essay.`;
 
         buildPrompt: (type, campaign, context, account) => {
           const traits = account.persona_traits || {};
-          let prompt = `Create a concise, ${traits.tone || 'professional'} LinkedIn post. Goal: ${campaign.post_goal}
+          let prompt = `Create a ${traits.tone || 'professional'} LinkedIn post that aligns with this campaign:
 
-Keep it brief and focused - busy professionals should be able to read it in 30 seconds.
+Campaign Overview: ${campaign.campaign_overview}
+Campaign Goal: ${campaign.campaign_goal}
+Post Goal: ${campaign.post_goal}
 
-Quick guidelines:
-1. Share one key insight${traits.expertise ? ` about ${traits.expertise[0]}` : ''}
-2. Keep it under 150 words
-3. Be direct and clear
-${traits.quirks?.includes('technical_jargon') ? '4. Use 1-2 industry terms naturally' : ''}`;
+Writing Guidelines:
+1. Write in a ${traits.tone || 'professional'} style
+2. Keep the content focused on the campaign's message
+3. Adapt the tone to match the campaign's goals
+4. Share relevant insights naturally
+5. End with a clear call to action
+${traits.quirks?.includes('technical_jargon') ? '6. Use relevant industry terminology naturally' : ''}
+
+Content Requirements:
+- Keep it concise and impactful
+- Use clear, professional language
+- Structure thoughts logically
+- Include specific examples or data points`;
 
           if (context.targetUrl) {
-            prompt += `\nInclude this link naturally: ${context.targetUrl}`;
+            prompt += `\n\nInclude this link naturally: ${context.targetUrl}`;
           }
 
           if (context.mediaAssets?.length > 0) {
-            prompt += `\nReference the attached image briefly.`;
+            prompt += `\n\nReference the attached media appropriately.`;
           }
+
+          prompt += `\n\nRemember: Maintain professionalism while effectively delivering the campaign's message.`;
 
           return prompt;
         },
@@ -141,6 +172,95 @@ ${traits.quirks?.includes('technical_jargon') ? '4. Use 1-2 industry terms natur
           return {
             mediaAssets: campaign.media_assets || [],
             targetUrl: campaign.target_url
+          };
+        }
+      },
+
+      x: {
+        createSimulatedPost: async (campaign, account, content, context) => {
+          return {
+            campaign_id: campaign.id,
+            social_account_id: account.id,
+            platform: 'x',
+            content,
+            status: 'simulated',
+            metadata: { 
+              media_assets: context.mediaAssets || [],
+              hashtags: context.hashtags || [],
+              mentions: context.mentions || []
+            }
+          };
+        },
+
+        createLivePost: async (campaign, account, content, context) => {
+          const platformPostId = await seleniumService.createXPost(
+            account.id,
+            content,
+            context.mediaAssets,
+            context.hashtags,
+            context.mentions
+          );
+
+          return {
+            campaign_id: campaign.id,
+            social_account_id: account.id,
+            platform: 'x',
+            platform_post_id: platformPostId,
+            content,
+            status: 'posted',
+            metadata: {
+              media_assets: context.mediaAssets || [],
+              hashtags: context.hashtags || [],
+              mentions: context.mentions || []
+            }
+          };
+        },
+
+        buildPrompt: (type, campaign, context, account) => {
+          const traits = account.persona_traits || {};
+          let prompt = `Create a ${traits.tone || 'engaging'} X (Twitter) post that aligns with this campaign:
+
+Campaign Overview: ${campaign.campaign_overview}
+Campaign Goal: ${campaign.campaign_goal}
+Post Goal: ${campaign.post_goal}
+
+Writing Guidelines:
+1. Write in a ${traits.tone || 'engaging'} style
+2. Keep the content focused on the campaign's message
+3. Adapt the tone to match the campaign's goals
+4. Make every character count (280 char limit)
+5. End with a powerful call to action
+${traits.quirks?.includes('uses_emojis') ? '6. Use relevant emojis strategically' : ''}
+
+Content Requirements:
+- Start with a strong hook
+- Keep it concise and impactful
+- Use clear, direct language
+- Make it shareable and engaging`;
+
+          if (context.hashtags?.length > 0) {
+            prompt += `\n\nIncorporate these hashtags naturally: ${context.hashtags.join(' ')}`;
+          }
+
+          if (context.mentions?.length > 0) {
+            prompt += `\n\nMention these accounts where relevant: ${context.mentions.join(' ')}`;
+          }
+
+          if (context.mediaAssets?.length > 0) {
+            prompt += `\n\nReference the attached media appropriately.`;
+          }
+
+          prompt += `\n\nRemember: Stay within 280 characters while effectively delivering the campaign's message.`;
+
+          return prompt;
+        },
+
+        getPostContext: async (campaignId) => {
+          const campaign = await this.getCampaign(campaignId);
+          return {
+            mediaAssets: campaign.media_assets || [],
+            hashtags: campaign.metadata?.hashtags || [],
+            mentions: campaign.metadata?.mentions || []
           };
         }
       }
@@ -203,38 +323,24 @@ ${traits.quirks?.includes('technical_jargon') ? '4. Use 1-2 industry terms natur
           
           // Check post limits for each platform
           const postCount = await this.getPostCount(campaignId, network.network_type);
-          const maxPosts = network.network_type === 'reddit' 
-            ? campaign.posts_per_subreddit 
-            : campaign.posts_per_linkedin;
+          console.log(`Current post count for ${network.network_type}: ${postCount}`);
 
-          console.log(`Current post count for ${network.network_type}: ${postCount}, Max allowed: ${maxPosts}`);
-
-          if (postCount >= maxPosts) {
-            const error = `Post limit reached for ${network.network_type} (${postCount}/${maxPosts})`;
-            console.log(error);
+          // Get account before checking limits
+          const account = await this.getRandomAccount(network.network_type);
+          if (!account) {
+            const error = `No available ${network.network_type} account found`;
+            console.warn(error);
             errors.push(error);
             continue;
           }
 
-          if (network.network_type === 'reddit') {
-            try {
-              const subreddit = await this.getRandomApprovedSubreddit(campaignId);
-              if (!subreddit) {
-                console.log('No available subreddits for Reddit posts');
-                continue;
-              }
-              const subredditPostCount = await this.getSubredditPostCount(campaignId, subreddit.subreddit_name);
-              if (subredditPostCount >= campaign.posts_per_subreddit) {
-                const error = `Post limit reached for subreddit ${subreddit.subreddit_name} (${subredditPostCount}/${campaign.posts_per_subreddit})`;
-                console.log(error);
-                errors.push(error);
-                continue;
-              }
-            } catch (subredditError) {
-              console.error('Error with subreddit:', subredditError);
-              errors.push(`Reddit error: ${subredditError.message}`);
-              continue;
-            }
+          // Validate post limits for the platform and account
+          try {
+            await this.validatePostLimits(campaignId, network.network_type, account.id);
+          } catch (limitError) {
+            console.log(limitError.message);
+            errors.push(limitError.message);
+            continue;
           }
 
           const handler = this.platformHandlers[network.network_type];
@@ -254,15 +360,6 @@ ${traits.quirks?.includes('technical_jargon') ? '4. Use 1-2 industry terms natur
             platform: network.network_type,
             ...context
           });
-
-          // Get account
-          const account = await this.getRandomAccount(network.network_type);
-          if (!account) {
-            const error = `No available ${network.network_type} account found`;
-            console.warn(error);
-            errors.push(error);
-            continue;
-          }
 
           // Create post using platform-specific handler
           const postData = await (isLive ? 
@@ -376,14 +473,14 @@ ${traits.quirks?.includes('technical_jargon') ? '4. Use 1-2 industry terms natur
     if (!traits) return this.generateDefaultPersona(campaign);
 
     return `You are a ${traits.tone} social media user with a ${traits.writingStyle} writing style.
-Your expertise is in ${traits.expertise.join(' and ')}.
+You have background in ${traits.expertise.join(' and ')}.
 You tend to write ${traits.responseLength} posts and engage as a ${traits.engagementStyle}.
 
 Your quirks: ${traits.quirks.map(quirk => quirk.replace(/_/g, ' ')).join(', ')}.
 
 When posting:
-- Maintain your ${traits.writingStyle} style consistently
-- Show your expertise in ${traits.expertise.join(' and ')} when relevant
+- Write naturally in your ${traits.writingStyle} style
+- Draw from your background when relevant, but don't explicitly state it
 - Keep posts ${traits.responseLength} in length
 - Maintain a ${traits.tone} tone
 - Incorporate your quirks naturally
@@ -391,7 +488,7 @@ When posting:
 
 Campaign context: ${campaign.campaign_goal}
 
-Remember: You are a real person with consistent traits - your posts should reflect your unique personality while achieving the campaign goals.`;
+Remember: You are a real person sharing authentic thoughts - let your knowledge and experience come through naturally in your writing style and examples.`;
   }
 
   generateDefaultPersona(campaign) {
@@ -610,44 +707,66 @@ Remember: You're a real person having a real conversation, not following a scrip
   }
 
   async getPostCount(campaignId, platform) {
-    if (platform === 'reddit') {
-      // For Reddit, we need to check if any subreddit has available slots
+    try {
+      if (platform === 'x') {
+        // Get total number of posts for X platform
+        const result = await pool.query(
+          'SELECT COUNT(*) FROM posts WHERE campaign_id = $1 AND platform = $2',
+          [campaignId, platform]
+        );
+        return parseInt(result.rows[0].count);
+      }
+
       const result = await pool.query(
-        `WITH subreddit_posts AS (
-          SELECT subreddit, COUNT(*) as post_count
-          FROM posts
-          WHERE campaign_id = $1 
-          AND platform = 'reddit'
-          AND status IN ('simulated', 'posted')
-          GROUP BY subreddit
-        ),
-        campaign_subreddits AS (
-          SELECT subreddit_name
-          FROM subreddit_suggestions
-          WHERE campaign_id = $1
-          AND status = 'approved'
-        )
-        SELECT COUNT(*) as available_subreddits
-        FROM campaign_subreddits cs
-        LEFT JOIN subreddit_posts sp ON cs.subreddit_name = sp.subreddit
-        WHERE sp.post_count IS NULL 
-        OR sp.post_count < (
-          SELECT posts_per_subreddit 
-          FROM campaigns 
-          WHERE id = $1
-        )`,
-        [campaignId]
-      );
-      
-      // If no subreddits are available (count = 0), we've reached the limit
-      return result.rows[0].available_subreddits === 0 ? 1 : 0;
-    } else {
-      // For other platforms, use the original total count logic
-      const result = await pool.query(
-        'SELECT COUNT(*) as count FROM posts WHERE campaign_id = $1 AND platform = $2',
+        'SELECT COUNT(*) FROM posts WHERE campaign_id = $1 AND platform = $2',
         [campaignId, platform]
       );
       return parseInt(result.rows[0].count);
+    } catch (error) {
+      console.error('Error getting post count:', error);
+      throw error;
+    }
+  }
+
+  async getAccountPostCount(campaignId, accountId) {
+    try {
+      const result = await pool.query(
+        'SELECT COUNT(*) FROM posts WHERE campaign_id = $1 AND social_account_id = $2',
+        [campaignId, accountId]
+      );
+      return parseInt(result.rows[0].count);
+    } catch (error) {
+      console.error('Error getting account post count:', error);
+      throw error;
+    }
+  }
+
+  async validatePostLimits(campaignId, platform, accountId) {
+    const campaign = await this.getCampaign(campaignId);
+    
+    if (platform === 'reddit') {
+      const subreddit = await this.getRandomApprovedSubreddit(campaignId);
+      const count = await this.getSubredditPostCount(campaignId, subreddit);
+      if (count >= campaign.posts_per_subreddit) {
+        throw new Error(`Post limit reached for subreddit ${subreddit}`);
+      }
+    } else if (platform === 'linkedin') {
+      const count = await this.getPostCount(campaignId, 'linkedin');
+      if (count >= campaign.posts_per_linkedin) {
+        throw new Error('LinkedIn post limit reached');
+      }
+    } else if (platform === 'x') {
+      // Check total X posts limit
+      const totalXPosts = await this.getPostCount(campaignId, 'x');
+      if (totalXPosts >= campaign.total_x_posts) {
+        throw new Error('Total X posts limit reached');
+      }
+
+      // Check posts per X account limit
+      const accountPosts = await this.getAccountPostCount(campaignId, accountId);
+      if (accountPosts >= campaign.posts_per_x) {
+        throw new Error(`Post limit reached for X account ${accountId}`);
+      }
     }
   }
 

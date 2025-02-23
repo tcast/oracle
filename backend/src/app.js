@@ -84,7 +84,19 @@ app.get('/api/campaigns', async (req, res) => {
 });
 
 app.post('/api/campaigns', async (req, res) => {
-  const { name, campaign_goal, post_goal, comment_goal, target_sentiment, is_live, networks, target_url, media_assets } = req.body;
+  const { 
+    name, 
+    campaign_overview,
+    campaign_goal, 
+    post_goal, 
+    comment_goal, 
+    target_sentiment, 
+    is_live, 
+    networks, 
+    target_url, 
+    media_assets 
+  } = req.body;
+  
   const client = await pool.connect();
   
   try {
@@ -92,18 +104,20 @@ app.post('/api/campaigns', async (req, res) => {
     
     const campaignResult = await client.query(
       `INSERT INTO campaigns 
-       (name, campaign_goal, post_goal, comment_goal, target_sentiment, is_live, platform, target_url, media_assets)
-       VALUES ($1, $2, $3, $4, $5, $6, $7::text[], $8, $9::jsonb)
+       (name, campaign_overview, campaign_goal, post_goal, comment_goal, 
+        target_sentiment, is_live, platform, target_url, media_assets)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text[], $9, $10::jsonb)
        RETURNING *`,
       [
-        name, 
-        campaign_goal, 
-        post_goal, 
-        comment_goal, 
-        target_sentiment, 
-        is_live, 
-        networks || [], 
-        target_url, 
+        name,
+        campaign_overview,
+        campaign_goal,
+        post_goal,
+        comment_goal,
+        target_sentiment,
+        is_live,
+        networks || [],
+        target_url,
         media_assets ? JSON.stringify(media_assets) : null
       ]
     );
@@ -276,7 +290,8 @@ app.get('/api/campaigns/:id/posts', async (req, res) => {
     // Organize posts by platform and subreddit
     const organizedPosts = {
       reddit: {},
-      linkedin: []
+      linkedin: [],
+      x: []
     };
 
     postsResult.rows.forEach(post => {
@@ -284,6 +299,8 @@ app.get('/api/campaigns/:id/posts', async (req, res) => {
       
       if (post.platform === 'linkedin') {
         organizedPosts.linkedin.push(post);
+      } else if (post.platform === 'x') {
+        organizedPosts.x.push(post);
       } else {
         // Reddit posts are organized by subreddit
         if (!organizedPosts.reddit[post.subreddit]) {

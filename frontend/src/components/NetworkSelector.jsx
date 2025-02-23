@@ -51,7 +51,7 @@ const NetworkSelector = ({ onNetworksChange, campaign }) => {
           Select Social Networks
         </label>
         <div className="space-y-2">
-          {['reddit', 'linkedin'].map(network => (
+          {['reddit', 'linkedin', 'x'].map(network => (
             <div key={network} className="flex items-center">
               <input
                 type="checkbox"
@@ -61,7 +61,7 @@ const NetworkSelector = ({ onNetworksChange, campaign }) => {
                 className="h-4 w-4 text-indigo-600 focus:ring-indigo-500 border-gray-300 rounded"
               />
               <label htmlFor={network} className="ml-2 block text-sm text-gray-900 capitalize">
-                {network}
+                {network === 'x' ? 'X (Twitter)' : network}
               </label>
             </div>
           ))}

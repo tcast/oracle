@@ -31,34 +31,41 @@ class ContentStyleService {
   generatePostPrompt(networkStyle, context) {
     const { tone_guidelines = {}, structure_guidelines = {}, purpose_guidelines = {}, format_rules } = networkStyle || {};
     
-    let prompt = `Create a ${tone_guidelines.style || 'natural'} post that MUST follow these requirements:
+    let prompt = `Write a ${tone_guidelines.style || 'natural'} post about this campaign overview:
+${context.campaign_overview}
 
-Content Requirements:
-${structure_guidelines.length === 'short' ? '- Keep the content under 100 words' : 
- structure_guidelines.length === 'medium' ? '- Keep the content between 50-300 words' :
- structure_guidelines.length === 'long' ? '- Write at least 200 words' : '- Use a natural length'}
+Campaign goal: ${context.campaign_goal}
+Post goal: ${context.post_goal}
 
-Tone Requirements:
-${tone_guidelines.style === 'professional' ? 
-  '- Use professional language (e.g., expertise, experience, industry-specific terms)\n- Avoid casual expressions' :
- tone_guidelines.style === 'casual' ? 
-  '- Use casual, friendly language\n- Feel free to use common expressions and informal tone' :
-  '- Use a natural, conversational tone'}
-- Maintain ${tone_guidelines.formality || 'standard'} formality throughout
+Tone:
+${Object.entries(tone_guidelines).map(([key, value]) => `- ${key}: ${value}`).join('\n')}
 
-Structure Requirements:`;
+Purpose:
+${Object.entries(purpose_guidelines).map(([key, value]) => `- ${key}: ${value}`).join('\n')}
+
+Format Rules:
+${Array.isArray(format_rules) && format_rules.length > 0 
+  ? format_rules.join('\n') 
+  : '- Keep it natural and authentic'}`;
 
     // Add platform-specific structure guidelines
     if (context.platform === 'reddit') {
       const title = structure_guidelines.title || {};
       const body = structure_guidelines.body || {};
+      const subreddit = context.subreddit || {};
+      const contentRules = Array.isArray(subreddit.content_rules) ? subreddit.content_rules : [];
       
       prompt += `
 - Title: Create a ${title.style || 'clear'} title${title.formats ? ` in one of these formats: ${title.formats.join(', ')}` : ''}
 - Body: 
   * Include at least one personal perspective (using I, my, we, our)
   * Organize content into clear paragraphs
-  * ${body.elements ? `Include all these elements: ${body.elements.join(', ')}` : 'Structure your thoughts logically'}`;
+  * ${body.elements ? `Include all these elements: ${body.elements.join(', ')}` : 'Structure your thoughts logically'}
+
+Subreddit-specific guidelines:
+${contentRules.length > 0 
+  ? contentRules.map(rule => `- ${rule}`).join('\n')
+  : '- Follow general Reddit etiquette and be respectful of the community'}`;
     } else if (context.platform === 'linkedin') {
       const opening = structure_guidelines.opening || {};
       const body = structure_guidelines.body || {};
@@ -72,6 +79,17 @@ Structure Requirements:`;
   * ${body.format ? `Format using ${body.format.join(' or ')}` : 'Use professional formatting'}
   * ${body.elements ? `Include all these elements: ${body.elements.join(', ')}` : 'Structure content professionally'}
 - Closing: ${closing.type ? `End with a ${closing.type} using ${closing.elements ? closing.elements.join(' or ') : 'call to action'}` : 'End with a clear conclusion or call to action'}`;
+    } else if (context.platform === 'x') {
+      const tweet = structure_guidelines.tweet || {};
+      
+      prompt += `
+- Tweet Structure:
+  * Start with a ${tweet.opening || 'strong hook'}
+  * Keep it under 280 characters
+  * ${tweet.elements ? `Include these elements: ${tweet.elements.join(', ')}` : 'Make every character count'}
+  * Use hashtags naturally: ${context.hashtags?.join(' ') || '#relevant #topics'}
+  * ${tweet.media ? `Include media: ${tweet.media}` : 'Add media when relevant'}
+  * End with a ${tweet.closing || 'clear call to action or thought-provoking point'}`;
     }
 
     prompt += `
@@ -86,11 +104,6 @@ ${format_rules?.formatting_options ? format_rules.formatting_options.map(format 
   }
 }).filter(Boolean).join('\n') : '- Use clear, readable formatting'}
 
-Purpose:
-${purpose_guidelines.primary_purposes ? `Primary goals: ${purpose_guidelines.primary_purposes.join(', ')}` : 'Share valuable content'}
-${purpose_guidelines.engagement_types ? `\nEngagement approach: ${purpose_guidelines.engagement_types.join(', ')}` : ''}
-${purpose_guidelines.objectives ? `\nObjectives: ${purpose_guidelines.objectives.join(', ')}` : ''}
-
 Important: Your response MUST follow all these requirements exactly. Do not skip any requirements.`;
 
     return prompt;
@@ -99,7 +112,11 @@ Important: Your response MUST follow all these requirements exactly. Do not skip
   generateCommentPrompt(networkStyle, context) {
     const { tone_guidelines = {}, structure_guidelines = {}, purpose_guidelines = {}, format_rules } = networkStyle || {};
     
-    let prompt = `Create a ${tone_guidelines.style || 'natural'} comment that MUST follow these requirements:
+    let prompt = `Create a ${tone_guidelines.style || 'natural'} comment in the context of this campaign:
+${context.campaign_overview}
+
+Campaign goal: ${context.campaign_goal}
+Comment goal: ${context.comment_goal}
 
 Content Requirements:
 ${structure_guidelines.length ? `- Keep the comment ${structure_guidelines.length} in length` : 

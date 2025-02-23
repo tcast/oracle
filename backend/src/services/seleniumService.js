@@ -1,6 +1,7 @@
 const { Builder, By, until } = require('selenium-webdriver');
 const chrome = require('selenium-webdriver/chrome');
 const pool = require('./db');
+const { Key } = require('selenium-webdriver');
 
 class SeleniumService {
   constructor() {
@@ -128,6 +129,26 @@ class SeleniumService {
 
         // Logout
         await this.redditLogout(driver);
+      } else if (platform === 'x') {
+        // Login to X
+        const loginSuccess = await this.xLogin(
+          driver,
+          account.username,
+          credentials.password
+        );
+
+        if (!loginSuccess) {
+          throw new Error('Login failed');
+        }
+
+        // Post comment
+        const commentSuccess = await this.xPostComment(driver, postUrl, comment);
+        if (!commentSuccess) {
+          throw new Error('Failed to post comment');
+        }
+
+        // Logout
+        await this.xLogout(driver);
       } else {
         throw new Error('Platform not supported');
       }
@@ -141,6 +162,78 @@ class SeleniumService {
         await driver.quit();
         this.activeDrivers.delete(accountId);
       }
+    }
+  }
+
+  async xLogin(driver, username, password) {
+    try {
+      await driver.get('https://twitter.com/login');
+      
+      // Wait for and fill in username
+      const usernameInput = await driver.wait(until.elementLocated(By.name('text')), 10000);
+      await usernameInput.sendKeys(username);
+      await usernameInput.sendKeys(Key.RETURN);
+
+      // Wait for and fill in password
+      const passwordInput = await driver.wait(until.elementLocated(By.name('password')), 10000);
+      await passwordInput.sendKeys(password);
+      await passwordInput.sendKeys(Key.RETURN);
+
+      // Wait for login to complete
+      await driver.wait(until.elementLocated(By.css('[data-testid="primaryColumn"]')), 10000);
+      
+      return true;
+    } catch (error) {
+      console.error('Error during X login:', error);
+      return false;
+    }
+  }
+
+  async xPostComment(driver, postUrl, comment) {
+    try {
+      // Navigate to the post
+      await driver.get(postUrl);
+      
+      // Wait for and click reply button
+      const replyButton = await driver.wait(until.elementLocated(By.css('[data-testid="reply"]')), 10000);
+      await replyButton.click();
+
+      // Wait for and fill in comment
+      const commentInput = await driver.wait(until.elementLocated(By.css('[data-testid="tweetTextarea_0"]')), 10000);
+      await commentInput.sendKeys(comment);
+
+      // Click reply button
+      const submitButton = await driver.wait(until.elementLocated(By.css('[data-testid="tweetButton"]')), 10000);
+      await submitButton.click();
+
+      // Wait for confirmation that reply was posted
+      await driver.wait(until.elementLocated(By.css('[data-testid="toast"]')), 10000);
+
+      return true;
+    } catch (error) {
+      console.error('Error posting X comment:', error);
+      return false;
+    }
+  }
+
+  async xLogout(driver) {
+    try {
+      // Click account menu
+      const accountMenu = await driver.wait(until.elementLocated(By.css('[data-testid="Account"]')), 10000);
+      await accountMenu.click();
+
+      // Click logout option
+      const logoutButton = await driver.wait(until.elementLocated(By.css('[data-testid="logout"]')), 10000);
+      await logoutButton.click();
+
+      // Confirm logout
+      const confirmLogout = await driver.wait(until.elementLocated(By.css('[data-testid="confirmationSheetConfirm"]')), 10000);
+      await confirmLogout.click();
+
+      return true;
+    } catch (error) {
+      console.error('Error during X logout:', error);
+      return false;
     }
   }
 

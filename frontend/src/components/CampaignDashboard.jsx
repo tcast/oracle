@@ -14,6 +14,7 @@ const CampaignDashboard = () => {
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [newCampaign, setNewCampaign] = useState({
     name: '',
+    campaign_overview: '',
     campaign_goal: '',
     post_goal: '',
     comment_goal: '',
@@ -26,6 +27,8 @@ const CampaignDashboard = () => {
     end_date: '',
     posts_per_subreddit: 1,
     posts_per_linkedin: 1,
+    posts_per_x: 1,
+    total_x_posts: 5,
     min_post_interval_hours: 1,
     max_post_interval_hours: 24,
     min_reply_interval_hours: 0.5,
@@ -92,6 +95,7 @@ const CampaignDashboard = () => {
       setSelectedCampaign(campaign);
       setNewCampaign({
         name: '',
+        campaign_overview: '',
         campaign_goal: '',
         post_goal: '',
         comment_goal: '',
@@ -104,6 +108,8 @@ const CampaignDashboard = () => {
         end_date: '',
         posts_per_subreddit: 1,
         posts_per_linkedin: 1,
+        posts_per_x: 1,
+        total_x_posts: 5,
         min_post_interval_hours: 1,
         max_post_interval_hours: 24,
         min_reply_interval_hours: 0.5,
@@ -157,39 +163,55 @@ const CampaignDashboard = () => {
           </div>
 
           <div>
-            <label className="block text-sm font-medium text-gray-700">Campaign Goal</label>
+            <label className="block text-sm font-medium text-gray-700">Campaign Overview</label>
             <textarea
               className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
-              value={newCampaign.campaign_goal}
-              onChange={(e) => setNewCampaign({...newCampaign, campaign_goal: e.target.value})}
+              value={newCampaign.campaign_overview}
+              onChange={(e) => setNewCampaign({...newCampaign, campaign_overview: e.target.value})}
               required
-              rows={3}
-              placeholder="What is the overall objective of this campaign?"
+              rows={4}
+              placeholder="Describe what you are promoting (theory, product, news, etc.) in detail"
             />
           </div>
 
-          <div>
-            <label className="block text-sm font-medium text-gray-700">Post Goal</label>
-            <textarea
-              className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
-              value={newCampaign.post_goal}
-              onChange={(e) => setNewCampaign({...newCampaign, post_goal: e.target.value})}
-              required
-              rows={3}
-              placeholder="What should each post aim to achieve?"
-            />
-          </div>
+          <div className="space-y-4 bg-gray-50 p-4 rounded-lg">
+            <h3 className="text-lg font-medium text-gray-900">Campaign Strategy</h3>
+            
+            <div>
+              <label className="block text-sm font-medium text-gray-700">Campaign Goal</label>
+              <textarea
+                className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                value={newCampaign.campaign_goal}
+                onChange={(e) => setNewCampaign({...newCampaign, campaign_goal: e.target.value})}
+                required
+                rows={3}
+                placeholder="What are the strategic objectives for this campaign? (e.g., drive mass adoption, increase awareness)"
+              />
+            </div>
 
-          <div>
-            <label className="block text-sm font-medium text-gray-700">Comment Goal</label>
-            <textarea
-              className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
-              value={newCampaign.comment_goal}
-              onChange={(e) => setNewCampaign({...newCampaign, comment_goal: e.target.value})}
-              required
-              rows={3}
-              placeholder="How should comments support and validate the posts?"
-            />
+            <div>
+              <label className="block text-sm font-medium text-gray-700">Post Goal</label>
+              <textarea
+                className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                value={newCampaign.post_goal}
+                onChange={(e) => setNewCampaign({...newCampaign, post_goal: e.target.value})}
+                required
+                rows={3}
+                placeholder="What should each post aim to achieve? (e.g., drive engagement, spark speculation)"
+              />
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-gray-700">Comment Goal</label>
+              <textarea
+                className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                value={newCampaign.comment_goal}
+                onChange={(e) => setNewCampaign({...newCampaign, comment_goal: e.target.value})}
+                required
+                rows={3}
+                placeholder="How should comments support the campaign? (e.g., provide validation, create social proof)"
+              />
+            </div>
           </div>
 
           <div>
@@ -275,6 +297,28 @@ const CampaignDashboard = () => {
                   className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
                   value={newCampaign.posts_per_linkedin}
                   onChange={(e) => setNewCampaign({...newCampaign, posts_per_linkedin: parseInt(e.target.value)})}
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700">Posts per X Account</label>
+                <input
+                  type="number"
+                  min="1"
+                  className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                  value={newCampaign.posts_per_x}
+                  onChange={(e) => setNewCampaign({...newCampaign, posts_per_x: parseInt(e.target.value)})}
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700">Total X Posts</label>
+                <input
+                  type="number"
+                  min="1"
+                  className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                  value={newCampaign.total_x_posts}
+                  onChange={(e) => setNewCampaign({...newCampaign, total_x_posts: parseInt(e.target.value)})}
                 />
               </div>
             </div>

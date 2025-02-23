@@ -21,7 +21,20 @@ class SubredditService {
       }
 
       console.log('Starting subreddit suggestion generation for campaign:', campaignId);
-      console.log('Campaign goal:', goal);
+      
+      // Get campaign details
+      const campaignResult = await pool.query(
+        'SELECT campaign_overview, campaign_goal FROM campaigns WHERE id = $1',
+        [campaignId]
+      );
+      
+      if (campaignResult.rows.length === 0) {
+        throw new Error('Campaign not found');
+      }
+
+      const { campaign_overview, campaign_goal } = campaignResult.rows[0];
+      console.log('Campaign overview:', campaign_overview);
+      console.log('Campaign goal:', campaign_goal);
 
       // Verify OpenAI configuration
       if (!process.env.OPENAI_API_KEY) {
@@ -42,29 +55,38 @@ class SubredditService {
         messages: [
           {
             role: "system",
-            content: "You are a Reddit expert who understands each subreddit's culture, rules, and engagement patterns. Always format subscriber counts as numbers or with K/M suffix (e.g., 50000, 50K, 1.8M)."
+            content: "You are a Reddit expert who understands each subreddit's culture, rules, and engagement patterns. Suggest both mainstream and niche subreddits that would be receptive to the content. Always format subscriber counts as numbers or with K/M suffix (e.g., 50000, 50K, 1.8M)."
           },
           {
             role: "user",
-            content: `Based on this campaign goal: "${goal}"
-                     Suggest relevant subreddits where this content would be well-received.
-                     For each subreddit, provide:
-                     1. The exact subreddit name (without r/)
-                     2. A detailed reason why this community would be interested
-                     3. Estimated subscriber count (use format: 50000, 50K, or 1.8M)
-                     4. Key content guidelines to follow
+            content: `Based on this campaign:
+
+Campaign Overview: "${campaign_overview}"
+Campaign Goal: "${campaign_goal}"
+
+Suggest relevant subreddits where this content would be well-received.
+Include a mix of:
+1. Large, mainstream subreddits (1M+ subscribers)
+2. Medium-sized topical subreddits (100K-1M subscribers)
+3. Smaller, highly-focused niche subreddits (<100K subscribers)
+
+For each subreddit, provide:
+1. The exact subreddit name (without r/)
+2. A detailed reason why this community would be interested
+3. Estimated subscriber count (use format: 50000, 50K, or 1.8M)
+4. Key content guidelines to follow
                      
-                     Format your response as a JSON object with this structure:
-                     {
-                       "subreddits": [
-                         {
-                           "subreddit_name": "example",
-                           "reason": "Detailed explanation...",
-                           "subscriber_count": "1.8M",
-                           "content_guidelines": ["Guideline 1", "Guideline 2"]
-                         }
-                       ]
-                     }`
+Format your response as a JSON object with this structure:
+{
+  "subreddits": [
+    {
+      "subreddit_name": "example",
+      "reason": "Detailed explanation...",
+      "subscriber_count": "1.8M",
+      "content_guidelines": ["Guideline 1", "Guideline 2"]
+    }
+  ]
+}`
           }
         ],
         temperature: 0.7
@@ -149,7 +171,8 @@ class SubredditService {
           campaignId,
           s.subreddit_name,
           s.reason,
-          s.subscriber_count
+          s.subscriber_count,
+          s.content_guidelines ? JSON.stringify(s.content_guidelines) : JSON.stringify([])
         ];
       });
 
@@ -157,8 +180,8 @@ class SubredditService {
         try {
           const result = await pool.query(
             `INSERT INTO subreddit_suggestions 
-             (campaign_id, subreddit_name, reason, subscriber_count)
-             VALUES ($1, $2, $3, $4)
+             (campaign_id, subreddit_name, reason, subscriber_count, content_guidelines)
+             VALUES ($1, $2, $3, $4, $5)
              RETURNING *`,
             v
           );
@@ -224,6 +247,56 @@ class SubredditService {
       return result.rows;
     } catch (error) {
       console.error('Error getting approved subreddits:', error);
+      throw error;
+    }
+  }
+
+  async getRandomApprovedSubreddit(campaignId) {
+    try {
+      console.log('Getting random approved subreddit for campaign:', campaignId);
+      
+      // Get all approved subreddits that haven't reached their post limit
+      const query = `
+        WITH subreddit_posts AS (
+          SELECT subreddit, COUNT(*) as post_count
+          FROM posts
+          WHERE campaign_id = $1 
+          AND status IN ('simulated', 'posted')
+          GROUP BY subreddit
+        )
+        SELECT s.subreddit_name, s.reason, s.content_guidelines
+        FROM subreddit_suggestions s
+        LEFT JOIN subreddit_posts p ON p.subreddit = s.subreddit_name
+        WHERE s.campaign_id = $1
+        AND s.status = 'approved'
+        AND (p.post_count IS NULL OR p.post_count < (
+          SELECT posts_per_subreddit 
+          FROM campaigns 
+          WHERE id = $1
+        ))
+        ORDER BY RANDOM()
+        LIMIT 1`;
+      
+      console.log('Executing query:', query);
+      console.log('With campaign ID:', campaignId);
+      
+      const suggestionsResult = await pool.query(query, [campaignId]);
+      console.log('Query result:', suggestionsResult.rows);
+
+      // If we find an approved suggestion that hasn't reached its limit, use it
+      if (suggestionsResult.rows.length > 0) {
+        const suggestion = suggestionsResult.rows[0];
+        console.log('Found approved subreddit from suggestions:', suggestion);
+        return {
+          subreddit_name: suggestion.subreddit_name,
+          content_rules: suggestion.content_guidelines || []
+        };
+      }
+
+      console.log('No available subreddits found for campaign:', campaignId);
+      return null;
+    } catch (error) {
+      console.error('Error getting random subreddit:', error);
       throw error;
     }
   }
