@@ -9,6 +9,31 @@ import ImageUploader from './ImageUploader';
 import VideoUploader from './VideoUploader';
 import ConfirmationModal from './ConfirmationModal';
 
+const ExpandableText = ({ text, maxLength = 500 }) => {
+  const [isExpanded, setIsExpanded] = useState(false);
+  
+  if (!text) return null;
+  
+  const shouldTruncate = text.length > maxLength;
+  const displayText = !shouldTruncate || isExpanded ? text : text.slice(0, maxLength) + '...';
+  
+  return (
+    <div className="space-y-2">
+      {displayText.split('\n\n').map((paragraph, i) => (
+        <p key={i} className="text-gray-700">{paragraph}</p>
+      ))}
+      {shouldTruncate && (
+        <button
+          onClick={() => setIsExpanded(!isExpanded)}
+          className="text-indigo-600 hover:text-indigo-800 text-sm font-medium"
+        >
+          {isExpanded ? 'Show Less' : 'Read More'}
+        </button>
+      )}
+    </div>
+  );
+};
+
 const CampaignView = () => {
   const { id } = useParams();
   const navigate = useNavigate();
@@ -71,56 +96,9 @@ const CampaignView = () => {
       }
       
       const data = await response.json();
-      console.log('Raw analytics data:', data);
-      console.log('First analytics point:', data[0]);
-      
-      // Transform the data points
-      const transformedData = data.map(point => {
-        console.log('Processing point:', point);
-        
-        // Parse platform breakdown
-        const platformBreakdown = point.platform_breakdown || {};
-        console.log('Platform breakdown:', platformBreakdown);
-        
-        // Calculate total posts, comments, and engagement from platform breakdown
-        let totalPosts = 0;
-        let totalComments = 0;
-        let totalEngagement = 0;
-
-        Object.entries(platformBreakdown).forEach(([platform, stats]) => {
-          console.log(`Platform ${platform} stats:`, stats);
-          totalPosts += parseInt(stats.posts || 0);
-          totalComments += parseInt(stats.comments || 0);
-          totalEngagement += parseInt(stats.engagement || 0);
-        });
-
-        console.log('Calculated totals:', { totalPosts, totalComments, totalEngagement });
-
-        const transformed = {
-          date: point.timestamp || point.date || Date.now(),
-          posts: totalPosts,
-          comments: totalComments,
-          engagement: totalEngagement,
-          platform_breakdown: {}
-        };
-
-        // Ensure each platform has valid numbers
-        Object.entries(platformBreakdown).forEach(([platform, stats]) => {
-          transformed.platform_breakdown[platform] = {
-            posts: parseInt(stats.posts || 0),
-            comments: parseInt(stats.comments || 0),
-            engagement: parseInt(stats.engagement || 0)
-          };
-        });
-
-        console.log('Transformed point:', transformed);
-        return transformed;
-      });
-      
-      console.log('Final analytics data:', transformedData);
-      setAnalytics(transformedData);
+      setAnalytics(data);
     } catch (err) {
-      console.error('Error fetching analytics:', err);
+      // Silently handle analytics fetch errors
     }
   };
 
@@ -140,7 +118,7 @@ const CampaignView = () => {
       const data = await response.json();
       setStats(data);
     } catch (err) {
-      console.error('Error fetching stats:', err);
+      // Silently handle stats fetch errors
     }
   };
 
@@ -235,7 +213,7 @@ const CampaignView = () => {
             Edit Campaign
           </button>
           <button
-            onClick={handleDeleteCampaign}
+            onClick={() => setShowDeleteModal(true)}
             className="px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500"
           >
             Delete Campaign
@@ -243,12 +221,147 @@ const CampaignView = () => {
         </div>
       </div>
 
-      <div className="bg-white shadow rounded-lg divide-y divide-gray-200">
-        <div className="px-4 py-5 sm:p-6">
-          <h3 className="text-lg font-medium text-gray-900">Campaign Overview</h3>
-          <p className="mt-2 text-gray-600">{campaign.campaign_overview}</p>
+      {isEditing ? (
+        <div className="bg-white shadow rounded-lg p-6">
+          <form onSubmit={handleEditCampaign}>
+            <div className="space-y-4">
+              <div>
+                <label htmlFor="name" className="block text-sm font-medium text-gray-700">Campaign Name</label>
+                <input
+                  type="text"
+                  id="name"
+                  value={editingCampaign.name}
+                  onChange={(e) => setEditingCampaign({...editingCampaign, name: e.target.value})}
+                  className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                />
+              </div>
+              
+              <div>
+                <label htmlFor="campaign_overview" className="block text-sm font-medium text-gray-700">Campaign Overview</label>
+                <textarea
+                  id="campaign_overview"
+                  value={editingCampaign.campaign_overview}
+                  onChange={(e) => setEditingCampaign({...editingCampaign, campaign_overview: e.target.value})}
+                  rows={3}
+                  className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                />
+              </div>
+
+              <div>
+                <label htmlFor="campaign_goal" className="block text-sm font-medium text-gray-700">Campaign Goal</label>
+                <textarea
+                  id="campaign_goal"
+                  value={editingCampaign.campaign_goal}
+                  onChange={(e) => setEditingCampaign({...editingCampaign, campaign_goal: e.target.value})}
+                  rows={2}
+                  className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                />
+              </div>
+
+              <div>
+                <label htmlFor="post_goal" className="block text-sm font-medium text-gray-700">Post Goal</label>
+                <textarea
+                  id="post_goal"
+                  value={editingCampaign.post_goal}
+                  onChange={(e) => setEditingCampaign({...editingCampaign, post_goal: e.target.value})}
+                  rows={2}
+                  className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                />
+              </div>
+
+              <div>
+                <label htmlFor="comment_goal" className="block text-sm font-medium text-gray-700">Comment Goal</label>
+                <textarea
+                  id="comment_goal"
+                  value={editingCampaign.comment_goal}
+                  onChange={(e) => setEditingCampaign({...editingCampaign, comment_goal: e.target.value})}
+                  rows={2}
+                  className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">Social Networks</label>
+                <NetworkSelector
+                  onNetworksChange={(networks) => setEditingCampaign({...editingCampaign, platform: networks})}
+                  campaign={editingCampaign}
+                />
+              </div>
+
+              <div className="flex justify-end space-x-3 pt-4">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsEditing(false);
+                    setEditingCampaign(null);
+                  }}
+                  className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2 text-sm font-medium text-white bg-indigo-600 border border-transparent rounded-md hover:bg-indigo-700"
+                >
+                  Save Changes
+                </button>
+              </div>
+            </div>
+          </form>
         </div>
-      </div>
+      ) : (
+        <div className="bg-white shadow rounded-lg divide-y divide-gray-200">
+          <div className="px-6 py-5">
+            <h3 className="text-lg font-medium text-gray-900 mb-4">Campaign Overview</h3>
+            
+            <div className="space-y-6">
+              <div>
+                <h4 className="text-sm font-medium text-gray-500">Overview</h4>
+                <div className="mt-2 prose prose-sm max-w-none">
+                  <ExpandableText text={campaign.campaign_overview} />
+                </div>
+              </div>
+
+              <div>
+                <h4 className="text-sm font-medium text-gray-500">Campaign Goal</h4>
+                <div className="mt-2 prose prose-sm max-w-none">
+                  <ExpandableText text={campaign.campaign_goal} />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div>
+                  <h4 className="text-sm font-medium text-gray-500">Post Goal</h4>
+                  <div className="mt-2 prose prose-sm max-w-none">
+                    <ExpandableText text={campaign.post_goal} maxLength={500} />
+                  </div>
+                </div>
+
+                <div>
+                  <h4 className="text-sm font-medium text-gray-500">Comment Goal</h4>
+                  <div className="mt-2 prose prose-sm max-w-none">
+                    <ExpandableText text={campaign.comment_goal} maxLength={500} />
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <h4 className="text-sm font-medium text-gray-500">Selected Networks</h4>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {campaign.platform?.map(platform => (
+                    <span
+                      key={platform}
+                      className="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-indigo-100 text-indigo-800"
+                    >
+                      {platform.charAt(0).toUpperCase() + platform.slice(1)}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="bg-white shadow rounded-lg overflow-hidden">
         <div className="px-4 py-5 sm:p-6">

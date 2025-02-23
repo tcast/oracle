@@ -145,13 +145,11 @@ class TaskQueue {
       try {
         const post = await postingService.createSimulatedPost(campaignId);
         if (!post) {
-          console.log('Post limit reached for campaign - continuing for comments only');
+          // Post limit reached - continue silently
         }
       } catch (error) {
         // Check if this is a post limit message (expected behavior)
-        if (error.message.includes('post limit') || error.message.includes('posts limit')) {
-          console.log(`Post limit reached for campaign ${campaignId} - continuing for comments only`);
-        } else {
+        if (!error.message.includes('post limit') && !error.message.includes('posts limit')) {
           console.error('Error creating simulated post:', error);
           throw error; // Only throw if it's not a post limit error
         }
@@ -162,7 +160,7 @@ class TaskQueue {
         await commentingService.createSimulatedComments(campaignId);
       } catch (error) {
         if (error.message.includes('comment limit')) {
-          console.log(`Comment limit reached for campaign ${campaignId}`);
+          // Comment limit reached - continue silently
         } else {
           console.error('Error creating comments:', error);
           throw error; // Only throw if it's not a comment limit error
@@ -179,12 +177,10 @@ class TaskQueue {
         setTimeout(() => this.addTask(campaignId, 'simulation'), delay);
       }
     } catch (error) {
-      if (!error.message.includes('post limit') && !error.message.includes('comment limit')) {
-        console.error('Error handling simulation task:', error);
-        // Don't stop on error unless it's critical
-        const delay = Math.floor(Math.random() * 5000) + 5000; // 5-10 seconds
-        setTimeout(() => this.addTask(campaignId, 'simulation'), delay);
-      }
+      console.error('Critical error in simulation task:', error);
+      // Don't stop on error unless it's critical
+      const delay = Math.floor(Math.random() * 5000) + 5000; // 5-10 seconds
+      setTimeout(() => this.addTask(campaignId, 'simulation'), delay);
     }
   }
 

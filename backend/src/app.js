@@ -451,34 +451,65 @@ app.get('/api/campaigns/:id/simulation/stats', async (req, res) => {
     const result = await pool.query(`
       WITH post_metrics AS (
         SELECT 
+          platform,
           COUNT(*) as total_posts,
           COALESCE(SUM((engagement_metrics->>'upvotes')::int), 0) as total_engagement
         FROM posts 
         WHERE campaign_id = $1 
         AND status = 'simulated'
+        GROUP BY platform
       ),
       comment_metrics AS (
-        SELECT COUNT(*) as total_comments
+        SELECT 
+          p.platform,
+          COUNT(*) as total_comments
         FROM comments c
         JOIN posts p ON c.post_id = p.id
         WHERE p.campaign_id = $1 
         AND c.status = 'simulated'
+        GROUP BY p.platform
+      ),
+      platform_stats AS (
+        SELECT 
+          COALESCE(pm.platform, cm.platform) as platform,
+          COALESCE(pm.total_posts, 0) as posts,
+          COALESCE(cm.total_comments, 0) as comments,
+          COALESCE(pm.total_engagement, 0) as engagement
+        FROM post_metrics pm
+        FULL OUTER JOIN comment_metrics cm ON pm.platform = cm.platform
+      ),
+      total_stats AS (
+        SELECT 
+          SUM(posts) as total_posts,
+          SUM(comments) as total_comments,
+          SUM(engagement) as total_engagement
+        FROM platform_stats
       )
       SELECT 
-        COALESCE(pm.total_posts, 0) as posts,
-        COALESCE(cm.total_comments, 0) as comments,
-        COALESCE(pm.total_engagement, 0) as engagement
-      FROM post_metrics pm
-      CROSS JOIN comment_metrics cm`,
+        ts.total_posts as posts,
+        ts.total_comments as comments,
+        ts.total_engagement as engagement,
+        json_object_agg(
+          COALESCE(ps.platform, 'unknown'),
+          json_build_object(
+            'posts', ps.posts,
+            'comments', ps.comments,
+            'engagement', ps.engagement
+          )
+        ) as platform_stats
+      FROM total_stats ts
+      CROSS JOIN platform_stats ps
+      GROUP BY ts.total_posts, ts.total_comments, ts.total_engagement`,
       [campaignId]
     );
 
-    console.log('Stats result:', result.rows[0] || { posts: 0, comments: 0, engagement: 0 });
+    console.log('Stats result:', result.rows[0] || { posts: 0, comments: 0, engagement: 0, platform_stats: {} });
     
     res.json(result.rows[0] || {
       posts: 0,
       comments: 0,
-      engagement: 0
+      engagement: 0,
+      platform_stats: {}
     });
   } catch (err) {
     console.error('Error fetching simulation stats:', err);
