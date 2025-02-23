@@ -4,20 +4,11 @@ import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-d
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import Login from './components/Login';
 import CampaignDashboard from './components/CampaignDashboard';
+import CampaignView from './components/CampaignView';
 import UserManagement from './components/UserManagement';
 import SocialAccounts from './components/SocialAccounts';
 import NavBar from './components/NavBar';
-
-// Protected Route component
-const PrivateRoute = ({ children }) => {
-  const { user, loading } = useAuth();
-  
-  if (loading) {
-    return <div>Loading...</div>;
-  }
-  
-  return user ? children : <Navigate to="/login" />;
-};
+import PrivateRoute from './components/PrivateRoute';
 
 // Public Route component - redirects to dashboard if already logged in
 const PublicRoute = ({ children }) => {
@@ -67,7 +58,18 @@ function App() {
               }
             />
             <Route
-              path="/*"
+              path="/campaigns/:id"
+              element={
+                <PrivateRoute>
+                  <NavBar />
+                  <main className="max-w-7xl mx-auto py-6 sm:px-6 lg:px-8">
+                    <CampaignView />
+                  </main>
+                </PrivateRoute>
+              }
+            />
+            <Route
+              path="/"
               element={
                 <PrivateRoute>
                   <NavBar />
@@ -77,6 +79,7 @@ function App() {
                 </PrivateRoute>
               }
             />
+            <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </div>
       </AuthProvider>

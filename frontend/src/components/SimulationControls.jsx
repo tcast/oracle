@@ -25,20 +25,20 @@ const SimulationControls = ({ campaignId, isLive }) => {
       }
     };
 
-    // Check initial status
+    // Check initial status and fetch initial stats
     checkStatus();
+    fetchSimulationStats();
     
-    if (isSimulating) {
-      // Initial fetch
+    // Set up intervals
+    interval = setInterval(() => {
+      checkStatus();
       fetchSimulationStats();
-      // Then set up interval
-      interval = setInterval(fetchSimulationStats, 5000);
-    }
+    }, 5000);
     
     return () => {
       if (interval) clearInterval(interval);
     };
-  }, [isSimulating, campaignId]);
+  }, [campaignId]);
 
   const fetchSimulationStats = async () => {
     try {
@@ -125,31 +125,31 @@ const SimulationControls = ({ campaignId, isLive }) => {
         </div>
       )}
 
-      {isSimulating && (
-        <div className="mt-4 space-y-4">
+      <div className="mt-4 space-y-4">
+        <div className="grid grid-cols-3 gap-4">
+          <div className="bg-gray-50 p-3 rounded">
+            <div className="text-sm text-gray-500">Posts</div>
+            <div className="text-xl font-semibold">{stats.posts}</div>
+          </div>
+          <div className="bg-gray-50 p-3 rounded">
+            <div className="text-sm text-gray-500">Comments</div>
+            <div className="text-xl font-semibold">{stats.comments}</div>
+          </div>
+          <div className="bg-gray-50 p-3 rounded">
+            <div className="text-sm text-gray-500">Engagement</div>
+            <div className="text-xl font-semibold">{stats.engagement}</div>
+          </div>
+        </div>
+
+        {isSimulating && (
           <div className="flex items-center justify-between">
             <div className="flex items-center">
               <div className="animate-pulse mr-2 h-3 w-3 bg-green-500 rounded-full"></div>
               <p className="text-sm text-gray-600">Simulation running...</p>
             </div>
           </div>
-
-          <div className="grid grid-cols-3 gap-4">
-            <div className="bg-gray-50 p-3 rounded">
-              <div className="text-sm text-gray-500">Posts</div>
-              <div className="text-xl font-semibold">{stats.posts}</div>
-            </div>
-            <div className="bg-gray-50 p-3 rounded">
-              <div className="text-sm text-gray-500">Comments</div>
-              <div className="text-xl font-semibold">{stats.comments}</div>
-            </div>
-            <div className="bg-gray-50 p-3 rounded">
-              <div className="text-sm text-gray-500">Engagement</div>
-              <div className="text-xl font-semibold">{stats.engagement}</div>
-            </div>
-          </div>
-        </div>
-      )}
+        )}
+      </div>
     </div>
   );
 };
