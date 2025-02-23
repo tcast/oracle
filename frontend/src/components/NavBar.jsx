@@ -1,28 +1,18 @@
 import React from 'react';
 import { useNavigate, Link } from 'react-router-dom';
+import { useAuth } from '../contexts/AuthContext';
 
 const NavBar = () => {
   const navigate = useNavigate();
+  const { logout } = useAuth();
 
   const handleLogout = async () => {
     try {
-      const refreshToken = localStorage.getItem('refreshToken');
-      await fetch('/api/auth/logout', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ refreshToken }),
-      });
-      
-      localStorage.removeItem('accessToken');
-      localStorage.removeItem('refreshToken');
+      await logout();
       navigate('/login');
     } catch (error) {
       console.error('Error during logout:', error);
-      // Still clear tokens and redirect even if the API call fails
-      localStorage.removeItem('accessToken');
-      localStorage.removeItem('refreshToken');
+      // Still navigate to login page even if there's an error
       navigate('/login');
     }
   };
