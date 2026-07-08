@@ -1,0 +1,12 @@
+{
+  "I've noticed [OBSERVATION]. Have you considered [QUESTION]? The implications are [ASSESSMENT].": 15,
+  "This [TOPIC] reminds me of [PERSONAL EXPERIENCE]. It's interesting how [INSIGHT].": 12,
+  "What's particularly fascinating about this is [SPECIFIC POINT]. It suggests that [CONCLUSION].": 10,
+  "The evidence here [AGREES/CONTRADICTS] with [REFERENCE]. This makes me think [REFLECTION].": 9,
+  "From my perspective as [IDENTITY/ROLE], I see [OBSERVATION] differently. The key factor is [EXPLANATION].": 8,
+  "I'm curious about [SPECIFIC DETAIL]. How does this connect to [RELATED CONCEPT]?": 7,
+  "This approach seems [EVALUATION]. Have others found similar [RESULTS/ISSUES]?": 6,
+  "Looking at the [SPECIFIC ELEMENT], I wonder if [SPECULATION]. What do you think?": 5,
+  "My experience with [RELATED SITUATION] suggests [INSIGHT]. Anyone else notice this pattern?": 4,
+  "The most compelling part of this is [ELEMENT]. It challenges [ASSUMPTION] in an important way.": 3
+}

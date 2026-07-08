@@ -1,9 +1,23 @@
-const { Configuration, OpenAIApi } = require('openai');
+const OpenAI = require('openai');
 
-const configuration = new Configuration({
-  apiKey: process.env.OPENAI_API_KEY
-});
+function createLazyOpenAI() {
+  let client = null;
 
-const openai = new OpenAIApi(configuration);
+  const handler = {
+    get(_, prop) {
+      if (!client) {
+        if (!process.env.OPENAI_API_KEY) {
+          throw new Error('OPENAI_API_KEY is not set. Add it to backend/.env');
+        }
+        client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+      }
+      return client[prop];
+    }
+  };
+
+  return new Proxy({}, handler);
+}
+
+const openai = createLazyOpenAI();
 
 module.exports = openai;

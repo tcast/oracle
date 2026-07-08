@@ -1,20 +1,45 @@
 // backend/src/middleware/auth.js
-const authService = require('../services/authService');
+const jwt = require('jsonwebtoken');
 
-const authMiddleware = async (req, res, next) => {
+// Public routes that don't require authentication
+const publicRoutes = [
+  '/api/auth/login',
+  '/api/auth/register',
+  '/api/auth/verify-token'
+];
+
+const authMiddleware = (req, res, next) => {
+  // Check if the route is public
+  if (publicRoutes.some(route => req.path.startsWith(route))) {
+    return next();
+  }
+
+  // Get token from header (support both formats)
+  const tokenFromXAuth = req.header('x-auth-token');
+  const authHeader = req.header('Authorization');
+  let token = tokenFromXAuth;
+  
+  // Extract token from Authorization header if present
+  if (!token && authHeader && authHeader.startsWith('Bearer ')) {
+    token = authHeader.split(' ')[1];
+  }
+
+  // Check if no token
+  if (!token) {
+    console.log('No token provided for:', req.method, req.path);
+    return res.status(401).json({ error: 'No token provided' });
+  }
+
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'No token provided' });
-    }
-
-    const token = authHeader.split(' ')[1];
-    const decoded = authService.verifyAccessToken(token);
+    // Verify token
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
     
-    req.user = decoded;
+    // Add user from payload (token has userId/email/role at top level)
+    req.user = decoded.user || { id: decoded.userId, email: decoded.email, role: decoded.role };
     next();
-  } catch (error) {
-    res.status(401).json({ error: 'Invalid token' });
+  } catch (err) {
+    console.log('Invalid token error:', err.message);
+    res.status(401).json({ error: 'Token is not valid' });
   }
 };
 

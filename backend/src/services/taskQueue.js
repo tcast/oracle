@@ -8,8 +8,7 @@ const commentingService = require('./commentingService');
 class TaskQueue {
   constructor() {
     this.taskSubject = new Subject();
-    this.activeIntervals = new Map(); // Store intervalIds by campaignId
-    this.initialize();
+    this.activeIntervals = new Map();
   }
 
   // Add getter for activeCampaigns
@@ -78,15 +77,27 @@ class TaskQueue {
       // Start initial task
       this.addTask(campaignId, taskType);
 
-      // Set up recurring checks
-      const intervalTime = isLive ? 5 * 60 * 1000 : 30 * 1000; // 5 mins for live, 30 secs for simulation
-      console.log(`Setting up ${taskType} mode with interval: ${intervalTime}ms`);
+      // Set up recurring checks with jitter (20-40% random variance)
+      const baseInterval = isLive ? 5 * 60 * 1000 : 30 * 1000;
+      console.log(`Setting up ${taskType} mode with base interval: ${baseInterval}ms`);
 
-      const intervalId = setInterval(() => {
-        this.addTask(campaignId, taskType);
-      }, intervalTime);
+      const scheduleNext = () => {
+        const jitterFactor = 0.2 + Math.random() * 0.2;
+        const direction = Math.random() > 0.5 ? 1 : -1;
+        const jitteredInterval = baseInterval + baseInterval * jitterFactor * direction;
+        const clampedInterval = Math.max(baseInterval * 0.6, Math.min(baseInterval * 1.6, jitteredInterval));
 
-      this.activeIntervals.set(campaignId, intervalId);
+        const timeoutId = setTimeout(() => {
+          if (this.activeIntervals.has(campaignId)) {
+            this.addTask(campaignId, taskType);
+            scheduleNext();
+          }
+        }, clampedInterval);
+
+        this.activeIntervals.set(campaignId, timeoutId);
+      };
+
+      scheduleNext();
     } catch (error) {
       console.error(`Error starting campaign ${campaignId}:`, error);
       throw error;
@@ -95,18 +106,18 @@ class TaskQueue {
 
   async stopCampaign(campaignId) {
     try {
-      // Clear any scheduled intervals
-      const intervalId = this.activeIntervals.get(campaignId);
-      if (intervalId) {
-        clearInterval(intervalId);
-        this.activeIntervals.delete(campaignId);
-      }
-
-      // Update database state immediately
+      // Update database state first so if this fails we know
       await pool.query(
         'UPDATE campaigns SET is_running = false WHERE id = $1',
         [campaignId]
       );
+
+      // Then clear timeouts/intervals
+      const timerId = this.activeIntervals.get(campaignId);
+      if (timerId) {
+        clearTimeout(timerId);
+        this.activeIntervals.delete(campaignId);
+      }
 
       console.log(`Campaign ${campaignId} stopped successfully`);
     } catch (error) {
@@ -192,12 +203,28 @@ class TaskQueue {
       }
 
       // Create a post
-      await postingService.createPost(task.campaignId, true);
+      try {
+        await postingService.createPost(task.campaignId, true);
+      } catch (postError) {
+        if (postError.message.includes('post limit') || postError.message.includes('Minimum post interval')) {
+          console.log(`Live post skipped for campaign ${task.campaignId}: ${postError.message}`);
+        } else {
+          console.error(`Error creating live post: ${postError.message}`);
+        }
+      }
       
       // Generate comments
-      await commentingService.createComments(task.campaignId, true);
+      try {
+        await commentingService.createComments(task.campaignId, true);
+      } catch (commentError) {
+        if (commentError.message.includes('comment limit') || commentError.message.includes('Minimum reply interval')) {
+          console.log(`Live comments skipped for campaign ${task.campaignId}: ${commentError.message}`);
+        } else {
+          console.error(`Error creating live comments: ${commentError.message}`);
+        }
+      }
     } catch (error) {
-      console.error(`Error handling live task: ${error.message}`);
+      console.error(`Critical error handling live task: ${error.message}`);
     }
   }
 }

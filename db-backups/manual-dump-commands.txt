@@ -1,0 +1,21 @@
+# Manual Database Dump Commands
+
+# 1. Create dump from RDS (replace YOUR_RDS_PASSWORD)
+PGPASSWORD='YOUR_RDS_PASSWORD' pg_dump \
+  -h oracle-db.cyruxuioaadm.us-east-1.rds.amazonaws.com \
+  -p 5432 \
+  -U postgres \
+  -d oracle \
+  --no-owner \
+  --no-privileges \
+  -f oracle_rds_dump.sql
+
+# 2. Drop and recreate local database
+PGPASSWORD='password' psql -h localhost -U postgres -d postgres -c "DROP DATABASE IF EXISTS oracle;"
+PGPASSWORD='password' psql -h localhost -U postgres -d postgres -c "CREATE DATABASE oracle;"
+
+# 3. Restore to local
+PGPASSWORD='password' psql -h localhost -U postgres -d oracle -f oracle_rds_dump.sql
+
+# 4. Verify
+PGPASSWORD='password' psql -h localhost -U postgres -d oracle -c "\dt"

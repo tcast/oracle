@@ -1,0 +1,48 @@
+{
+  "overall_stats": {
+    "avg_word_count": 42.5,
+    "median_word_count": 38,
+    "avg_sentence_count": 2.8,
+    "median_sentence_count": 2,
+    "emoji_usage_rate": 0.18,
+    "question_usage_rate": 0.32,
+    "exclamation_usage_rate": 0.27,
+    "hashtag_usage_rate": 0.08
+  },
+  "high_score_stats": {
+    "avg_word_count": 58.3,
+    "median_word_count": 52,
+    "avg_sentence_count": 3.2,
+    "median_sentence_count": 3,
+    "emoji_usage_rate": 0.15,
+    "question_usage_rate": 0.41,
+    "exclamation_usage_rate": 0.22,
+    "hashtag_usage_rate": 0.03
+  },
+  "recommendations": {
+    "optimal_comment_length": {
+      "words": 50,
+      "sentences": 3
+    },
+    "engagement_elements": {
+      "use_questions": true,
+      "use_exclamations": true,
+      "use_emojis": false,
+      "avoid_hashtags": true
+    },
+    "best_performing_style": {
+      "characteristics": {
+        "avg_word_count": 52,
+        "avg_sentence_count": 3,
+        "question_ratio": 0.41,
+        "exclamation_ratio": 0.22,
+        "emoji_ratio": 0.15
+      },
+      "example_comments": [
+        "I've noticed this pattern in my own experience. Have you considered how this might affect long-term outcomes? The implications are significant.",
+        "This perspective challenges conventional wisdom. What's particularly interesting is the connection between these factors that most people overlook.",
+        "The evidence presented here contradicts what I've observed in similar situations. Could there be regional or demographic factors at play?"
+      ]
+    }
+  }
+}

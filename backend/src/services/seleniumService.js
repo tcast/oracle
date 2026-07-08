@@ -93,7 +93,7 @@ class SeleniumService {
     let driver;
     try {
       // Get account credentials
-      const accountResult = await this.pool.query(
+      const accountResult = await pool.query(
         'SELECT username, credentials FROM social_accounts WHERE id = $1',
         [accountId]
       );

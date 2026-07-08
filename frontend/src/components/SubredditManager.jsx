@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import api from '../utils/api';
 
 const SubredditManager = ({ campaignId }) => {
   const [suggestions, setSuggestions] = useState([]);
@@ -6,20 +7,14 @@ const SubredditManager = ({ campaignId }) => {
   const [error, setError] = useState(null);
 
   useEffect(() => {
-    if (campaignId) {
-      fetchSuggestions();
-    }
+    if (campaignId) fetchSuggestions();
   }, [campaignId]);
 
   const fetchSuggestions = async () => {
     try {
       setLoading(true);
-      const response = await fetch(`/api/campaigns/${campaignId}/subreddits`);
-      if (!response.ok) {
-        throw new Error('Failed to fetch suggestions');
-      }
-      const data = await response.json();
-      setSuggestions(Array.isArray(data) ? data : []);
+      const response = await api.get(`/api/subreddits/${campaignId}`);
+      setSuggestions(Array.isArray(response.data) ? response.data : []);
     } catch (err) {
       console.error('Error fetching suggestions:', err);
       setError('Failed to fetch subreddit suggestions');
@@ -33,32 +28,11 @@ const SubredditManager = ({ campaignId }) => {
     try {
       setLoading(true);
       setError(null);
-      
-      console.log('Generating suggestions for campaign:', campaignId);
-      
-      const response = await fetch(`/api/campaigns/${campaignId}/generate-subreddits`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        }
-      });
-      
-      if (!response.ok) {
-        const errorData = await response.json();
-        console.error('Server error details:', errorData);
-        throw new Error(errorData.error || `Server error: ${response.status}`);
-      }
-      
-      const data = await response.json();
-      if (!Array.isArray(data)) {
-        console.error('Invalid response format:', data);
-        throw new Error('Invalid response format from server');
-      }
-      
-      setSuggestions(data);
+      const response = await api.post(`/api/subreddits/${campaignId}/generate`);
+      setSuggestions(Array.isArray(response.data) ? response.data : []);
     } catch (err) {
       console.error('Error generating suggestions:', err);
-      setError(err.message || 'Failed to generate suggestions');
+      setError('Failed to generate subreddit suggestions');
     } finally {
       setLoading(false);
     }
@@ -69,22 +43,15 @@ const SubredditManager = ({ campaignId }) => {
       setLoading(true);
       const response = await fetch(`/api/subreddit-suggestions/${suggestionId}`, {
         method: 'PATCH',
-        headers: {
-          'Content-Type': 'application/json'
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ status })
       });
-
       if (!response.ok) {
         const errorData = await response.json();
         throw new Error(errorData.error || 'Failed to update status');
       }
-
-      const updatedSuggestion = await response.json();
-      setSuggestions(prevSuggestions => 
-        prevSuggestions.map(s => 
-          s.id === suggestionId ? { ...s, status } : s
-        )
+      setSuggestions(prev =>
+        prev.map(s => s.id === suggestionId ? { ...s, status } : s)
       );
     } catch (err) {
       console.error('Error updating suggestion:', err);
@@ -94,77 +61,82 @@ const SubredditManager = ({ campaignId }) => {
     }
   };
 
-  if (loading) {
-    return <div className="text-center py-4">Loading suggestions...</div>;
-  }
-
   return (
     <div className="space-y-4">
       <div className="flex justify-between items-center">
-        <h3 className="text-lg font-medium">Subreddit Suggestions</h3>
-        <button
-          onClick={generateSuggestions}
-          disabled={loading}
-          className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 disabled:bg-gray-400"
-        >
+        <h3 className="section-header mb-0">Subreddit Suggestions</h3>
+        <button onClick={generateSuggestions} disabled={loading} className="btn-primary text-sm">
           {loading ? 'Generating...' : 'Generate Suggestions'}
         </button>
       </div>
 
       {error && (
-        <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded">
+        <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-xl text-sm animate-fade-in">
           {error}
         </div>
       )}
 
       {!loading && suggestions.length === 0 && (
-        <div className="text-center py-4 text-gray-500">
+        <div className="text-center py-8 text-gray-400 bg-gray-50 rounded-xl">
+          <svg className="w-8 h-8 mx-auto mb-2 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+          </svg>
           No suggestions yet. Click "Generate Suggestions" to get started.
         </div>
       )}
 
-      <div className="grid gap-4">
+      <div className="grid gap-3">
         {suggestions.map(suggestion => (
-          <div 
-            key={suggestion.id} 
-            className={`p-4 rounded-lg border ${
-              suggestion.status === 'approved' ? 'border-green-500 bg-green-50' :
-              suggestion.status === 'rejected' ? 'border-red-500 bg-red-50' :
-              'border-gray-200'
+          <div
+            key={suggestion.id}
+            className={`rounded-xl border-2 p-4 transition-all ${
+              suggestion.status === 'approved' ? 'border-emerald-300 bg-emerald-50/50' :
+              suggestion.status === 'rejected' ? 'border-red-300 bg-red-50/50' :
+              'border-gray-100 bg-white hover:border-gray-200'
             }`}
           >
             <div className="flex justify-between items-start">
-              <div>
-                <h4 className="font-medium">r/{suggestion.subreddit_name}</h4>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center space-x-2">
+                  <h4 className="font-semibold text-gray-900">r/{suggestion.subreddit_name}</h4>
+                  <span className={`badge ${
+                    suggestion.status === 'approved' ? 'badge-success' :
+                    suggestion.status === 'rejected' ? 'badge-danger' :
+                    'badge-neutral'
+                  }`}>
+                    {suggestion.status || 'pending'}
+                  </span>
+                </div>
                 <p className="text-sm text-gray-600 mt-1">{suggestion.reason}</p>
                 {suggestion.subscriber_count && (
-                  <p className="text-sm text-gray-500 mt-1">
+                  <p className="text-xs text-gray-400 mt-1 flex items-center">
+                    <svg className="w-3.5 h-3.5 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z" />
+                    </svg>
                     {suggestion.subscriber_count.toLocaleString()} subscribers
                   </p>
                 )}
               </div>
-              
               {(!suggestion.status || suggestion.status === 'pending') && (
-                <div className="flex space-x-2">
+                <div className="flex space-x-2 ml-4">
                   <button
                     onClick={() => updateSuggestionStatus(suggestion.id, 'approved')}
-                    className="px-3 py-1 bg-green-500 text-white rounded hover:bg-green-600"
+                    className="px-3 py-1.5 text-xs font-medium bg-emerald-500 text-white rounded-lg hover:bg-emerald-600 transition-colors"
                   >
                     Approve
                   </button>
                   <button
                     onClick={() => updateSuggestionStatus(suggestion.id, 'rejected')}
-                    className="px-3 py-1 bg-red-500 text-white rounded hover:bg-red-600"
+                    className="px-3 py-1.5 text-xs font-medium bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors"
                   >
                     Reject
                   </button>
                 </div>
               )}
-              
               {suggestion.status && suggestion.status !== 'pending' && (
                 <button
                   onClick={() => updateSuggestionStatus(suggestion.id, 'pending')}
-                  className="text-sm text-gray-500 hover:text-gray-700"
+                  className="text-xs text-gray-400 hover:text-gray-600 ml-4 transition-colors"
                 >
                   Reset
                 </button>

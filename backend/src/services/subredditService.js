@@ -1,13 +1,12 @@
 const pool = require('./db');
-const { Configuration, OpenAIApi } = require('openai');
+const OpenAI = require('openai');
 
 class SubredditService {
   constructor() {
     if (process.env.OPENAI_API_KEY) {
-      this.configuration = new Configuration({
+      this.openai = new OpenAI({
         apiKey: process.env.OPENAI_API_KEY,
       });
-      this.openai = new OpenAIApi(this.configuration);
     }
   }
 
@@ -42,16 +41,15 @@ class SubredditService {
       }
 
       if (!this.openai) {
-        this.configuration = new Configuration({
+        this.openai = new OpenAI({
           apiKey: process.env.OPENAI_API_KEY,
         });
-        this.openai = new OpenAIApi(this.configuration);
       }
 
       console.log('Making OpenAI API request...');
       
-      const completion = await this.openai.createChatCompletion({
-        model: "gpt-4",
+      const completion = await this.openai.chat.completions.create({
+        model: "gpt-4o",
         messages: [
           {
             role: "system",
@@ -95,7 +93,7 @@ Format your response as a JSON object with this structure:
 
       // ... rest of OpenAI response handling ...
 
-      const content = completion.data.choices[0].message.content;
+      const content = completion.choices[0].message.content;
       console.log('Received response from OpenAI:', content);
 
       // Parse and clean the response before JSON parsing

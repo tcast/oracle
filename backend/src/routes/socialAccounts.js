@@ -1,8 +1,13 @@
 const express = require('express');
 const router = express.Router();
+const { authMiddleware } = require('../middleware/auth');
 const pool = require('../services/db');
+const accountCreationService = require('../services/accountCreationService');
 
-router.get('/social-accounts', async (req, res) => {
+router.use(authMiddleware);
+
+// The frontend expects this route without the 'social-accounts' prefix
+router.get('/', async (req, res) => {
   try {
     const { search, platform, status } = req.query;
     
@@ -34,6 +39,7 @@ router.get('/social-accounts', async (req, res) => {
         id,
         platform,
         username,
+        email,
         status,
         persona_traits,
         CASE 
@@ -64,7 +70,7 @@ router.get('/social-accounts', async (req, res) => {
 });
 
 // Get available platforms and statuses for filters
-router.get('/social-accounts/filters', async (req, res) => {
+router.get('/filters', async (req, res) => {
   try {
     const platforms = await pool.query(
       'SELECT DISTINCT platform FROM social_accounts ORDER BY platform'
@@ -85,18 +91,19 @@ router.get('/social-accounts/filters', async (req, res) => {
 });
 
 // Add new social account
-router.post('/social-accounts', async (req, res) => {
-  const { platform, username, credentials, persona_traits } = req.body;
+router.post('/', async (req, res) => {
+  const { platform, username, email, credentials, persona_traits } = req.body;
   
   try {
     const result = await pool.query(
       `INSERT INTO social_accounts 
-       (platform, username, credentials, status, persona_traits)
-       VALUES ($1, $2, $3, 'active', $4)
+       (platform, username, email, credentials, status, persona_traits)
+       VALUES ($1, $2, $3, $4, 'active', $5)
        RETURNING *`,
       [
         platform,
         username,
+        email,
         JSON.stringify(credentials),
         JSON.stringify(persona_traits)
       ]
@@ -110,7 +117,7 @@ router.post('/social-accounts', async (req, res) => {
 });
 
 // Update social account status
-router.patch('/social-accounts/:id/status', async (req, res) => {
+router.patch('/:id/status', async (req, res) => {
   const { id } = req.params;
   const { status } = req.body;
   
@@ -135,7 +142,7 @@ router.patch('/social-accounts/:id/status', async (req, res) => {
 });
 
 // Delete social account
-router.delete('/social-accounts/:id', async (req, res) => {
+router.delete('/:id', async (req, res) => {
   const { id } = req.params;
   
   try {
@@ -152,6 +159,42 @@ router.delete('/social-accounts/:id', async (req, res) => {
   } catch (err) {
     console.error('Error deleting social account:', err);
     res.status(500).json({ error: 'Failed to delete social account' });
+  }
+});
+
+router.post('/create', async (req, res) => {
+  const { platform, count, emailDomain, usernamePrefix } = req.body;
+
+  try {
+    // Validate input
+    if (!platform || !count || !emailDomain || !usernamePrefix) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    if (count < 1 || count > 10) {
+      return res.status(400).json({ error: 'Count must be between 1 and 10' });
+    }
+
+    if (!emailDomain.match(/^[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9]\.[a-zA-Z]{2,}$/)) {
+      return res.status(400).json({ error: 'Invalid email domain' });
+    }
+
+    if (!usernamePrefix.match(/^[a-zA-Z0-9_-]{3,15}$/)) {
+      return res.status(400).json({ error: 'Invalid username prefix' });
+    }
+
+    // Create accounts
+    const accounts = await accountCreationService.createAccounts(
+      platform,
+      count,
+      emailDomain,
+      usernamePrefix
+    );
+
+    res.json({ accounts });
+  } catch (error) {
+    console.error('Error creating accounts:', error);
+    res.status(500).json({ error: 'Failed to create accounts' });
   }
 });
 

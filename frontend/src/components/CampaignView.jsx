@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import SimulationControls from './SimulationControls';
@@ -8,25 +8,20 @@ import NetworkSelector from './NetworkSelector';
 import ImageUploader from './ImageUploader';
 import VideoUploader from './VideoUploader';
 import ConfirmationModal from './ConfirmationModal';
+import api from '../utils/api';
 
 const ExpandableText = ({ text, maxLength = 500 }) => {
   const [isExpanded, setIsExpanded] = useState(false);
-  
   if (!text) return null;
-  
   const shouldTruncate = text.length > maxLength;
   const displayText = !shouldTruncate || isExpanded ? text : text.slice(0, maxLength) + '...';
-  
   return (
-    <div className="space-y-2">
+    <div className="space-y-2 text-sm text-gray-700 leading-relaxed">
       {displayText.split('\n\n').map((paragraph, i) => (
-        <p key={i} className="text-gray-700">{paragraph}</p>
+        <p key={i}>{paragraph}</p>
       ))}
       {shouldTruncate && (
-        <button
-          onClick={() => setIsExpanded(!isExpanded)}
-          className="text-indigo-600 hover:text-indigo-800 text-sm font-medium"
-        >
+        <button onClick={() => setIsExpanded(!isExpanded)} className="text-oracle-600 hover:text-oracle-700 text-sm font-medium">
           {isExpanded ? 'Show Less' : 'Read More'}
         </button>
       )}
@@ -46,92 +41,59 @@ const CampaignView = () => {
   const [isEditing, setIsEditing] = useState(false);
   const [editingCampaign, setEditingCampaign] = useState(null);
 
-  // Calculate latest point from analytics
+  const fetchCampaign = useCallback(async () => {
+    try {
+      const { data } = await api.get(`/api/campaigns/${id}`);
+      setCampaign(data);
+      setLoading(false);
+    } catch (err) {
+      console.error('Error fetching campaign:', err);
+      setError(err.response?.data?.error || err.message);
+      setLoading(false);
+    }
+  }, [id]);
+
+  const fetchAnalytics = useCallback(async () => {
+    try {
+      const { data } = await api.get(`/api/campaigns/${id}/analytics`);
+      setAnalytics(data);
+    } catch (err) {
+      if (err.response?.status !== 404) console.error('Error fetching analytics:', err.message);
+    }
+  }, [id]);
+
+  const fetchStats = useCallback(async () => {
+    try {
+      const { data } = await api.get(`/api/campaigns/${id}/simulation/stats`);
+      setStats(data);
+    } catch (err) {
+      if (err.response?.status !== 404) console.error('Error fetching stats:', err.message);
+    }
+  }, [id]);
+
   const latestPoint = analytics.length > 0 ? analytics[analytics.length - 1] : null;
 
   useEffect(() => {
     fetchCampaign();
     fetchAnalytics();
-    fetchStats(); // Initial fetch
-    
-    // Set up intervals
+    fetchStats();
     const campaignInterval = setInterval(fetchCampaign, 5000);
     const analyticsInterval = setInterval(fetchAnalytics, 5000);
     const statsInterval = setInterval(fetchStats, 5000);
-    
     return () => {
       clearInterval(campaignInterval);
       clearInterval(analyticsInterval);
       clearInterval(statsInterval);
     };
-  }, [id]);
-
-  const fetchCampaign = async () => {
-    try {
-      const response = await fetch(`/api/campaigns/${id}`);
-      if (!response.ok) {
-        throw new Error('Failed to fetch campaign');
-      }
-      const data = await response.json();
-      setCampaign(data);
-      setLoading(false);
-    } catch (err) {
-      console.error('Error fetching campaign:', err);
-      setError(err.message);
-      setLoading(false);
-    }
-  };
-
-  const fetchAnalytics = async () => {
-    try {
-      const response = await fetch(`/api/campaigns/${id}/analytics`, {
-        headers: {
-          'Accept': 'application/json',
-          'Cache-Control': 'no-cache'
-        }
-      });
-      
-      if (!response.ok) {
-        throw new Error('Failed to fetch analytics');
-      }
-      
-      const data = await response.json();
-      setAnalytics(data);
-    } catch (err) {
-      // Silently handle analytics fetch errors
-    }
-  };
-
-  const fetchStats = async () => {
-    try {
-      const response = await fetch(`/api/campaigns/${id}/simulation/stats`, {
-        headers: {
-          'Accept': 'application/json',
-          'Cache-Control': 'no-cache'
-        }
-      });
-      
-      if (!response.ok) {
-        throw new Error('Failed to fetch stats');
-      }
-      
-      const data = await response.json();
-      setStats(data);
-    } catch (err) {
-      // Silently handle stats fetch errors
-    }
-  };
+  }, [id, fetchCampaign, fetchAnalytics, fetchStats]);
 
   const handleDeleteCampaign = async () => {
     try {
       setLoading(true);
-      const response = await fetch(`/api/campaigns/${id}`, {
-        method: 'DELETE'
-      });
-      if (!response.ok) throw new Error('Failed to delete campaign');
+      await api.delete(`/api/campaigns/${id}`);
       navigate('/');
     } catch (err) {
-      setError(err.message);
+      setError(err.response?.data?.error || err.message);
       setLoading(false);
     }
   };
@@ -140,22 +102,12 @@ const CampaignView = () => {
     e.preventDefault();
     try {
       setLoading(true);
-      const response = await fetch(`/api/campaigns/${id}`, {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(editingCampaign),
-      });
-      
-      if (!response.ok) throw new Error('Failed to update campaign');
-      
-      const updatedCampaign = await response.json();
-      setCampaign(updatedCampaign);
+      const { data } = await api.put(`/api/campaigns/${id}`, editingCampaign);
+      setCampaign(data);
       setIsEditing(false);
       setEditingCampaign(null);
     } catch (err) {
-      setError(err.message);
+      setError(err.response?.data?.error || err.message);
     } finally {
       setLoading(false);
     }
@@ -172,15 +124,15 @@ const CampaignView = () => {
 
   if (loading) {
     return (
-      <div className="flex justify-center items-center py-8">
-        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-600"></div>
+      <div className="flex justify-center items-center py-20">
+        <div className="animate-spin rounded-full h-10 w-10 border-2 border-oracle-400 border-t-transparent"></div>
       </div>
     );
   }
 
   if (error) {
     return (
-      <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded">
+      <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-xl text-sm">
         {error}
       </div>
     );
@@ -188,13 +140,10 @@ const CampaignView = () => {
 
   if (!campaign) {
     return (
-      <div className="text-center py-8">
-        <h2 className="text-2xl font-bold text-gray-900">Campaign not found</h2>
-        <p className="mt-2 text-gray-600">The campaign you're looking for doesn't exist or has been deleted.</p>
-        <button
-          onClick={() => navigate('/')}
-          className="mt-4 px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700"
-        >
+      <div className="card p-12 text-center">
+        <h2 className="text-xl font-bold text-gray-900">Campaign not found</h2>
+        <p className="mt-2 text-gray-500">The campaign you're looking for doesn't exist or has been deleted.</p>
+        <button onClick={() => navigate('/')} className="btn-primary mt-4">
           Return to Dashboard
         </button>
       </div>
@@ -203,106 +152,94 @@ const CampaignView = () => {
 
   return (
     <div className="space-y-6">
-      <div className="flex justify-between items-center">
-        <h1 className="text-2xl font-bold text-gray-900">{campaign.name}</h1>
-        <div className="flex space-x-4">
-          <button
-            onClick={startEditing}
-            className="px-4 py-2 bg-white text-gray-700 border border-gray-300 rounded-md hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
-          >
-            Edit Campaign
+      <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3">
+        <div className="flex items-center space-x-3 min-w-0">
+          <button onClick={() => navigate('/')} className="flex-shrink-0 text-gray-400 hover:text-gray-600 p-1 rounded-lg hover:bg-gray-100 transition-colors">
+            <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M10 19l-7-7m0 0l7-7m-7 7h18" />
+            </svg>
           </button>
-          <button
-            onClick={() => setShowDeleteModal(true)}
-            className="px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500"
-          >
-            Delete Campaign
+          <h1 className="page-title truncate">{campaign.name}</h1>
+          <span className={`badge flex-shrink-0 ${
+            campaign.is_running ? 'badge-success' : 'badge-neutral'
+          }`}>
+            <span className={`w-1.5 h-1.5 rounded-full mr-1.5 ${
+              campaign.is_running ? 'bg-emerald-500' : 'bg-gray-400'
+            }`}></span>
+            {campaign.is_running ? 'Active' : 'Inactive'}
+          </span>
+        </div>
+        <div className="flex space-x-2 sm:space-x-3">
+          <button onClick={startEditing} className="btn-secondary text-sm flex-1 sm:flex-none">
+            Edit
+          </button>
+          <button onClick={() => setShowDeleteModal(true)} className="btn-danger text-sm flex-1 sm:flex-none">
+            Delete
           </button>
         </div>
       </div>
 
       {isEditing ? (
-        <div className="bg-white shadow rounded-lg p-6">
+        <div className="card p-6 animate-slide-up">
           <form onSubmit={handleEditCampaign}>
             <div className="space-y-4">
               <div>
-                <label htmlFor="name" className="block text-sm font-medium text-gray-700">Campaign Name</label>
+                <label className="label">Campaign Name</label>
                 <input
                   type="text"
-                  id="name"
                   value={editingCampaign.name}
                   onChange={(e) => setEditingCampaign({...editingCampaign, name: e.target.value})}
-                  className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                  className="input-field"
                 />
               </div>
-              
               <div>
-                <label htmlFor="campaign_overview" className="block text-sm font-medium text-gray-700">Campaign Overview</label>
+                <label className="label">Campaign Overview</label>
                 <textarea
-                  id="campaign_overview"
                   value={editingCampaign.campaign_overview}
                   onChange={(e) => setEditingCampaign({...editingCampaign, campaign_overview: e.target.value})}
                   rows={3}
-                  className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                  className="input-field"
                 />
               </div>
-
               <div>
-                <label htmlFor="campaign_goal" className="block text-sm font-medium text-gray-700">Campaign Goal</label>
+                <label className="label">Campaign Goal</label>
                 <textarea
-                  id="campaign_goal"
                   value={editingCampaign.campaign_goal}
                   onChange={(e) => setEditingCampaign({...editingCampaign, campaign_goal: e.target.value})}
                   rows={2}
-                  className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                  className="input-field"
                 />
               </div>
-
               <div>
-                <label htmlFor="post_goal" className="block text-sm font-medium text-gray-700">Post Goal</label>
+                <label className="label">Post Goal</label>
                 <textarea
-                  id="post_goal"
                   value={editingCampaign.post_goal}
                   onChange={(e) => setEditingCampaign({...editingCampaign, post_goal: e.target.value})}
                   rows={2}
-                  className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                  className="input-field"
                 />
               </div>
-
               <div>
-                <label htmlFor="comment_goal" className="block text-sm font-medium text-gray-700">Comment Goal</label>
+                <label className="label">Comment Goal</label>
                 <textarea
-                  id="comment_goal"
                   value={editingCampaign.comment_goal}
                   onChange={(e) => setEditingCampaign({...editingCampaign, comment_goal: e.target.value})}
                   rows={2}
-                  className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                  className="input-field"
                 />
               </div>
-
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">Social Networks</label>
+                <label className="label mb-2">Social Networks</label>
                 <NetworkSelector
                   onNetworksChange={(networks) => setEditingCampaign({...editingCampaign, platform: networks})}
                   campaign={editingCampaign}
                 />
               </div>
-
-              <div className="flex justify-end space-x-3 pt-4">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setIsEditing(false);
-                    setEditingCampaign(null);
-                  }}
-                  className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50"
-                >
+              <div className="flex justify-end space-x-3 pt-4 border-t border-gray-100">
+                <button type="button" onClick={() => { setIsEditing(false); setEditingCampaign(null); }} className="btn-secondary">
                   Cancel
                 </button>
-                <button
-                  type="submit"
-                  className="px-4 py-2 text-sm font-medium text-white bg-indigo-600 border border-transparent rounded-md hover:bg-indigo-700"
-                >
+                <button type="submit" className="btn-primary">
                   Save Changes
                 </button>
               </div>
@@ -310,120 +247,89 @@ const CampaignView = () => {
           </form>
         </div>
       ) : (
-        <div className="bg-white shadow rounded-lg divide-y divide-gray-200">
+        <div className="card divide-y divide-gray-100">
           <div className="px-6 py-5">
-            <h3 className="text-lg font-medium text-gray-900 mb-4">Campaign Overview</h3>
-            
-            <div className="space-y-6">
-              <div>
-                <h4 className="text-sm font-medium text-gray-500">Overview</h4>
-                <div className="mt-2 prose prose-sm max-w-none">
+            <h3 className="section-header">Campaign Details</h3>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 sm:gap-6">
+              <div className="space-y-4">
+                <div>
+                  <h4 className="text-xs font-semibold text-gray-500 uppercase tracking-wider">Overview</h4>
                   <ExpandableText text={campaign.campaign_overview} />
                 </div>
-              </div>
-
-              <div>
-                <h4 className="text-sm font-medium text-gray-500">Campaign Goal</h4>
-                <div className="mt-2 prose prose-sm max-w-none">
+                <div>
+                  <h4 className="text-xs font-semibold text-gray-500 uppercase tracking-wider">Campaign Goal</h4>
                   <ExpandableText text={campaign.campaign_goal} />
                 </div>
               </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <div className="space-y-4">
                 <div>
-                  <h4 className="text-sm font-medium text-gray-500">Post Goal</h4>
-                  <div className="mt-2 prose prose-sm max-w-none">
-                    <ExpandableText text={campaign.post_goal} maxLength={500} />
-                  </div>
+                  <h4 className="text-xs font-semibold text-gray-500 uppercase tracking-wider">Post Goal</h4>
+                  <ExpandableText text={campaign.post_goal} maxLength={500} />
                 </div>
-
                 <div>
-                  <h4 className="text-sm font-medium text-gray-500">Comment Goal</h4>
-                  <div className="mt-2 prose prose-sm max-w-none">
-                    <ExpandableText text={campaign.comment_goal} maxLength={500} />
-                  </div>
+                  <h4 className="text-xs font-semibold text-gray-500 uppercase tracking-wider">Comment Goal</h4>
+                  <ExpandableText text={campaign.comment_goal} maxLength={500} />
                 </div>
               </div>
-
-              <div>
-                <h4 className="text-sm font-medium text-gray-500">Selected Networks</h4>
-                <div className="mt-2 flex flex-wrap gap-2">
-                  {campaign.platform?.map(platform => (
-                    <span
-                      key={platform}
-                      className="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-indigo-100 text-indigo-800"
-                    >
+            </div>
+            {campaign.platform?.length > 0 && (
+              <div className="mt-4 pt-4 border-t border-gray-100">
+                <h4 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">Networks</h4>
+                <div className="flex flex-wrap gap-2">
+                  {campaign.platform.map(platform => (
+                    <span key={platform} className="badge-info">
                       {platform.charAt(0).toUpperCase() + platform.slice(1)}
                     </span>
                   ))}
                 </div>
               </div>
-            </div>
+            )}
           </div>
         </div>
       )}
 
-      <div className="bg-white shadow rounded-lg overflow-hidden">
-        <div className="px-4 py-5 sm:p-6">
+      <div className="card">
+        <div className="px-6 py-5">
           <SimulationControls campaignId={id} isLive={campaign.is_live} />
         </div>
       </div>
 
-      <div className="bg-white shadow rounded-lg overflow-hidden">
-        <div className="px-4 py-5 sm:p-6">
-          <h3 className="text-lg font-medium text-gray-900 mb-4">Activity Overview</h3>
-          <div className="h-64">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={analytics}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis 
-                  dataKey="date" 
-                  tickFormatter={(timestamp) => new Date(timestamp).toLocaleDateString()} 
-                />
-                <YAxis />
-                <Tooltip 
-                  labelFormatter={(timestamp) => new Date(timestamp).toLocaleDateString()}
-                  formatter={(value, name) => [value, name.charAt(0).toUpperCase() + name.slice(1)]}
-                />
-                <Legend />
-                <Line 
-                  type="monotone" 
-                  dataKey="posts" 
-                  stroke="#8884d8" 
-                  name="Posts"
-                  strokeWidth={2}
-                  dot={false}
-                />
-                <Line 
-                  type="monotone" 
-                  dataKey="comments" 
-                  stroke="#82ca9d" 
-                  name="Comments"
-                  strokeWidth={2}
-                  dot={false}
-                />
-                <Line 
-                  type="monotone" 
-                  dataKey="engagement" 
-                  stroke="#ffc658" 
-                  name="Engagement"
-                  strokeWidth={2}
-                  dot={false}
-                />
-              </LineChart>
-            </ResponsiveContainer>
+      <div className="card">
+        <div className="px-6 py-5">
+          <h3 className="section-header">Activity Overview</h3>
+          <div className="h-72">
+            {analytics.length > 0 ? (
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={analytics}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
+                  <XAxis dataKey="date" tickFormatter={(t) => new Date(t).toLocaleDateString()} tick={{ fontSize: 12 }} stroke="#9ca3af" />
+                  <YAxis tick={{ fontSize: 12 }} stroke="#9ca3af" />
+                  <Tooltip
+                    labelFormatter={(t) => new Date(t).toLocaleDateString()}
+                    formatter={(value, name) => [value, name.charAt(0).toUpperCase() + name.slice(1)]}
+                    contentStyle={{ borderRadius: '12px', border: '1px solid #e5e7eb', boxShadow: '0 4px 6px -1px rgba(0,0,0,0.1)' }}
+                  />
+                  <Legend />
+                  <Line type="monotone" dataKey="posts" stroke="#6366f1" strokeWidth={2} dot={false} />
+                  <Line type="monotone" dataKey="comments" stroke="#10b981" strokeWidth={2} dot={false} />
+                  <Line type="monotone" dataKey="engagement" stroke="#f59e0b" strokeWidth={2} dot={false} />
+                </LineChart>
+              </ResponsiveContainer>
+            ) : (
+              <div className="flex items-center justify-center h-full text-gray-400 text-sm">No analytics data yet</div>
+            )}
           </div>
         </div>
       </div>
 
-      <div className="bg-white shadow rounded-lg overflow-hidden">
-        <div className="px-4 py-5 sm:p-6">
+      <div className="card">
+        <div className="px-6 py-5">
           <SubredditManager campaignId={id} />
         </div>
       </div>
 
-      <div className="bg-white shadow rounded-lg overflow-hidden">
-        <div className="px-4 py-5 sm:p-6">
+      <div className="card">
+        <div className="px-6 py-5">
           <CampaignPosts campaignId={id} />
         </div>
       </div>
@@ -439,4 +345,4 @@ const CampaignView = () => {
   );
 };
 
-export default CampaignView; 
+export default CampaignView;

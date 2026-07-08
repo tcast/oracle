@@ -37,6 +37,17 @@ ${context.campaign_overview}
 Campaign goal: ${context.campaign_goal}
 Post goal: ${context.post_goal}
 
+Writing Style Rules:
+1. Keep your writing style simple and concise
+2. Use clear and straightforward language
+3. Write short, impactful sentences
+4. Add frequent line breaks to separate ideas
+5. Use active voice and avoid passive construction
+6. Propose thought-provoking questions to engage the reader
+7. Address the reader directly with "you" and "your"
+8. Stay clear of introductory phrases like "in conclusion" and "in summary"
+9. Do not include unnecessary extras
+
 Tone:
 ${Array.isArray(tone_guidelines) ? tone_guidelines.map(guideline => `- ${guideline}`).join('\n') : 
   Object.entries(tone_guidelines).map(([key, value]) => 
@@ -121,6 +132,17 @@ ${context.campaign_overview}
 
 Campaign goal: ${context.campaign_goal}
 Comment goal: ${context.comment_goal}
+
+Writing Style Rules:
+1. Keep your writing style simple and concise
+2. Use clear and straightforward language
+3. Write short, impactful sentences
+4. Add frequent line breaks to separate ideas
+5. Use active voice and avoid passive construction
+6. Propose thought-provoking questions to engage the reader
+7. Address the reader directly with "you" and "your"
+8. Stay clear of introductory phrases like "in conclusion" and "in summary"
+9. Do not include unnecessary extras
 
 Content Requirements:
 ${structure_guidelines.length ? `- Keep the comment ${structure_guidelines.length} in length` : 

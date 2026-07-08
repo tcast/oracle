@@ -1,7 +1,5 @@
 // Core service imports
 const express = require('express');
-const { Pool } = require('pg');
-const { Configuration, OpenAIApi } = require('openai');
 const cors = require('cors');
 const dotenv = require('dotenv');
 const multer = require('multer');
@@ -10,14 +8,21 @@ const fs = require('fs').promises;
 const postsRouter = require('./routes/posts');
 const subredditsRouter = require('./routes/subreddits');
 const socialAccountsRouter = require('./routes/socialAccounts');
+const campaignsRouter = require('./routes/campaigns');
+const healthRouter = require('./routes/health');
+const proxyRouter = require('./routes/proxies');
+const emailAccountsRouter = require('./routes/emailAccounts');
 
 // Service imports
+const pool = require('./services/db'); // Import the shared database pool
 const postingService = require('./services/postingService');
 const taskQueue = require('./services/taskQueue');
 const commentingService = require('./services/commentingService');
-const seleniumService = require('./services/seleniumService');
+const playwrightService = require('./services/playwrightService');
 const subredditService = require('./services/subredditService');
 const authService = require('./services/authService');
+const initDb = require('./database/init-db');
+const { authMiddleware } = require('./middleware/auth');
 
 // Configuration
 dotenv.config();
@@ -28,53 +33,10 @@ const port = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Database configuration
-const dbConfig = process.env.DATABASE_URL
-  ? {
-      connectionString: process.env.DATABASE_URL,
-      ssl: { 
-        require: true, 
-        rejectUnauthorized: false 
-      }
-    }
-  : {
-      user: process.env.DB_USER,
-      host: process.env.DB_HOST,
-      database: process.env.DB_NAME,
-      password: process.env.DB_PASSWORD,
-      port: process.env.DB_PORT,
-    };
+const openai = require('./services/openai');
 
-const pool = new Pool(dbConfig);
-
-// Test database connection
-if (process.env.NODE_ENV === 'production') {
-  pool.query('SELECT NOW()', (err, res) => {
-    if (err) {
-      console.error('Production database connection error:', err);
-      process.exit(1); // Exit if we can't connect in production
-    } else {
-      console.log('Production database connected successfully');
-    }
-  });
-} else {
-  pool.query('SELECT NOW()', (err, res) => {
-    if (err) {
-      console.error('Local database connection error:', err);
-    } else {
-      console.log('Local database connected successfully');
-    }
-  });
-}
-
-// OpenAI configuration
-const configuration = new Configuration({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-const openai = new OpenAIApi(configuration);
-
-// Campaign Routes
-app.get('/api/campaigns', async (req, res) => {
+// Campaign Routes (authenticated)
+app.get('/api/campaigns', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM campaigns ORDER BY created_at DESC');
     res.json(result.rows);
@@ -83,7 +45,7 @@ app.get('/api/campaigns', async (req, res) => {
   }
 });
 
-app.get('/api/campaigns/:id', async (req, res) => {
+app.get('/api/campaigns/:id', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM campaigns WHERE id = $1', [req.params.id]);
     if (result.rows.length === 0) {
@@ -96,7 +58,7 @@ app.get('/api/campaigns/:id', async (req, res) => {
   }
 });
 
-app.post('/api/campaigns', async (req, res) => {
+app.post('/api/campaigns', authMiddleware, async (req, res) => {
   const { 
     name, 
     campaign_overview,
@@ -125,8 +87,8 @@ app.post('/api/campaigns', async (req, res) => {
         name,
         campaign_overview,
         campaign_goal,
-        post_goal,
-        comment_goal,
+        parseInt(post_goal) || 5,
+        parseInt(comment_goal) || 3,
         target_sentiment,
         is_live,
         networks || [],
@@ -136,7 +98,7 @@ app.post('/api/campaigns', async (req, res) => {
     );
     
     if (is_live && networks?.includes('reddit')) {
-      const accounts = await seleniumService.verifyAccounts('reddit');
+      const accounts = await playwrightService.verifyAccounts('reddit');
       if (!accounts.length) {
         throw new Error('No valid Reddit accounts available for live mode');
       }
@@ -153,7 +115,7 @@ app.post('/api/campaigns', async (req, res) => {
   }
 });
 
-app.put('/api/campaigns/:id', async (req, res) => {
+app.put('/api/campaigns/:id', authMiddleware, async (req, res) => {
   const { 
     name, 
     campaign_overview,
@@ -222,8 +184,8 @@ app.put('/api/campaigns/:id', async (req, res) => {
         name,
         campaign_overview,
         campaign_goal,
-        post_goal,
-        comment_goal,
+        parseInt(post_goal) || 5,
+        parseInt(comment_goal) || 3,
         target_sentiment,
         is_live,
         platform || [],
@@ -245,7 +207,7 @@ app.put('/api/campaigns/:id', async (req, res) => {
     
     // If switching to live mode, verify accounts
     if (is_live && platform?.includes('reddit') && !existingCampaign.rows[0].is_live) {
-      const accounts = await seleniumService.verifyAccounts('reddit');
+      const accounts = await playwrightService.verifyAccounts('reddit');
       if (!accounts.length) {
         throw new Error('No valid Reddit accounts available for live mode');
       }
@@ -262,7 +224,7 @@ app.put('/api/campaigns/:id', async (req, res) => {
   }
 });
 
-app.delete('/api/campaigns/:id', async (req, res) => {
+app.delete('/api/campaigns/:id', authMiddleware, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -311,7 +273,7 @@ app.delete('/api/campaigns/:id', async (req, res) => {
   }
 });
 
-app.get('/api/campaigns/:id/simulation/status', async (req, res) => {
+app.get('/api/campaigns/:id/simulation/status', authMiddleware, async (req, res) => {
   try {
     const status = await taskQueue.getCampaignStatus(req.params.id);
     res.json(status);
@@ -321,7 +283,7 @@ app.get('/api/campaigns/:id/simulation/status', async (req, res) => {
   }
 });
 
-app.post('/api/campaigns/:id/simulation/start', async (req, res) => {
+app.post('/api/campaigns/:id/simulation/start', authMiddleware, async (req, res) => {
   try {
     const campaignId = parseInt(req.params.id);
     const status = await taskQueue.getCampaignStatus(campaignId);
@@ -338,7 +300,7 @@ app.post('/api/campaigns/:id/simulation/start', async (req, res) => {
   }
 });
 
-app.post('/api/campaigns/:id/simulation/stop', async (req, res) => {
+app.post('/api/campaigns/:id/simulation/stop', authMiddleware, async (req, res) => {
   try {
     const campaignId = parseInt(req.params.id);
     const status = await taskQueue.getCampaignStatus(campaignId);
@@ -357,7 +319,7 @@ app.post('/api/campaigns/:id/simulation/stop', async (req, res) => {
 
 
 // Posts and Comments Routes
-app.get('/api/campaigns/:id/posts', async (req, res) => {
+app.get('/api/campaigns/:id/posts', authMiddleware, async (req, res) => {
   try {
     const campaignId = req.params.id;
     
@@ -443,7 +405,7 @@ app.get('/api/campaigns/:id/posts', async (req, res) => {
 });
 
 // Analytics and Stats Routes
-app.get('/api/campaigns/:id/simulation/stats', async (req, res) => {
+app.get('/api/campaigns/:id/simulation/stats', authMiddleware, async (req, res) => {
   try {
     const campaignId = parseInt(req.params.id);
     console.log('Fetching simulation stats for campaign:', campaignId);
@@ -518,7 +480,7 @@ app.get('/api/campaigns/:id/simulation/stats', async (req, res) => {
 });
 
 // Add this with the other analytics routes
-app.get('/api/campaigns/:id/analytics', async (req, res) => {
+app.get('/api/campaigns/:id/analytics', authMiddleware, async (req, res) => {
   try {
     const campaignId = req.params.id;
     
@@ -608,7 +570,7 @@ const upload = multer({
 });
 
 // File Upload Routes
-app.post('/api/upload', upload.single('media'), async (req, res) => {
+app.post('/api/upload', authMiddleware, upload.single('media'), async (req, res) => {
   try {
     if (!req.file) {
       throw new Error('No file uploaded');
@@ -679,19 +641,13 @@ app.post('/api/auth/logout', async (req, res) => {
 
 // Serve uploaded files
 app.use('/uploads', express.static('uploads'));
-app.use('/api', postsRouter);
-app.use('/api', subredditsRouter);
-app.use('/api', socialAccountsRouter);
-
-if (process.env.NODE_ENV === 'production') {
-  // Serve static files from the frontend build directory
-  app.use(express.static(path.join(__dirname, '../../frontend/dist')));
-  
-  // Handle React routing, return all requests to React app
-  app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, '../../frontend/dist/index.html'));
-  });
-}
+app.use('/api/posts', postsRouter);
+app.use('/api/subreddits', subredditsRouter);
+app.use('/api/social-accounts', socialAccountsRouter);
+app.use('/api/campaigns', campaignsRouter);
+app.use('/api/health', healthRouter);
+app.use('/api/proxies', proxyRouter);
+app.use('/api/email-accounts', emailAccountsRouter);
 
 // Add cleanup handling for graceful shutdown
 process.on('SIGTERM', async () => {
@@ -702,8 +658,8 @@ process.on('SIGTERM', async () => {
     await taskQueue.stopCampaign(campaignId);
   }
   
-  // Clean up selenium sessions
-  await seleniumService.cleanup();
+  // Clean up browser sessions
+  await playwrightService.cleanup();
   
   // Close database pool
   await pool.end();
@@ -711,17 +667,20 @@ process.on('SIGTERM', async () => {
   process.exit(0);
 });
 
-
-if (process.env.NODE_ENV === 'production') {
-  app.use(express.static(path.join(__dirname, '../../frontend/dist')));
+// Serve static files from the frontend build directory (any environment if dist exists)
+const distPath = path.join(__dirname, '../../frontend/dist');
+if (require('fs').existsSync(distPath)) {
+  app.use(express.static(distPath));
   
   app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, '../../frontend/dist/index.html'));
+    res.sendFile(path.join(distPath, 'index.html'));
   });
 }
 
 // Start server
-app.listen(port, () => {
+app.listen(port, async () => {
+  await initDb();
+  await taskQueue.initialize();
   console.log(`Server running on port ${port}`);
 });
 

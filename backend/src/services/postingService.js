@@ -1,6 +1,6 @@
 const pool = require('./db');
 const openai = require('./openai');
-const seleniumService = require('./seleniumService');
+const playwrightService = require('./playwrightService');
 const commentingService = require('./commentingService');
 const contentStyleService = require('./contentStyleService');
 
@@ -33,7 +33,7 @@ class PostingService {
           const subreddit = context.subreddit;
           if (!subreddit) throw new Error('Subreddit required for Reddit posts');
 
-          const platformPostId = await seleniumService.createRedditPost(
+          const platformPostId = await playwrightService.createRedditPost(
             account.id,
             subreddit.subreddit_name,
             content
@@ -63,12 +63,21 @@ Target Subreddit: r/${context.subreddit.subreddit_name}
 ${context.subreddit.content_rules ? `\nSubreddit Rules:\n${context.subreddit.content_rules.join('\n')}` : ''}
 
 Writing Guidelines:
-1. Write in a ${traits.tone || 'natural'} style
-2. Keep the content focused on the campaign's message
-3. Adapt the tone to match the campaign's goals
-4. Share relevant experiences naturally
-5. End with a thought-provoking point or call to action
-${traits.quirks?.includes('shares_personal_stories') ? '6. Include a relevant personal story or anecdote' : ''}
+1. Keep your writing style simple and concise
+2. Use clear and straightforward language
+3. Write short, impactful sentences
+4. Add frequent line breaks to separate ideas
+5. Use active voice and avoid passive construction
+6. Propose thought-provoking questions to engage the reader
+7. Address the reader directly with "you" and "your"
+8. Stay clear of introductory phrases like "in conclusion" and "in summary"
+9. Do not include unnecessary extras
+10. Write in a ${traits.tone || 'natural'} style
+11. Keep the content focused on the campaign's message
+12. Adapt the tone to match the campaign's goals
+13. Share relevant experiences naturally
+14. End with a thought-provoking point or call to action
+${traits.quirks?.includes('shares_personal_stories') ? '15. Include a relevant personal story or anecdote' : ''}
 
 Remember: Stay authentic while delivering the campaign's message effectively.`;
 
@@ -111,7 +120,7 @@ Remember: Stay authentic while delivering the campaign's message effectively.`;
         },
 
         createLivePost: async (campaign, account, content, context) => {
-          const platformPostId = await seleniumService.createLinkedInPost(
+          const platformPostId = await playwrightService.createLinkedInPost(
             account.id,
             content,
             context.mediaAssets,
@@ -141,12 +150,21 @@ Campaign Goal: ${campaign.campaign_goal}
 Post Goal: ${campaign.post_goal}
 
 Writing Guidelines:
-1. Write in a ${traits.tone || 'professional'} style
-2. Keep the content focused on the campaign's message
-3. Adapt the tone to match the campaign's goals
-4. Share relevant insights naturally
-5. End with a clear call to action
-${traits.quirks?.includes('technical_jargon') ? '6. Use relevant industry terminology naturally' : ''}
+1. Keep your writing style simple and concise
+2. Use clear and straightforward language
+3. Write short, impactful sentences
+4. Add frequent line breaks to separate ideas
+5. Use active voice and avoid passive construction
+6. Propose thought-provoking questions to engage the reader
+7. Address the reader directly with "you" and "your"
+8. Stay clear of introductory phrases like "in conclusion" and "in summary"
+9. Do not include unnecessary extras
+10. Write in a ${traits.tone || 'professional'} style
+11. Keep the content focused on the campaign's message
+12. Adapt the tone to match the campaign's goals
+13. Share relevant insights naturally
+14. End with a clear call to action
+${traits.quirks?.includes('technical_jargon') ? '15. Use relevant industry terminology naturally' : ''}
 
 Content Requirements:
 - Keep it concise and impactful
@@ -193,7 +211,7 @@ Content Requirements:
         },
 
         createLivePost: async (campaign, account, content, context) => {
-          const platformPostId = await seleniumService.createXPost(
+          const platformPostId = await playwrightService.createXPost(
             account.id,
             content,
             context.mediaAssets,
@@ -225,12 +243,21 @@ Campaign Goal: ${campaign.campaign_goal}
 Post Goal: ${campaign.post_goal}
 
 Writing Guidelines:
-1. Write in a ${traits.tone || 'engaging'} style
-2. Keep the content focused on the campaign's message
-3. Adapt the tone to match the campaign's goals
-4. Make every character count (280 char limit)
-5. End with a powerful call to action
-${traits.quirks?.includes('uses_emojis') ? '6. Use relevant emojis strategically' : ''}
+1. Keep your writing style simple and concise
+2. Use clear and straightforward language
+3. Write short, impactful sentences
+4. Add frequent line breaks to separate ideas
+5. Use active voice and avoid passive construction
+6. Propose thought-provoking questions to engage the reader
+7. Address the reader directly with "you" and "your"
+8. Stay clear of introductory phrases like "in conclusion" and "in summary"
+9. Do not include unnecessary extras
+10. Write in a ${traits.tone || 'engaging'} style
+11. Keep the content focused on the campaign's message
+12. Adapt the tone to match the campaign's goals
+13. Make every character count (280 char limit)
+14. End with a powerful call to action
+${traits.quirks?.includes('uses_emojis') ? '15. Use relevant emojis strategically' : ''}
 
 Content Requirements:
 - Start with a strong hook
@@ -321,7 +348,7 @@ Content Requirements:
             videoContext: 'TikTok video showcasing the campaign message'
           });
 
-          const platformPostId = await seleniumService.createTikTokPost(
+          const platformPostId = await playwrightService.createTikTokPost(
             account.id,
             videoAsset.url,
             caption
@@ -350,12 +377,21 @@ Campaign Goal: ${campaign.campaign_goal}
 Post Goal: ${campaign.post_goal}
 
 Writing Guidelines:
-1. Write in a ${traits.tone || 'professional'} style
-2. Keep the content focused on the campaign's message
-3. Adapt the tone to match the campaign's goals
-4. Share relevant insights naturally
-5. End with a clear call to action
-${traits.quirks?.includes('technical_jargon') ? '6. Use relevant industry terminology naturally' : ''}
+1. Keep your writing style simple and concise
+2. Use clear and straightforward language
+3. Write short, impactful sentences
+4. Add frequent line breaks to separate ideas
+5. Use active voice and avoid passive construction
+6. Propose thought-provoking questions to engage the reader
+7. Address the reader directly with "you" and "your"
+8. Stay clear of introductory phrases like "in conclusion" and "in summary"
+9. Do not include unnecessary extras
+10. Write in a ${traits.tone || 'professional'} style
+11. Keep the content focused on the campaign's message
+12. Adapt the tone to match the campaign's goals
+13. Share relevant insights naturally
+14. End with a clear call to action
+${traits.quirks?.includes('technical_jargon') ? '15. Use relevant industry terminology naturally' : ''}
 
 Content Requirements:
 - Keep it concise and impactful
@@ -412,11 +448,11 @@ Content Requirements:
       if (network.network_type === 'reddit') {
         const subreddit = await this.getRandomApprovedSubreddit(campaignId);
         if (!subreddit) throw new Error('No available subreddits');
-        
-        const content = await this.generateContent('post', campaign, {
+
+      const content = await this.generateContent('post', campaign, {
           platform: network.network_type,
-          subreddit: subreddit.subreddit_name
-        });
+        subreddit: subreddit.subreddit_name
+      });
 
         post = await pool.query(
           `INSERT INTO posts (campaign_id, platform, content, subreddit, social_account_id, status, posted_at)
@@ -658,11 +694,11 @@ Content Requirements:
           console.log(`Got context for ${network.network_type}:`, context);
 
           // Generate content
-          const content = await this.generateContent('post', campaign, {
+      const content = await this.generateContent('post', campaign, {
             platform: network.network_type,
             ...context
-          });
-
+      });
+      
           // Create post using platform-specific handler
           const postData = await (isLive ? 
             handler.createLivePost(campaign, account, content, context) :
@@ -670,12 +706,12 @@ Content Requirements:
 
           // Insert into database
           const result = await pool.query(
-            `INSERT INTO posts 
+        `INSERT INTO posts 
              (campaign_id, social_account_id, platform, platform_post_id, 
               content, status, metadata, subreddit, posted_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
-             RETURNING *`,
-            [
+         RETURNING *`,
+        [
               postData.campaign_id,
               postData.social_account_id,
               postData.platform,
@@ -753,11 +789,18 @@ Content Requirements:
       // Combine network style with persona
       const finalPrompt = contentStyleService.combineWithPersona(basePrompt, persona);
 
-      const completion = await openai.createChatCompletion({
-        model: "gpt-4",
+      // Check content diversity before generating
+      const recentContent = await this.getRecentContent(campaign.id, context.platform);
+
+      const diversityGuidance = recentContent.length > 0
+        ? `\n\nAvoid repeating these ideas from recent content:\n${recentContent.join('\n')}`
+        : '';
+
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4o",
         messages: [
           { role: "system", content: finalPrompt },
-          { role: "user", content: handler.buildPrompt(type, campaign, context, account) }
+          { role: "user", content: handler.buildPrompt(type, campaign, context, account) + diversityGuidance }
         ],
         temperature: 1.0,
         presence_penalty: 1.0,
@@ -765,14 +808,51 @@ Content Requirements:
         top_p: 0.9
       });
 
-      const content = completion.data?.choices?.[0]?.message?.content.trim();
+      let content = completion.choices?.[0]?.message?.content.trim();
       if (!content) throw new Error('Failed to generate content');
+
+      this.validateContentLength(content, context.platform);
+      this.recentContentCache.add(content);
 
       return content;
     } catch (error) {
       console.error('Error generating content:', error);
       throw error;
     }
+  }
+
+  contentSimilarity(a, b) {
+    const wordsA = new Set(a.toLowerCase().split(/\s+/));
+    const wordsB = new Set(b.toLowerCase().split(/\s+/));
+    const intersection = new Set([...wordsA].filter(w => wordsB.has(w)));
+    const union = new Set([...wordsA, ...wordsB]);
+    return intersection.size / union.size;
+  }
+
+  validateContentLength(content, platform) {
+    const limits = {
+      x: 280,
+      linkedin: 3000,
+      reddit: 40000,
+      tiktok: 2200
+    };
+
+    const limit = limits[platform];
+    if (!limit) return;
+
+    if (content.length > limit) {
+      throw new Error(`Content exceeds ${platform}'s ${limit} character limit (${content.length} chars)`);
+    }
+  }
+
+  async getRecentContent(campaignId, platform) {
+    const result = await pool.query(
+      `SELECT content FROM posts 
+       WHERE campaign_id = $1 AND platform = $2 
+       ORDER BY posted_at DESC LIMIT 5`,
+      [campaignId, platform]
+    );
+    return result.rows.map(r => r.content);
   }
 
   generatePersona(campaign, account) {
@@ -828,7 +908,7 @@ Remember: You're a real person having a real conversation, not following a scrip
         WITH subreddit_posts AS (
           SELECT subreddit, COUNT(*) as post_count
           FROM posts
-          WHERE campaign_id = $1 
+         WHERE campaign_id = $1
           AND status IN ('simulated', 'posted')
           GROUP BY subreddit
         )
@@ -842,7 +922,7 @@ Remember: You're a real person having a real conversation, not following a scrip
           FROM campaigns 
           WHERE id = $1
         ))
-        ORDER BY RANDOM()
+         ORDER BY RANDOM()
         LIMIT 1`;
       
       console.log('Executing query:', query);
@@ -918,7 +998,7 @@ Remember: You're a real person having a real conversation, not following a scrip
       throw error;
     }
   }
-
+ 
   async getCampaign(campaignId) {
     try {
       const query = 'SELECT * FROM campaigns WHERE id = $1';
@@ -1015,15 +1095,6 @@ Remember: You're a real person having a real conversation, not following a scrip
 
   async getPostCount(campaignId, platform) {
     try {
-      if (platform === 'x') {
-        // Get total number of posts for X platform
-        const result = await pool.query(
-          'SELECT COUNT(*) FROM posts WHERE campaign_id = $1 AND platform = $2',
-          [campaignId, platform]
-        );
-        return parseInt(result.rows[0].count);
-      }
-
       const result = await pool.query(
         'SELECT COUNT(*) FROM posts WHERE campaign_id = $1 AND platform = $2',
         [campaignId, platform]

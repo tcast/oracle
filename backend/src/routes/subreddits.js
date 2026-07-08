@@ -1,9 +1,12 @@
 const express = require('express');
 const router = express.Router();
+const { authMiddleware } = require('../middleware/auth');
 const pool = require('../services/db');
 const subredditService = require('../services/subredditService');
 
-router.get('/campaigns/:id/subreddits', async (req, res) => {
+router.use(authMiddleware);
+
+router.get('/:id', async (req, res) => {
   try {
     const suggestions = await subredditService.getSubredditsForCampaign(req.params.id);
     res.json(suggestions);
@@ -13,7 +16,7 @@ router.get('/campaigns/:id/subreddits', async (req, res) => {
   }
 });
 
-router.post('/campaigns/:id/generate-subreddits', async (req, res) => {
+router.post('/:id/generate', async (req, res) => {
     try {
       const campaignId = req.params.id;
       

@@ -1,0 +1,1 @@
+{"statusCode":200,"body":"{\"message\":\"Lambda function executed\",\"files\":[\"AAPL.csv\",\"AMZN.csv\",\"GOOGL.csv\",\"META.csv\",\"MSFT.csv\"],\"testRecordResult\":{\"success\":true,\"recordsWritten\":1}}"}

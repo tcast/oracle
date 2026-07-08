@@ -1,7 +1,7 @@
 // backend/src/services/commentingService.js
 const pool = require('./db');
 const openai = require('./openai');
-const seleniumService = require('./seleniumService');
+const playwrightService = require('./playwrightService');
 const postingService = require('./postingService');
 const contentStyleService = require('./contentStyleService');
 
@@ -23,7 +23,7 @@ const platformHandlers = {
     },
 
     createLiveComment: async (post, campaign, account, content, parentCommentId = null) => {
-      const platformCommentId = await seleniumService.postComment(
+      const platformCommentId = await playwrightService.postComment(
         'reddit',
         account.id,
         post.platform_post_id,
@@ -48,11 +48,30 @@ const platformHandlers = {
 POST:
 ${post.content}
 
+Comment Goal: ${campaign.comment_goal || 'Engage naturally with the post content'}
+
+Writing Style Rules:
+
+1. Keep your writing style simple and concise
+2. Use clear and straightforward language
+3. Write short, impactful sentences
+4. Add frequent line breaks to separate ideas
+5. Use active voice and avoid passive construction
+6. Include thoughtful questions to engage the reader
+7. Address the reader directly with "you" and "your"
+8. Stay clear of introductory phrases like "in conclusion" and "in summary"
+9. Do not include unnecessary extras
+10. Get straight to the point - no introductory statements
+11. Aim for about 50 words and 3 sentences
+12. DO NOT use hashtags in your comment
+
 Quick guidelines:
+
 1. Get straight to your point - no greetings or introductions
-2. Keep it under 50 words
-3. React to one specific point with relevant insight
-${traits.quirks?.includes('shares_personal_stories') ? '4. Add a quick personal example' : ''}
+2. Keep it around 50 words
+3. React to one specific point from the post
+4. Avoid using emojis unless it's essential to your persona
+5. Use exclamation marks to show enthusiasm when appropriate
 
 Write like you're in the middle of a conversation - direct and natural.`;
     }
@@ -74,8 +93,8 @@ Write like you're in the middle of a conversation - direct and natural.`;
     },
 
     createLiveComment: async (post, campaign, account, content, parentCommentId = null) => {
-      const platformCommentId = await seleniumService.postComment(
-        'linkedin',
+      const platformCommentId = await playwrightService.postComment(
+        post.platform,
         account.id,
         post.platform_post_id,
         content,
@@ -99,11 +118,30 @@ Write like you're in the middle of a conversation - direct and natural.`;
 POST:
 ${post.content}
 
+Comment Goal: ${campaign.comment_goal || 'Engage naturally with the post content'}
+
+Writing Style Rules:
+
+1. Keep your writing style simple and concise
+2. Use clear and straightforward language
+3. Write short, impactful sentences
+4. Add frequent line breaks to separate ideas
+5. Use active voice and avoid passive construction
+6. Include thoughtful questions to engage the reader
+7. Address the reader directly with "you" and "your"
+8. Stay clear of introductory phrases like "in conclusion" and "in summary"
+9. Do not include unnecessary extras
+10. Get straight to the point - no introductory statements
+11. Aim for about 50 words and 3 sentences
+12. DO NOT use hashtags in your comment
+
 Quick guidelines:
-1. Get straight to your point - no introductions or formalities
-2. Keep it under 50 words
-3. Add a thoughtful insight to the discussion
-${traits.quirks?.includes('technical_jargon') ? '4. Use one industry term naturally' : ''}
+
+1. Get straight to your point - no greetings or introductions
+2. Keep it around 50 words
+3. React to one specific point from the post
+4. Avoid using emojis unless it's essential to your persona
+5. Use exclamation marks to show enthusiasm when appropriate
 
 Write like you're continuing an ongoing professional discussion.`;
     }
@@ -126,7 +164,7 @@ Write like you're continuing an ongoing professional discussion.`;
     },
 
     createLiveComment: async (post, campaign, account, content, parentCommentId = null) => {
-      const platformCommentId = await seleniumService.postComment(
+      const platformCommentId = await playwrightService.postComment(
         'x',
         account.id,
         post.platform_post_id,
@@ -151,11 +189,30 @@ Write like you're continuing an ongoing professional discussion.`;
 POST:
 ${post.content}
 
+Comment Goal: ${campaign.comment_goal || 'Engage naturally with the post content'}
+
+Writing Style Rules:
+
+1. Keep your writing style simple and concise
+2. Use clear and straightforward language
+3. Write short, impactful sentences
+4. Add frequent line breaks to separate ideas
+5. Use active voice and avoid passive construction
+6. Include thoughtful questions to engage the reader
+7. Address the reader directly with "you" and "your"
+8. Stay clear of introductory phrases like "in conclusion" and "in summary"
+9. Do not include unnecessary extras
+10. Get straight to the point - no introductory statements
+11. Aim for about 50 words and 3 sentences
+12. DO NOT use hashtags in your comment
+
 Quick guidelines:
+
 1. Get straight to your point - no greetings or introductions
-2. Keep it under 280 characters
-3. Add value to the conversation
-${traits.quirks?.includes('uses_emojis') ? '4. Use one relevant emoji' : ''}
+2. Keep it around 50 words
+3. React to one specific point from the post
+4. Avoid using emojis unless it's essential to your persona
+5. Use exclamation marks to show enthusiasm when appropriate
 
 Write like you're in the middle of a Twitter thread - direct and engaging.`;
     }
@@ -178,7 +235,7 @@ Write like you're in the middle of a Twitter thread - direct and engaging.`;
     },
 
     createLiveComment: async (post, campaign, account, content, parentCommentId = null) => {
-      const platformCommentId = await seleniumService.postComment(
+      const platformCommentId = await playwrightService.postComment(
         'tiktok',
         account.id,
         post.platform_post_id,
@@ -203,12 +260,30 @@ Write like you're in the middle of a Twitter thread - direct and engaging.`;
 VIDEO CAPTION:
 ${post.caption}
 
+Comment Goal: ${campaign.comment_goal || 'Engage naturally with the post content'}
+
+Writing Style Rules:
+
+1. Keep your writing style simple and concise
+2. Use clear and straightforward language
+3. Write short, impactful sentences
+4. Add frequent line breaks to separate ideas
+5. Use active voice and avoid passive construction
+6. Include thoughtful questions to engage the reader
+7. Address the reader directly with "you" and "your"
+8. Stay clear of introductory phrases like "in conclusion" and "in summary"
+9. Do not include unnecessary extras
+10. Get straight to the point - no introductory statements
+11. Aim for about 50 words and 3 sentences
+12. DO NOT use hashtags in your comment
+
 Quick guidelines:
+
 1. Get straight to your point - no greetings or introductions
-2. Keep it under 150 characters
-3. Add value to the conversation
-${traits.quirks?.includes('uses_emojis') ? '4. Use one relevant emoji' : ''}
-${traits.quirks?.includes('casual_slang') ? '4. Use casual, trendy language' : ''}
+2. Keep it around 50 words
+3. React to one specific point from the post
+4. Avoid using emojis unless it's essential to your persona
+5. Use exclamation marks to show enthusiasm when appropriate
 
 Write like you're commenting on a TikTok - brief, engaging, and authentic.`;
     }
@@ -372,19 +447,54 @@ class CommentingService {
       // Combine network style with persona
       const finalPrompt = contentStyleService.combineWithPersona(basePrompt, persona);
 
-      const completion = await openai.createChatCompletion({
-        model: "gpt-4",
+      // Add template suggestions based on comment analysis
+      const templateSuggestions = `
+EFFECTIVE COMMENT STRUCTURES:
+Consider using one of these proven comment structures:
+1. I've noticed [OBSERVATION]. Have you considered [QUESTION]? The implications are [ASSESSMENT].
+2. This [TOPIC] reminds me of [PERSONAL EXPERIENCE]. It's interesting how [INSIGHT].
+3. What's particularly fascinating about this is [SPECIFIC POINT]. It suggests that [CONCLUSION].
+4. The evidence here [AGREES/CONTRADICTS] with [REFERENCE]. This makes me think [REFLECTION].
+5. From my perspective as [IDENTITY/ROLE], I see [OBSERVATION] differently. The key factor is [EXPLANATION].
+
+Remember to adapt these structures to your unique persona and the specific content.
+`;
+
+      // Add diversity instructions to ensure unique comments
+      const diversityInstructions = `
+IMPORTANT: Create a UNIQUE comment that is distinctly different from other comments.
+- Your comment should reflect your specific persona traits
+- Choose a unique angle or perspective on the topic
+- Express your thoughts in your own distinctive voice
+- NEVER start your comment the same way as other comments would
+- Vary your sentence structure, word choice, and overall approach
+- Each comment must have its own unique phrasing and perspective
+- Avoid using common or generic expressions that other commenters might use
+- Ensure your comment feels authentic to your specific persona
+
+COMMENT GOAL GUIDANCE:
+${campaign.comment_goal}
+
+Remember: Your comment must be UNIQUE in:
+- The specific evidence, anecdotes, or insights you provide
+- The phrasing and language you use
+- The angle or perspective you take
+- Your writing style and tone
+`;
+
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4o",
         messages: [
-          { role: "system", content: finalPrompt },
+          { role: "system", content: finalPrompt + diversityInstructions + templateSuggestions },
           { role: "user", content: platformHandlers[post.platform].buildPrompt(post, campaign, account) }
         ],
-        temperature: 1.0,
-        presence_penalty: 1.0,
-        frequency_penalty: 1.0,
-        top_p: 0.9
+        temperature: 1.2,
+        presence_penalty: 1.5,
+        frequency_penalty: 1.5,
+        top_p: 0.95
       });
 
-      const comment = completion.data?.choices?.[0]?.message?.content.trim();
+      const comment = completion.choices?.[0]?.message?.content.trim();
       if (!comment) throw new Error('Failed to generate comment');
 
       return comment;
@@ -404,6 +514,14 @@ You tend to write ${traits.responseLength} responses and engage as a ${traits.en
 
 Your quirks: ${traits.quirks.map(quirk => quirk.replace(/_/g, ' ')).join(', ')}.
 
+IMPORTANT - Your UNIQUE PERSONALITY:
+- You are a DISTINCT individual with your own voice and perspective
+- Your writing style is unmistakably ${traits.writingStyle}
+- Your tone is consistently ${traits.tone}
+- You have a unique way of expressing yourself that nobody else has
+- You bring your specific background in ${traits.expertise.join(' and ')} to your comments
+- Your comments should NEVER sound like anyone else's
+
 When commenting:
 - Write naturally in your ${traits.writingStyle} style
 - Draw from your background when relevant, but don't explicitly state it
@@ -411,10 +529,19 @@ When commenting:
 - Maintain a ${traits.tone} tone
 - Incorporate your quirks naturally
 - Stay in character as a ${traits.engagementStyle}
+- Use vocabulary and expressions that are unique to you
+- Have your own perspective on the topic
 
-Context:
+CAMPAIGN CONTEXT:
 - Campaign goal: ${campaign.campaign_goal}
-- Your role: A genuine participant with authentic insights
+- Comment goal: ${campaign.comment_goal || 'Engage naturally with the content'}
+- Your role: A genuine participant with authentic insights aligned with the comment goal
+
+IMPORTANT - COMMENT GOAL ALIGNMENT:
+- Your comments should naturally align with the comment goal
+- Incorporate the comment goal's intent into your authentic perspective
+- Maintain your unique voice while supporting the campaign's objectives
+- Never explicitly mention the comment goal in your response
 
 Remember: You are a real person sharing authentic thoughts - let your knowledge and experience come through naturally in your writing style and examples.`;
 
@@ -423,6 +550,27 @@ Remember: You are a real person sharing authentic thoughts - let your knowledge 
       persona += '\nFeel free to use common expressions and informal language.';
     } else if (traits.writingStyle === 'formal') {
       persona += '\nMaintain professional language while sharing insights.';
+    } else if (traits.writingStyle === 'enthusiastic') {
+      persona += '\nShow genuine excitement and energy in your comments.';
+    } else if (traits.writingStyle === 'sarcastic') {
+      persona += '\nUse subtle irony and wit in your responses.';
+    } else if (traits.writingStyle === 'technical') {
+      persona += '\nIncorporate precise terminology and logical structure.';
+    } else if (traits.writingStyle === 'storyteller') {
+      persona += '\nWeave narrative elements into your comments when appropriate.';
+    }
+
+    // Add tone-specific instructions
+    if (traits.tone === 'positive') {
+      persona += '\nFocus on constructive and optimistic aspects.';
+    } else if (traits.tone === 'neutral') {
+      persona += '\nPresent balanced perspectives without strong emotional bias.';
+    } else if (traits.tone === 'skeptical') {
+      persona += '\nQuestion assumptions and ask for evidence in a thoughtful way.';
+    } else if (traits.tone === 'humorous') {
+      persona += '\nIncorporate light humor and playfulness where appropriate.';
+    } else if (traits.tone === 'professional') {
+      persona += '\nMaintain a business-like approach with credibility.';
     }
 
     // Add quirk-specific instructions
@@ -432,23 +580,93 @@ Remember: You are a real person sharing authentic thoughts - let your knowledge 
     if (traits.quirks.includes('occasional_typos')) {
       persona += '\nOccasionally make minor, realistic typos or typing mistakes.';
     }
+    if (traits.quirks.includes('technical_jargon')) {
+      persona += '\nIncorporate specialized terminology from your field of expertise.';
+    }
+    if (traits.quirks.includes('casual_slang')) {
+      persona += '\nUse contemporary casual expressions and slang terms.';
+    }
+    if (traits.quirks.includes('asks_questions')) {
+      persona += '\nInclude thoughtful questions to engage others.';
+    }
+    if (traits.quirks.includes('shares_personal_stories')) {
+      persona += '\nReference relevant personal experiences when appropriate.';
+    }
+    if (traits.quirks.includes('uses_bullet_points')) {
+      persona += '\nOrganize thoughts with occasional bullet points for clarity.';
+    }
+    if (traits.quirks.includes('likes_analogies')) {
+      persona += '\nUse creative comparisons to illustrate your points.';
+    }
 
     return persona;
   }
 
   generateDefaultPersona(campaign, account) {
-    return `You are someone engaging naturally with this content about ${campaign.campaign_goal}.
+    // Create a unique identifier for this account to ensure consistent but different personas
+    const uniqueId = account.id % 5; // Creates 5 different default persona types
+    
+    // Array of different persona types
+    const personaTypes = [
+      {
+        style: "analytical",
+        approach: "logical and evidence-based",
+        tone: "thoughtful",
+        quirk: "connecting ideas to broader concepts"
+      },
+      {
+        style: "conversational",
+        approach: "relatable and down-to-earth",
+        tone: "friendly",
+        quirk: "using everyday examples"
+      },
+      {
+        style: "passionate",
+        approach: "emotionally engaged",
+        tone: "enthusiastic",
+        quirk: "emphasizing personal impact"
+      },
+      {
+        style: "concise",
+        approach: "direct and to-the-point",
+        tone: "straightforward",
+        quirk: "cutting through complexity"
+      },
+      {
+        style: "inquisitive",
+        approach: "curious and questioning",
+        tone: "thoughtful",
+        quirk: "asking thought-provoking questions"
+      }
+    ];
+    
+    // Select a persona type based on the account's unique ID
+    const personaType = personaTypes[uniqueId];
+    
+    return `You are a ${personaType.style} commenter with a ${personaType.approach} approach to discussions.
 
-Your role: A genuine participant in this discussion who has relevant experience to share.
-Your style: Write conversationally and naturally.
+Your UNIQUE VOICE:
+- You have a distinctly ${personaType.style} communication style
+- Your tone is consistently ${personaType.tone}
+- You're known for ${personaType.quirk}
+- You never sound generic or like other commenters
+- You bring a fresh perspective to every conversation
+
+CAMPAIGN CONTEXT:
+- Campaign goal: ${campaign.campaign_goal}
+- Comment goal: ${campaign.comment_goal || 'Engage naturally with the content'}
+
 Your approach: 
-- Vary your comment style (sometimes ask questions, sometimes share experiences, sometimes offer insights)
+- Follow the comment goal while maintaining your authentic voice
+- Write in your distinctive ${personaType.style} style
 - React to specific points in the content
-- Add value to the discussion
+- Add value to the discussion with your ${personaType.approach} perspective
 - Stay authentic and avoid generic responses
-- Match the tone of the platform and community
+- Match the tone of the platform while maintaining your unique voice
+- NEVER use common phrases that others might use
+- Align your natural perspective with the comment goal's intent
 
-Remember: Each comment should feel unique and natural, as if coming from a different real person.`;
+Remember: Your comment should feel unique and natural, as if coming from a real person with a distinct personality who genuinely believes in their perspective.`;
   }
 
   async getCampaign(campaignId) {
@@ -528,10 +746,10 @@ Remember: Each comment should feel unique and natural, as if coming from a diffe
       campaign,
       { postContent: post.content }
     );
-    const account = await this.getRandomAccount('reddit');
+    const account = await this.getRandomAccount(post.platform);
 
     try {
-      const platformCommentId = await seleniumService.postComment(
+      const platformCommentId = await playwrightService.postComment(
         'reddit',
         account.id,
         post.platform_post_id,
@@ -675,7 +893,11 @@ Remember: Each comment should feel unique and natural, as if coming from a diffe
   }
 
   pickRandomMultiple(array, count) {
-    const shuffled = [...array].sort(() => 0.5 - Math.random());
+    const shuffled = [...array];
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
     return shuffled.slice(0, count);
   }
 

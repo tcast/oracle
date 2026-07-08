@@ -7,8 +7,8 @@ const crypto = require('crypto');
 class AuthService {
   constructor() {
     this.jwtSecret = process.env.JWT_SECRET || crypto.randomBytes(64).toString('hex');
-    this.jwtExpiration = '15m';  // Access token expires in 15 minutes
-    this.refreshExpiration = '7d';  // Refresh token expires in 7 days
+    this.jwtExpiration = '7d';  // Access token expires in 7 days
+    this.refreshExpiration = '30d';  // Refresh token expires in 30 days
   }
 
   async registerUser(email, password, firstName, lastName) {
@@ -138,7 +138,7 @@ class AuthService {
   async generateRefreshToken(userId) {
     const token = crypto.randomBytes(40).toString('hex');
     const expiresAt = new Date();
-    expiresAt.setDate(expiresAt.getDate() + 7); // 7 days from now
+    expiresAt.setDate(expiresAt.getDate() + 30); // 30 days from now
 
     await pool.query(
       `INSERT INTO sessions (user_id, refresh_token, expires_at)

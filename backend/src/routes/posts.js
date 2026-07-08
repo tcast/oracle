@@ -1,6 +1,9 @@
 const express = require('express');
 const router = express.Router();
+const { authMiddleware } = require('../middleware/auth');
 const postingService = require('../services/postingService');
+
+router.use(authMiddleware);
 
 // Delete a specific post and its comments
 router.delete('/campaigns/:campaignId/posts/:postId', async (req, res) => {

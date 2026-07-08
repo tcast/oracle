@@ -1,0 +1,13 @@
+{
+  "name": "polygon-to-timestream",
+  "version": "1.0.0",
+  "description": "Lambda function to fetch data from Polygon flat files and store in Timestream",
+  "main": "index.js",
+  "dependencies": {
+    "@aws-sdk/client-timestream-write": "^3.423.0",
+    "csv-parser": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+} 
