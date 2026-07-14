@@ -120,7 +120,7 @@ const ProxyAccountAssignment = () => {
 
   if (loading) {
     return <div className="flex items-center justify-center py-12">
-      <div className="animate-spin rounded-full h-8 w-8 border-2 border-oracle-400 border-t-transparent"></div>
+      <div className="animate-spin rounded-full h-8 w-8 border-2 border-whisper-400 border-t-transparent"></div>
     </div>;
   }
 
@@ -271,13 +271,13 @@ const ProxyAccountAssignment = () => {
                       key={proxy.id}
                       className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
                         assigningProxies.includes(proxy.id)
-                          ? 'border-oracle-300 bg-oracle-50/50'
+                          ? 'border-whisper-300 bg-whisper-50/50'
                           : 'border-gray-200 hover:border-gray-300'
                       }`}
                     >
                       <input
                         type="checkbox"
-                        className="mt-0.5 w-4 h-4 rounded border-gray-300 text-oracle-600 focus:ring-oracle-500"
+                        className="mt-0.5 w-4 h-4 rounded border-gray-300 text-whisper-600 focus:ring-whisper-500"
                         checked={assigningProxies.includes(proxy.id)}
                         onChange={(e) => {
                           if (e.target.checked) {

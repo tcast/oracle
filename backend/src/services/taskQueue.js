@@ -4,6 +4,7 @@ const { filter } = require('rxjs/operators');
 const pool = require('./db');
 const postingService = require('./postingService');
 const commentingService = require('./commentingService');
+const campaignScorecardService = require('./campaignScorecardService');
 
 class TaskQueue {
   constructor() {
@@ -11,27 +12,23 @@ class TaskQueue {
     this.activeIntervals = new Map();
   }
 
-  // Add getter for activeCampaigns
   get activeCampaigns() {
     return Array.from(this.activeIntervals.keys()).map(id => parseInt(id));
   }
 
   async initialize() {
-    // Handle simulation tasks
     this.taskSubject.pipe(
       filter(task => task.type === 'simulation')
     ).subscribe(async task => {
       await this.handleSimulationTask(task.campaignId);
     });
 
-    // Handle live tasks
     this.taskSubject.pipe(
       filter(task => task.type === 'live')
     ).subscribe(async task => {
       await this.handleLiveTask(task);
     });
 
-    // Restore active campaigns on server start
     await this.restoreActiveCampaigns();
   }
 
@@ -66,18 +63,29 @@ class TaskQueue {
     }
 
     try {
-      // Update database state
-      await pool.query(
-        'UPDATE campaigns SET is_running = true, simulation_mode = $1 WHERE id = $2',
-        [!isLive, campaignId]
-      );
+      if (isLive) {
+        await pool.query(
+          'UPDATE campaigns SET is_running = true, simulation_mode = false, is_live = true WHERE id = $1',
+          [campaignId]
+        );
+      } else {
+        await pool.query(
+          'UPDATE campaigns SET is_running = true, simulation_mode = true WHERE id = $1',
+          [campaignId]
+        );
+        try {
+          await campaignScorecardService.startSimRun(campaignId);
+        } catch (err) {
+          console.warn('Failed to start sim run scorecard:', err.message);
+        }
+      }
 
       const taskType = isLive ? 'live' : 'simulation';
       
-      // Start initial task
+      // Immediate first tick
       this.addTask(campaignId, taskType);
 
-      // Set up recurring checks with jitter (20-40% random variance)
+      // Single recurring scheduler (no double-schedule from handlers)
       const baseInterval = isLive ? 5 * 60 * 1000 : 30 * 1000;
       console.log(`Setting up ${taskType} mode with base interval: ${baseInterval}ms`);
 
@@ -106,17 +114,25 @@ class TaskQueue {
 
   async stopCampaign(campaignId) {
     try {
-      // Update database state first so if this fails we know
+      const prior = await this.getCampaignStatus(campaignId).catch(() => null);
+
       await pool.query(
         'UPDATE campaigns SET is_running = false WHERE id = $1',
         [campaignId]
       );
 
-      // Then clear timeouts/intervals
       const timerId = this.activeIntervals.get(campaignId);
       if (timerId) {
         clearTimeout(timerId);
         this.activeIntervals.delete(campaignId);
+      }
+
+      if (prior?.simulationMode !== false) {
+        try {
+          await campaignScorecardService.finalizeSimRun(campaignId);
+        } catch (err) {
+          console.warn('Failed to finalize sim scorecard:', err.message);
+        }
       }
 
       console.log(`Campaign ${campaignId} stopped successfully`);
@@ -129,7 +145,7 @@ class TaskQueue {
   async getCampaignStatus(campaignId) {
     try {
       const result = await pool.query(
-        'SELECT is_running, simulation_mode FROM campaigns WHERE id = $1',
+        'SELECT is_running, simulation_mode, is_live FROM campaigns WHERE id = $1',
         [campaignId]
       );
       
@@ -140,6 +156,7 @@ class TaskQueue {
       return {
         isRunning: result.rows[0].is_running,
         simulationMode: result.rows[0].simulation_mode,
+        isLive: result.rows[0].is_live,
         hasActiveInterval: this.activeIntervals.has(campaignId)
       };
     } catch (error) {
@@ -150,48 +167,50 @@ class TaskQueue {
 
   async handleSimulationTask(campaignId) {
     try {
-      let shouldContinue = true;
+      const { rows } = await pool.query(
+        'SELECT whisper_enabled, overt_enabled FROM campaigns WHERE id = $1',
+        [campaignId]
+      );
+      const camp = rows[0] || {};
+      const whisperOn = camp.whisper_enabled !== false;
+      const overtOn = !!camp.overt_enabled;
 
-      // Try to create a post
-      try {
-        const post = await postingService.createSimulatedPost(campaignId);
-        if (!post) {
-          // Post limit reached - continue silently
+      if (whisperOn) {
+        try {
+          await postingService.createSimulatedPost(campaignId);
+        } catch (error) {
+          if (
+            !error.message.includes('post limit') &&
+            !error.message.includes('posts limit') &&
+            !error.message.includes('No available')
+          ) {
+            console.error('Error creating simulated post:', error);
+          } else {
+            console.log(`Simulation post skipped: ${error.message}`);
+          }
         }
-      } catch (error) {
-        // Check if this is a post limit message (expected behavior)
-        if (!error.message.includes('post limit') && !error.message.includes('posts limit')) {
-          console.error('Error creating simulated post:', error);
-          throw error; // Only throw if it's not a post limit error
+
+        try {
+          await commentingService.createSimulatedComments(campaignId);
+        } catch (error) {
+          if (error.message.includes('comment limit') || error.message.includes('No real')) {
+            console.log(`Simulation comments skipped: ${error.message}`);
+          } else {
+            console.error('Error creating comments:', error);
+          }
         }
       }
 
-      // Always try to generate comments, even if post creation failed
-      try {
-        await commentingService.createSimulatedComments(campaignId);
-      } catch (error) {
-        if (error.message.includes('comment limit')) {
-          // Comment limit reached - continue silently
-        } else {
-          console.error('Error creating comments:', error);
-          throw error; // Only throw if it's not a comment limit error
+      if (overtOn) {
+        try {
+          const overtPostingService = require('./overtPostingService');
+          await overtPostingService.createAndMaybePublish(campaignId, { live: false });
+        } catch (err) {
+          console.log(`Overt sim draft skipped: ${err.message}`);
         }
-      }
-
-      // Check if we should continue (only if campaign is still marked as running)
-      const status = await this.getCampaignStatus(campaignId);
-      shouldContinue = status.isRunning;
-
-      if (shouldContinue) {
-        // Schedule next task with random delay
-        const delay = Math.floor(Math.random() * 2000) + 1000; // 1-3 seconds
-        setTimeout(() => this.addTask(campaignId, 'simulation'), delay);
       }
     } catch (error) {
       console.error('Critical error in simulation task:', error);
-      // Don't stop on error unless it's critical
-      const delay = Math.floor(Math.random() * 5000) + 5000; // 5-10 seconds
-      setTimeout(() => this.addTask(campaignId, 'simulation'), delay);
     }
   }
 
@@ -201,26 +220,47 @@ class TaskQueue {
       if (!campaign.rows[0]) {
         throw new Error('Campaign not found');
       }
+      const camp = campaign.rows[0];
+      const whisperOn = camp.whisper_enabled !== false;
+      const overtOn = !!camp.overt_enabled;
 
-      // Create a post
-      try {
-        await postingService.createPost(task.campaignId, true);
-      } catch (postError) {
-        if (postError.message.includes('post limit') || postError.message.includes('Minimum post interval')) {
-          console.log(`Live post skipped for campaign ${task.campaignId}: ${postError.message}`);
-        } else {
-          console.error(`Error creating live post: ${postError.message}`);
+      if (whisperOn) {
+        try {
+          await postingService.createPost(task.campaignId, true);
+        } catch (postError) {
+          if (
+            postError.message.includes('post limit') ||
+            postError.message.includes('Minimum post interval') ||
+            postError.message.includes('No real') ||
+            postError.message.includes('No available')
+          ) {
+            console.log(`Live post skipped for campaign ${task.campaignId}: ${postError.message}`);
+          } else {
+            console.error(`Error creating live post: ${postError.message}`);
+          }
+        }
+
+        try {
+          await commentingService.createComments(task.campaignId, true);
+        } catch (commentError) {
+          if (
+            commentError.message.includes('comment limit') ||
+            commentError.message.includes('Minimum reply interval') ||
+            commentError.message.includes('No real')
+          ) {
+            console.log(`Live comments skipped for campaign ${task.campaignId}: ${commentError.message}`);
+          } else {
+            console.error(`Error creating live comments: ${commentError.message}`);
+          }
         }
       }
-      
-      // Generate comments
-      try {
-        await commentingService.createComments(task.campaignId, true);
-      } catch (commentError) {
-        if (commentError.message.includes('comment limit') || commentError.message.includes('Minimum reply interval')) {
-          console.log(`Live comments skipped for campaign ${task.campaignId}: ${commentError.message}`);
-        } else {
-          console.error(`Error creating live comments: ${commentError.message}`);
+
+      if (overtOn) {
+        try {
+          const overtPostingService = require('./overtPostingService');
+          await overtPostingService.createAndMaybePublish(task.campaignId, { live: true });
+        } catch (overtErr) {
+          console.error(`Overt post error for campaign ${task.campaignId}:`, overtErr.message);
         }
       }
     } catch (error) {

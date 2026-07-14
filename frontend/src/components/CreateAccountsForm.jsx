@@ -70,7 +70,7 @@ const CreateAccountsForm = ({ onClose, onSuccess }) => {
               value={formData.emailDomain}
               onChange={(e) => setFormData({ ...formData, emailDomain: e.target.value })}
               placeholder="example.com"
-              className="flex-1 min-w-0 block w-full px-3 py-2 rounded-none rounded-r-lg border-gray-200 focus:border-oracle-500 focus:ring-oracle-500 sm:text-sm"
+              className="flex-1 min-w-0 block w-full px-3 py-2 rounded-none rounded-r-lg border-gray-200 focus:border-whisper-500 focus:ring-whisper-500 sm:text-sm"
             />
           </div>
           <p className="mt-1 text-xs text-gray-500">Accounts will be created with emails like username@{formData.emailDomain || 'example.com'}</p>

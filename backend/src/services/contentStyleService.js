@@ -11,10 +11,10 @@ class ContentStyleService {
         [networkType, contentType]
       );
       
-      return result.rows[0];
+      return result.rows[0] || null;
     } catch (error) {
-      console.error('Error fetching network style:', error);
-      throw error;
+      console.warn('Network style lookup unavailable, using defaults:', error.message);
+      return null;
     }
   }
 
@@ -73,22 +73,21 @@ ${Array.isArray(format_rules) ? format_rules.map(rule => `- ${rule}`).join('\n')
 
     // Add platform-specific structure guidelines
     if (context.platform === 'reddit') {
-      const title = structure_guidelines.title || {};
-      const body = structure_guidelines.body || {};
       const subreddit = context.subreddit || {};
       const contentRules = Array.isArray(subreddit.content_rules) ? subreddit.content_rules : [];
       
       prompt += `
-- Title: Create a ${title.style || 'clear'} title${title.formats ? ` in one of these formats: ${title.formats.join(', ')}` : ''}
-- Body: 
-  * Include at least one personal perspective (using I, my, we, our)
-  * Organize content into clear paragraphs
-  * ${body.elements ? `Include all these elements: ${body.elements.join(', ')}` : 'Structure your thoughts logically'}
+Reddit-native writing (mandatory):
+- Start mid-thought — never greet the subreddit or use "Hey [group]!"
+- No marketing intros, no "excited to share", no brand voice
+- Sound like a regular member: casual, specific, sometimes skeptical
+- Mention products/sites only as something you found or tried, not a pitch
+- Short paragraphs; real questions welcome
 
-Subreddit-specific guidelines:
+Subreddit: r/${subreddit.subreddit_name || 'unknown'}
 ${contentRules.length > 0 
   ? contentRules.map(rule => `- ${rule}`).join('\n')
-  : '- Follow general Reddit etiquette and be respectful of the community'}`;
+  : '- Match the tone of discussion posts in this community'}`;
     } else if (context.platform === 'tiktok') {
       const { length = {}, formats = [], elements = [] } = structure_guidelines;
       

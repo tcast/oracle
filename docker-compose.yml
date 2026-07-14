@@ -1,11 +1,11 @@
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: oracle-db
+    container_name: whisper-db
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: password
-      POSTGRES_DB: oracle
+      POSTGRES_DB: whisper
     ports:
       - "5433:5432"
     volumes:
@@ -18,7 +18,7 @@ services:
 
   backend:
     build: ./backend
-    container_name: oracle-backend
+    container_name: whisper-backend
     ports:
       - "3021:3000"
     environment:
@@ -28,15 +28,16 @@ services:
       - DB_PORT=5432
       - DB_USER=postgres
       - DB_PASSWORD=password
-      - DB_NAME=oracle
+      - DB_NAME=whisper
       - DB_SSL=false
-      - DATABASE_URL=postgresql://postgres:password@postgres:5432/oracle
+      - DATABASE_URL=postgresql://postgres:password@postgres:5432/whisper
       - JWT_SECRET=1ac86a81f6082c1fe8394a6af49cd7ad85263d47b48d8af30db1e78b5de91d9c
       - FIVESIM_API_KEY=eyJhbGciOiJSUzUxMiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3NzIzOTg2NDksImlhdCI6MTc0MDg2MjY0OSwicmF5IjoiZDgxODJiZTU0NTc5MjMyMWRmNDhiODY3YzQ4M2RkZmEiLCJzdWIiOjMwNjQ5OTZ9.FjGc--NXbuM_RSbceN4TqvR1oJzx8UiGjb5rFbiuGlgT9FOxB_QHdS_K27xiUZOhDP12QNFOaQDNDcrlKXrTA2pE1igK8yVPssR9G1x398MVCW-VsXahKL3RpCg-kXCRKpSahO5xTe-VSElVm6dTbDc6VaCLMoGI7bjd7-9ajgM-bXqgUxu7ScELlgoDEXUxBSr5vjqRWJodl-GGaTxp1n-wl1TU1dEdYPG1KaDokv35FzAM2TZnvDxgZWoaigxAB4GFrDpXH3_jJQyblOxn29p-fj-57fimRD2_Vj-bQqdvXytDTI9X67e3A427UzegvyhAlhMT1WWBzmYfwRVgDA
       - TWOCAPTCHA_API_KEY=acde364c7433b278656840ece205f91a
       - CAPSOLVER_API_KEY=CAP-B642BF591035A4C8A60DD06C5E89E8636EF5E64315ABEE6171545854C808D5C7
     volumes:
       - ./backend/uploads:/app/uploads
+      - ./.env:/app/.env
     restart: unless-stopped
     depends_on:
       postgres:
@@ -50,7 +51,7 @@ services:
 
   frontend:
     build: ./frontend
-    container_name: oracle-frontend
+    container_name: whisper-frontend
     ports:
       - "3020:3020"
     depends_on:

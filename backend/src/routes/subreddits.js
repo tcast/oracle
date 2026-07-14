@@ -36,22 +36,70 @@ router.post('/:id/generate', async (req, res) => {
         campaignId,
         campaign.rows[0].campaign_goal
       );
-  
-      res.json(suggestions);
+
+      const all = await subredditService.getSubredditsForCampaign(campaignId);
+      res.json({ added: suggestions, all });
     } catch (err) {
       console.error('Error generating subreddits:', err);
       res.status(500).json({ error: err.message });
     }
   });
 
+router.post('/:id/refine', async (req, res) => {
+  try {
+    const campaignId = req.params.id;
+    const { seedSubreddits, hint } = req.body;
+
+    const campaign = await pool.query('SELECT id FROM campaigns WHERE id = $1', [campaignId]);
+    if (campaign.rows.length === 0) {
+      return res.status(404).json({ error: 'Campaign not found' });
+    }
+
+    let seeds = seedSubreddits;
+    if (!seeds?.length) {
+      const approved = await subredditService.getApprovedSubreddits(campaignId);
+      seeds = approved.map(s => s.subreddit_name);
+    }
+
+    const newSuggestions = await subredditService.refineSubreddits(campaignId, {
+      seedSubreddits: seeds,
+      hint: hint || '',
+    });
+
+    const all = await subredditService.getSubredditsForCampaign(campaignId);
+    res.json({ added: newSuggestions, all });
+  } catch (err) {
+    console.error('Error refining subreddits:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/:id/add', async (req, res) => {
+  try {
+    const campaignId = req.params.id;
+    const { subreddit_name, reason } = req.body;
+
+    const campaign = await pool.query('SELECT id FROM campaigns WHERE id = $1', [campaignId]);
+    if (campaign.rows.length === 0) {
+      return res.status(404).json({ error: 'Campaign not found' });
+    }
+
+    const suggestion = await subredditService.addManualSubreddit(campaignId, subreddit_name, reason);
+    res.status(201).json(suggestion);
+  } catch (err) {
+    console.error('Error adding subreddit:', err);
+    res.status(400).json({ error: err.message });
+  }
+});
+
 router.patch('/subreddit-suggestions/:id', async (req, res) => {
     try {
       const { id } = req.params;
       const { status } = req.body;
   
-      if (!status || !['approved', 'rejected'].includes(status)) {
+      if (!status || !['approved', 'rejected', 'pending'].includes(status)) {
         return res.status(400).json({ 
-          error: 'Invalid status. Must be either "approved" or "rejected"' 
+          error: 'Invalid status. Must be "approved", "rejected", or "pending"'
         });
       }
   

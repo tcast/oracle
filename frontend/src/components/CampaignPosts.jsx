@@ -1,205 +1,194 @@
 import React, { useState, useEffect } from 'react';
 import api from '../utils/api';
 
-const INITIAL_COMMENTS_TO_SHOW = 3;
+const PostRow = ({ post, onUpdateStatus, onDelete, expanded, onToggleExpand }) => {
+  const isDraft = post.status === 'draft';
+  const isApproved = post.status === 'approved';
 
-const Comment = ({ comment, depth = 0 }) => {
-  const [showReplies, setShowReplies] = useState(depth < 2);
   return (
-    <div className={`ml-${Math.min(depth, 5) * 4} my-2`}>
-      <div className="bg-gray-50 p-3 rounded-xl border border-gray-100">
-        <p className="text-sm text-gray-900">{comment.content}</p>
-        <div className="mt-1.5 text-xs text-gray-400 flex items-center flex-wrap gap-x-2">
-          <span className="font-medium text-gray-500">by {comment.commented_by}</span>
-          <span>•</span>
-          <span>{new Date(comment.posted_at).toLocaleString()}</span>
-          <span>•</span>
-          <span>{comment.engagement_metrics?.upvotes || 0} upvotes</span>
-        </div>
-      </div>
-      {comment.replies && comment.replies.length > 0 && (
-        <div className="ml-4 mt-1">
-          <button
-            onClick={() => setShowReplies(!showReplies)}
-            className="text-sm text-oracle-600 hover:text-oracle-700 font-medium"
-          >
-            {showReplies ? 'Hide' : 'Show'} {comment.replies.length} {comment.replies.length === 1 ? 'reply' : 'replies'}
-          </button>
-          {showReplies && (
-            <div className="mt-2 space-y-1">
-              {comment.replies.map(reply => (
-                <Comment key={reply.id} comment={reply} depth={depth + 1} />
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  );
-};
-
-const Post = ({ post, campaignId, onDelete }) => {
-  const [showAllComments, setShowAllComments] = useState(false);
-  const visibleComments = showAllComments ? post.comments : post.comments?.slice(0, INITIAL_COMMENTS_TO_SHOW);
-  const hasMoreComments = post.comments?.length > INITIAL_COMMENTS_TO_SHOW;
-
-  const renderContent = () => {
-    if (post.platform === 'tiktok') {
-      const videoUrl = post.video_url?.startsWith('http') ? post.video_url : `${window.location.origin}${post.video_url}`;
-      return (
-        <div className="space-y-2">
-          <div className="max-w-[300px] mx-auto aspect-[9/16] bg-black rounded-xl overflow-hidden">
-            <video src={videoUrl} controls preload="metadata" playsInline className="w-full h-full object-contain" poster="/tiktok-placeholder.jpg">
-              Your browser does not support the video tag.
-            </video>
+    <div className={`rounded-lg border text-sm ${
+      isApproved ? 'border-emerald-200 bg-emerald-50/50' :
+      post.status === 'rejected' ? 'border-red-100 bg-red-50/30 opacity-60' :
+      isDraft ? 'border-amber-200/80 bg-white' :
+      'border-gray-100 bg-white'
+    }`}>
+      <div className="flex items-start gap-2 p-2.5">
+        <button type="button" onClick={onToggleExpand} className="flex-1 min-w-0 text-left">
+          <div className="flex items-center gap-1.5 mb-1">
+            {post.subreddit && (
+              <span className="text-[10px] font-semibold text-whisper-700 bg-whisper-100 px-1.5 py-0.5 rounded">r/{post.subreddit}</span>
+            )}
+            {isApproved && <span className="text-[10px] text-emerald-700 font-medium">✓ approved</span>}
+            {isDraft && <span className="text-[10px] text-amber-700 font-medium">draft</span>}
           </div>
-          <p className="text-gray-900">{post.caption}</p>
-        </div>
-      );
-    }
-    return <p className="text-gray-900">{post.content}</p>;
-  };
-
-  return (
-    <div className="border border-gray-100 rounded-xl p-5 mb-4 bg-white shadow-sm hover:shadow-md transition-shadow">
-      <div className="flex justify-between items-start gap-4">
-        <div className="flex-1 min-w-0">{renderContent()}</div>
-        <button
-          onClick={() => onDelete(post.id)}
-          className="flex-shrink-0 px-3 py-1.5 text-xs font-medium text-red-600 hover:text-white hover:bg-red-600 rounded-lg border border-red-200 hover:border-red-600 transition-all"
-        >
-          Delete
+          <p className={`text-xs text-gray-700 leading-relaxed ${expanded ? 'whitespace-pre-wrap' : 'line-clamp-2'}`}>
+            {post.content}
+          </p>
         </button>
-      </div>
-      <div className="mt-3 text-xs text-gray-400 flex items-center flex-wrap gap-x-2">
-        <span className="font-medium text-gray-500">by {post.posted_by}</span>
-        <span>•</span>
-        <span>{new Date(post.posted_at).toLocaleString()}</span>
-        <span>•</span>
-        {post.platform === 'tiktok' ? (
-          <>
-            <span>{post.engagement_metrics?.likes || 0} likes</span>
-            <span>•</span>
-            <span>{post.engagement_metrics?.shares || 0} shares</span>
-          </>
-        ) : (
-          <span>{post.engagement_metrics?.upvotes || 0} upvotes</span>
-        )}
-        <span>•</span>
-        <span>{post.comments?.length || 0} comments</span>
-      </div>
-      {post.comments && post.comments.length > 0 && (
-        <div className="mt-4 pt-4 border-t border-gray-100 space-y-2">
-          {visibleComments.map(comment => (
-            <Comment key={comment.id} comment={comment} />
-          ))}
-          {!showAllComments && hasMoreComments && (
-            <button
-              onClick={() => setShowAllComments(true)}
-              className="text-sm text-oracle-600 hover:text-oracle-700 font-medium"
-            >
-              View {post.comments.length - INITIAL_COMMENTS_TO_SHOW} more comments
-            </button>
+        <div className="flex flex-col gap-1 flex-shrink-0">
+          {isDraft && (
+            <>
+              <button onClick={() => onUpdateStatus(post.id, 'approved')} className="p-1.5 rounded-md bg-emerald-500 text-white hover:bg-emerald-600" title="Approve">
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>
+              </button>
+              <button onClick={() => onUpdateStatus(post.id, 'rejected')} className="p-1.5 rounded-md border border-red-200 text-red-500 hover:bg-red-50" title="Reject">
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}><path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+              </button>
+              <button onClick={() => onDelete(post.id)} className="p-1.5 rounded-md text-gray-400 hover:text-red-600 hover:bg-red-50" title="Delete">
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+              </button>
+            </>
+          )}
+          {isApproved && (
+            <button onClick={() => onUpdateStatus(post.id, 'draft')} className="text-[10px] text-emerald-700 px-1">Undo</button>
           )}
         </div>
-      )}
+      </div>
     </div>
   );
 };
 
-const CampaignPosts = ({ campaignId }) => {
+const CampaignPosts = ({ campaignId, embedded = false, onCountsChange }) => {
+  const [posts, setPosts] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [generating, setGenerating] = useState(false);
   const [error, setError] = useState(null);
-  const [posts, setPosts] = useState({});
-  const [deleteError, setDeleteError] = useState(null);
-  const [expandedPlatform, setExpandedPlatform] = useState(null);
-  const [selectedPlatforms, setSelectedPlatforms] = useState([]);
+  const [generateCount, setGenerateCount] = useState(3);
+  const [expandedId, setExpandedId] = useState(null);
+  const [showRejected, setShowRejected] = useState(false);
+
+  const approved = posts.filter(p => p.status === 'approved');
+  const drafts = posts.filter(p => p.status === 'draft');
+  const rejected = posts.filter(p => p.status === 'rejected');
 
   useEffect(() => {
     fetchPosts();
-    const interval = setInterval(fetchPosts, 5000);
+    const interval = setInterval(fetchPosts, embedded ? 12000 : 10000);
     return () => clearInterval(interval);
-  }, [campaignId]);
+  }, [campaignId, embedded]);
 
   const fetchPosts = async () => {
     try {
-      const { data: campaignData } = await api.get(`/api/campaigns/${campaignId}`);
-      setSelectedPlatforms(campaignData.platform || []);
-      const { data } = await api.get(`/api/campaigns/${campaignId}/posts`);
-      setPosts(data);
+      const { data } = await api.get(`/api/campaigns/${campaignId}/posts/list`);
+      setPosts(Array.isArray(data) ? data : []);
       setLoading(false);
+      onCountsChange?.();
     } catch (err) {
-      console.error('Error fetching posts:', err);
       setError(err.response?.data?.error || err.message);
       setLoading(false);
     }
   };
 
+  const generatePosts = async () => {
+    try {
+      setGenerating(true);
+      setError(null);
+      const { data } = await api.post(
+        `/api/campaigns/${campaignId}/posts/generate`,
+        { count: generateCount },
+        { timeout: 300000 }
+      );
+      if (data.all) setPosts(data.all);
+      else await fetchPosts();
+      onCountsChange?.();
+    } catch (err) {
+      setError(err.response?.data?.error || err.message);
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  const updatePostStatus = async (postId, status) => {
+    try {
+      setError(null);
+      const { data } = await api.patch(`/api/campaigns/${campaignId}/posts/${postId}/status`, { status });
+      setPosts(prev => prev.map(p => p.id === postId ? { ...p, ...data } : p));
+      onCountsChange?.();
+    } catch (err) {
+      setError(err.response?.data?.error || err.message);
+    }
+  };
+
   const handleDeletePost = async (postId) => {
     try {
-      setDeleteError(null);
       await api.delete(`/api/campaigns/${campaignId}/posts/${postId}`);
-      await fetchPosts();
+      setPosts(prev => prev.filter(p => p.id !== postId));
+      onCountsChange?.();
     } catch (err) {
-      console.error('Error deleting post:', err);
-      setDeleteError(err.response?.data?.error || err.message);
+      setError(err.response?.data?.error || err.message);
     }
   };
 
   if (loading) {
-    return <div className="flex justify-center items-center py-8"><div className="animate-spin rounded-full h-8 w-8 border-2 border-oracle-400 border-t-transparent"></div></div>;
-  }
-
-  if (error || deleteError) {
-    return <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-xl text-sm">{error || deleteError}</div>;
+    return <div className="flex justify-center py-8"><div className="animate-spin rounded-full h-6 w-6 border-2 border-whisper-400 border-t-transparent" /></div>;
   }
 
   return (
-    <div className="space-y-4">
-      <h3 className="section-header">Campaign Posts</h3>
-      {selectedPlatforms.map((platform) => {
-        const platformData = posts[platform] || (platform === 'reddit' ? {} : []);
-        const postCount = platform === 'reddit' ? Object.values(platformData).flat().length : platformData.length;
-        const isExpanded = expandedPlatform === platform;
+    <div className={embedded ? 'space-y-3' : 'space-y-6'}>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h3 className={`font-semibold text-gray-900 ${embedded ? 'text-sm' : 'section-header mb-0'}`}>
+          Posts {approved.length > 0 && <span className="text-emerald-600 font-normal">({approved.length} approved)</span>}
+        </h3>
+        <div className="flex items-center gap-1.5">
+          <select value={generateCount} onChange={(e) => setGenerateCount(parseInt(e.target.value))} className="input-field text-xs w-14 py-1.5">
+            {[1, 2, 3, 5].map(n => <option key={n} value={n}>{n}</option>)}
+          </select>
+          <button onClick={generatePosts} disabled={generating} className="btn-primary text-xs px-2.5 py-1.5 whitespace-nowrap">
+            {generating ? '…' : 'Generate drafts'}
+          </button>
+        </div>
+      </div>
 
-        return (
-          <div key={platform} className="rounded-xl border border-gray-100 overflow-hidden">
-            <button
-              onClick={() => setExpandedPlatform(isExpanded ? null : platform)}
-              className="w-full px-5 py-3.5 flex justify-between items-center bg-gray-50/80 hover:bg-gray-100 transition-colors"
-            >
-              <h4 className="text-sm font-semibold text-gray-900 capitalize">{platform} Posts</h4>
-              <div className="flex items-center space-x-2">
-                <span className="text-xs text-gray-500">{postCount} posts</span>
-                <svg className={`w-4 h-4 text-gray-400 transition-transform ${isExpanded ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
-                </svg>
-              </div>
-            </button>
-            {isExpanded && postCount > 0 && (
-              <div className="p-5 bg-white">
-                {platform === 'reddit' ? (
-                  Object.entries(platformData).map(([subreddit, subredditPosts]) => (
-                    <div key={subreddit} className="mb-6 last:mb-0">
-                      <h5 className="text-sm font-semibold text-gray-700 mb-3">r/{subreddit || (subredditPosts[0]?.metadata?.subreddit || 'unknown')}</h5>
-                      {subredditPosts.map(post => (
-                        <Post key={post.id} post={post} campaignId={campaignId} onDelete={handleDeletePost} />
-                      ))}
-                    </div>
-                  ))
-                ) : (
-                  platformData.map(post => (
-                    <Post key={post.id} post={post} campaignId={campaignId} onDelete={handleDeletePost} />
-                  ))
-                )}
-              </div>
-            )}
-            {isExpanded && postCount === 0 && (
-              <div className="p-5 text-center text-sm text-gray-400">No posts yet</div>
-            )}
-          </div>
-        );
-      })}
+      {error && <p className="text-xs text-red-600 bg-red-50 px-2 py-1.5 rounded-lg">{error}</p>}
+
+      {approved.length > 0 && (
+        <div className="space-y-1">
+          <p className="text-[10px] font-semibold text-emerald-700 uppercase tracking-wide">Approved</p>
+          {approved.map(post => (
+            <PostRow
+              key={post.id}
+              post={post}
+              onUpdateStatus={updatePostStatus}
+              onDelete={handleDeletePost}
+              expanded={expandedId === post.id}
+              onToggleExpand={() => setExpandedId(expandedId === post.id ? null : post.id)}
+            />
+          ))}
+        </div>
+      )}
+
+      <div className="space-y-1">
+        <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide">
+          Drafts {drafts.length > 0 && `(${drafts.length})`}
+        </p>
+        {drafts.length === 0 ? (
+          <p className="text-xs text-gray-400 py-4 text-center">
+            {posts.length === 0 ? 'Generate drafts for your approved subreddits' : 'No pending drafts'}
+          </p>
+        ) : (
+          drafts.map(post => (
+            <PostRow
+              key={post.id}
+              post={post}
+              onUpdateStatus={updatePostStatus}
+              onDelete={handleDeletePost}
+              expanded={expandedId === post.id}
+              onToggleExpand={() => setExpandedId(expandedId === post.id ? null : post.id)}
+            />
+          ))
+        )}
+      </div>
+
+      {rejected.length > 0 && (
+        <>
+          <button onClick={() => setShowRejected(v => !v)} className="text-xs text-gray-400 hover:text-gray-600">
+            {showRejected ? '▼' : '▶'} Rejected ({rejected.length})
+          </button>
+          {showRejected && rejected.map(post => (
+            <PostRow key={post.id} post={post} onUpdateStatus={updatePostStatus} onDelete={handleDeletePost} expanded={false} onToggleExpand={() => {}} />
+          ))}
+        </>
+      )}
     </div>
   );
 };

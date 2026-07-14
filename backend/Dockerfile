@@ -8,6 +8,7 @@ RUN apk add --no-cache \
     freetype-dev \
     harfbuzz \
     ca-certificates \
+    curl \
     ttf-freefont \
     nodejs \
     yarn

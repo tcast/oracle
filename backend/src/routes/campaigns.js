@@ -13,7 +13,17 @@ router.use(authMiddleware);
  */
 router.get('/', async (req, res) => {
   try {
-    const campaigns = await pool.query('SELECT * FROM campaigns WHERE user_id = $1', [req.user.id]);
+    const brandService = require('../services/brandService');
+    await brandService.ensureUserBrandMemberships(req.user.id);
+    const brandIds = await brandService.getBrandIdsForUser(req.user.id);
+    const campaigns = await pool.query(
+      `SELECT c.*, b.name AS brand_name, b.slug AS brand_slug
+       FROM campaigns c
+       LEFT JOIN brands b ON b.id = c.brand_id
+       WHERE c.brand_id = ANY($1::int[]) OR c.user_id = $2
+       ORDER BY c.created_at DESC`,
+      [brandIds, req.user.id]
+    );
     res.json(campaigns.rows);
   } catch (error) {
     console.error('Error fetching campaigns:', error);
@@ -120,12 +130,27 @@ router.post('/:id/generate-subreddits', async (req, res) => {
  */
 router.post('/', async (req, res) => {
   try {
-    const { name, description, target_audience, goals, campaign_goal, campaign_overview, post_goal, comment_goal, target_sentiment, platform, target_url, media_assets, is_live, posts_per_subreddit } = req.body;
+    const {
+      name, description, target_audience, goals, campaign_goal, campaign_overview,
+      post_goal, comment_goal, target_sentiment, platform, target_url, media_assets,
+      is_live, posts_per_subreddit, brand_id, whisper_enabled, overt_enabled, ads_enabled, overt_platforms,
+    } = req.body;
+
+    if (!brand_id) {
+      return res.status(400).json({ error: 'brand_id is required' });
+    }
     
     const newCampaign = await pool.query(
-      `INSERT INTO campaigns (name, description, target_audience, goals, campaign_goal, campaign_overview, post_goal, comment_goal, target_sentiment, platform, target_url, media_assets, is_live, user_id, posts_per_subreddit)
-       VALUES ($1, $2, $3, $4, $5, $6, $7::integer, $8::integer, $9::numeric, $10, $11, $12, $13, $14, $15) RETURNING *`,
-      [name, description, target_audience, goals, campaign_goal, campaign_overview, parseInt(post_goal) || 5, parseInt(comment_goal) || 3, target_sentiment === 'positive' ? 0.7 : target_sentiment === 'negative' ? 0.3 : 0.5, platform, target_url, JSON.stringify(media_assets || []), is_live || false, req.user.id, posts_per_subreddit || 3]
+      `INSERT INTO campaigns (name, description, target_audience, goals, campaign_goal, campaign_overview, post_goal, comment_goal, target_sentiment, platform, target_url, media_assets, is_live, user_id, posts_per_subreddit, brand_id, whisper_enabled, overt_enabled, ads_enabled, overt_platforms)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::integer, $8::integer, $9::numeric, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20::text[]) RETURNING *`,
+      [
+        name, description, target_audience, goals, campaign_goal, campaign_overview,
+        parseInt(post_goal) || 5, parseInt(comment_goal) || 3,
+        target_sentiment === 'positive' ? 0.7 : target_sentiment === 'negative' ? 0.3 : 0.5,
+        platform, target_url, JSON.stringify(media_assets || []), is_live || false, req.user.id,
+        posts_per_subreddit || 3, brand_id, whisper_enabled !== false, !!overt_enabled, !!ads_enabled,
+        overt_platforms || [],
+      ]
     );
     
     res.status(201).json(newCampaign.rows[0]);

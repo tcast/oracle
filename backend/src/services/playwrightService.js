@@ -266,7 +266,7 @@ class PlaywrightService {
     }
   }
 
-  async createBrowserForAccount(accountId, maxRetries = 2) {
+  async createBrowserForAccount(accountId, maxRetries = 2, { requireProxy = false } = {}) {
     let lastError;
     let attempt = 0;
 
@@ -275,6 +275,9 @@ class PlaywrightService {
         const proxyConfig = await proxyService.getNextProxyForAccount(accountId);
 
         if (!proxyConfig) {
+          if (requireProxy || process.env.REQUIRE_PROXY_FOR_LIVE === 'true') {
+            throw new Error(`No proxy assigned to account ${accountId} (required for live)`);
+          }
           console.log(`No proxy assigned to account ${accountId}, using direct connection`);
         } else {
           console.log(`Using proxy for account ${accountId} (attempt ${attempt + 1}):`, proxyConfig.server);
@@ -296,6 +299,10 @@ class PlaywrightService {
           await this.humanLikeDelay(1000, 2000);
         }
       }
+    }
+
+    if (requireProxy || process.env.REQUIRE_PROXY_FOR_LIVE === 'true') {
+      throw lastError || new Error(`No proxy available for account ${accountId}`);
     }
 
     console.log(`All proxy attempts failed for account ${accountId}, trying direct connection`);
@@ -378,7 +385,9 @@ class PlaywrightService {
         case 'reddit':
           await page.goto('https://www.reddit.com/', { waitUntil: 'domcontentloaded', timeout: 15000 });
           await this.humanLikeDelay(500, 1000);
-          const redditUser = await page.$('[aria-label="User menu"]');
+          const redditUser = await page.$(
+            '[aria-label="User menu"], [aria-label="Expand user menu"], #USER_DROPDOWN_ID, button:has-text("Create")'
+          );
           return !!redditUser;
         case 'x':
           await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 15000 });
@@ -434,55 +443,70 @@ class PlaywrightService {
 
   async redditLogin(page, username, password) {
     try {
-      await page.goto('https://www.reddit.com/login', { waitUntil: 'domcontentloaded' });
-      await this.humanLikeDelay(1500, 3000);
-      await this.simulateHumanBehavior(page);
-
-      // Wait for JS challenge to resolve (if any) — wait until the username input appears
-      try {
-        await page.waitForSelector('input[name="username"]', { timeout: 45000 });
-      } catch (_) {
-        // Challenge may have partially resolved; proceed anyway
+      // Retry once if Reddit JS challenge blocks the form
+      let usernameInput = null;
+      for (let attempt = 0; attempt < 2 && !usernameInput; attempt++) {
+        await page.goto('https://www.reddit.com/login/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await this.humanLikeDelay(2500, 4500);
+        await this.simulateHumanBehavior(page);
+        usernameInput = await page.waitForSelector(
+          'input[name="username"], #loginUsername, input[autocomplete="username"]',
+          { timeout: 45000, state: 'visible' }
+        ).catch(() => null);
+        if (!usernameInput) {
+          console.warn(`Reddit login form missing (attempt ${attempt + 1}), retrying… url=${page.url()}`);
+          await page.screenshot({ path: `/tmp/reddit-challenge-${attempt}.png`, fullPage: true }).catch(() => {});
+        }
       }
-
-      const usernameInput = await page.$('input[name="username"]');
       if (!usernameInput) throw new Error('Username input not found after challenge');
-      const box = await usernameInput.boundingBox();
-      if (box) {
-        await this.simulateMouseMovement(page, 0, 0, box.x + box.width / 2, box.y + box.height / 2);
-      }
 
-      await this.humanLikeTyping(page, 'input[name="username"]', username);
+      await usernameInput.click({ force: true });
+      await usernameInput.fill('');
+      await usernameInput.type(username, { delay: 35 });
       await this.humanLikeDelay(400, 1000);
 
-      const passwordInput = await page.waitForSelector('input[name="password"]', { timeout: 5000 });
-      const pBox = await passwordInput.boundingBox();
-      if (pBox) {
-        await this.simulateMouseMovement(page, box.x + box.width / 2, box.y + box.height / 2, pBox.x + pBox.width / 2, pBox.y + pBox.height / 2);
+      const passwordInput = await page.waitForSelector(
+        'input[name="password"], #loginPassword, input[type="password"]',
+        { timeout: 10000, state: 'visible' }
+      );
+      await passwordInput.click({ force: true });
+      await passwordInput.fill('');
+      await passwordInput.type(password, { delay: 35 });
+      await this.humanLikeDelay(400, 900);
+
+      // Prefer the branded Log In button once enabled
+      let submitBtn = await page.$('button.login:not([disabled])');
+      if (!submitBtn) {
+        submitBtn = await page.$('button:has-text("Log In"):not([disabled]), button:has-text("Log in"):not([disabled])');
       }
-
-      await this.humanLikeTyping(page, 'input[name="password"]', password);
-      await this.humanLikeDelay(300, 800);
-
-      let submitBtn = await page.$('button[type="submit"]');
-      if (!submitBtn) submitBtn = await page.$('button:has-text("Log In")');
-      if (!submitBtn) submitBtn = await page.$('button.login');
-      if (!submitBtn) submitBtn = await page.$('fieldset button, form button');
+      if (!submitBtn) submitBtn = await page.$('button[type="submit"]:not([disabled])');
       if (submitBtn) {
-        await submitBtn.click();
+        await submitBtn.click({ force: true });
       } else {
         await page.keyboard.press('Enter');
       }
-      await this.humanLikeDelay(3000, 5000);
+      await this.humanLikeDelay(5000, 8000);
 
-      const isError = await page.$('.AnimatedForm__errorMessage, .Autho__errorMessage');
-      if (isError) {
-        console.error('Reddit login failed - error message detected');
-        return false;
+      const loggedIn = await page.$(
+        '[aria-label="User menu"], [aria-label="Expand user menu"], #USER_DROPDOWN_ID, button:has-text("Create"), faceplate-tracker[source="user_dropdown"]'
+      );
+      if (loggedIn) return true;
+
+      const url = page.url();
+      const stillOnLogin = url.includes('/login');
+      if (!stillOnLogin) {
+        const loginFields = await page.$('input[name="username"], input[name="password"]');
+        if (!loginFields) return true;
       }
 
-      const loggedIn = await page.$('[aria-label="User menu"]');
-      return !!loggedIn;
+      const errText = await page.evaluate(() => {
+        const el = document.querySelector('.AnimatedForm__errorMessage, [slot="error"], faceplate-banner');
+        return el ? el.textContent?.trim() : '';
+      }).catch(() => '');
+      if (errText) console.error('Reddit login error message:', errText);
+      await page.screenshot({ path: `/tmp/reddit-login-failed-${username}.png`, fullPage: true }).catch(() => {});
+      console.log(`Reddit login failed for ${username}. final_url=${url}`);
+      return false;
     } catch (error) {
       console.error('Reddit login error:', error);
       return false;
@@ -494,8 +518,13 @@ class PlaywrightService {
     let operationSuccess = false;
 
     try {
+      if (!title || !String(title).trim()) {
+        throw new Error('Reddit post title is required');
+      }
       const account = await this.getAccount(accountId);
-      const result = await this.createBrowserForAccount(accountId);
+      const requireProxy = process.env.REQUIRE_PROXY_FOR_LIVE === 'true';
+      if (requireProxy) await this.requireProxyForLive(accountId);
+      const result = await this.createBrowserForAccount(accountId, 2, { requireProxy });
       browser = result.browser;
       context = result.context;
       page = result.page;
@@ -588,69 +617,199 @@ class PlaywrightService {
       if (submitBtn) {
         await submitBtn.click();
         await this.humanLikeDelay(2000, 4000);
-        return true;
+        const url = page.url();
+        const commentId = url.includes('/comment/')
+          ? url.split('/comment/')[1]?.split('/')[0]
+          : `rc_${Date.now()}`;
+        return commentId || `rc_${Date.now()}`;
       }
-      return false;
+      return null;
     } catch (error) {
       console.error('Error posting Reddit comment:', error);
-      return false;
+      return null;
     }
   }
 
   async xLogin(page, username, password) {
     try {
-      await page.goto('https://x.com/login', { waitUntil: 'domcontentloaded' });
-      await this.humanLikeDelay(2000, 4000);
+      // Landing page hosts the current username → Continue → password form
+      await page.goto('https://x.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await this.humanLikeDelay(2500, 4500);
+
+      for (const label of ['Accept all', 'Accept', 'Agree', 'Allow all']) {
+        const btn = await page.$(`button:has-text("${label}"), div[role="button"]:has-text("${label}")`).catch(() => null);
+        if (btn) {
+          await btn.click().catch(() => {});
+          await this.humanLikeDelay(500, 1200);
+          break;
+        }
+      }
+
       await this.simulateHumanBehavior(page);
 
-      const userInput = await page.waitForSelector('input[autocomplete="username"], input[name="text"]', { timeout: 15000 });
+      const userSelector = [
+        'input[name="username_or_email"]',
+        'input[autocomplete="username"]',
+        'input[name="text"]',
+      ].join(', ');
+
+      const userInput = await page.waitForSelector(userSelector, { timeout: 30000, state: 'visible' });
       if (!userInput) throw new Error('X username input not found');
 
-      const uBox = await userInput.boundingBox();
-      if (uBox) {
-        await this.simulateMouseMovement(page, 0, 0, uBox.x + uBox.width / 2, uBox.y + uBox.height / 2);
-      }
+      await userInput.click({ force: true });
+      await userInput.fill('');
+      await userInput.type(username, { delay: 40 });
+      await this.humanLikeDelay(800, 1500);
 
-      await this.humanLikeTyping(page, 'input[autocomplete="username"], input[name="text"]', username);
-      await this.humanLikeDelay(800, 2000);
-
-      const nextBtn = await page.$('button:has-text("Next"), button:has-text("Sign in"), div[role="button"]:has-text("Next")');
-      if (nextBtn) {
-        await nextBtn.click();
-        await this.humanLikeDelay(2000, 4000);
-      }
-
-      const passwordInput = await page.waitForSelector('input[type="password"], input[name="password"]', { timeout: 10000 }).catch(() => null);
-      if (!passwordInput) {
-        console.log('X login - unexpected step after username, may need email verification');
-        const pageUrl = page.url();
-        if (pageUrl.includes('login') || pageUrl.includes('flow')) {
-          await page.screenshot({ path: '/tmp/x-login-challenge.png' }).catch(() => {});
+      // Exact "Continue" only — never "Continue with phone/Google/Apple"
+      const continueClicked = await page.evaluate(() => {
+        const buttons = [...document.querySelectorAll('button, [role="button"]')];
+        const exact = buttons.find((b) => (b.innerText || '').trim() === 'Continue');
+        if (exact) {
+          exact.click();
+          return true;
         }
+        return false;
+      });
+      if (!continueClicked) await page.keyboard.press('Enter');
+      await this.humanLikeDelay(2500, 4500);
+
+      let passwordInput = await page.waitForSelector(
+        'input[name="password"], input[type="password"]',
+        { timeout: 15000 }
+      ).catch(() => null);
+
+      if (!passwordInput || !(await passwordInput.isVisible().catch(() => false))) {
+        const challengeInput = await page.$('input[data-testid="ocfEnterTextTextInput"], input[name="text"]');
+        if (challengeInput && await challengeInput.isVisible().catch(() => false)) {
+          console.log(`X login challenge for ${username} — re-entering username`);
+          await challengeInput.click({ force: true }).catch(() => {});
+          await challengeInput.fill('');
+          await challengeInput.type(username, { delay: 40 });
+          await this.humanLikeDelay(600, 1200);
+          await page.evaluate(() => {
+            const buttons = [...document.querySelectorAll('button, [role="button"]')];
+            const next = buttons.find((b) => ['Next', 'Continue'].includes((b.innerText || '').trim()));
+            if (next) next.click();
+          });
+          await this.humanLikeDelay(2000, 4000);
+          passwordInput = await page.waitForSelector('input[name="password"], input[type="password"]', {
+            timeout: 10000,
+          }).catch(() => null);
+        }
+      }
+
+      if (!passwordInput) {
+        console.log('X login - unexpected step after username');
+        await page.screenshot({ path: `/tmp/x-login-challenge-${username}.png`, fullPage: true }).catch(() => {});
+        console.log(`challenge_url=${page.url()}`);
         return false;
       }
 
-      const pBox = await passwordInput.boundingBox();
-      if (pBox) {
-        await this.simulateMouseMovement(page, 0, 0, pBox.x + pBox.width / 2, pBox.y + pBox.height / 2);
-      }
-
-      await this.humanLikeTyping(page, 'input[type="password"], input[name="password"]', password);
+      await passwordInput.focus().catch(() => {});
+      await passwordInput.click({ force: true }).catch(() => {});
+      await passwordInput.fill('');
+      await passwordInput.type(password, { delay: 40 });
       await this.humanLikeDelay(500, 1500);
 
-      const loginBtn = await page.$('button:has-text("Log in"), div[role="button"]:has-text("Log in")');
-      if (loginBtn) {
-        await loginBtn.click();
-      } else {
-        await page.keyboard.press('Enter');
-      }
-      await this.humanLikeDelay(3000, 6000);
+      const loginClicked = await page.evaluate(() => {
+        const buttons = [...document.querySelectorAll('button, [role="button"]')];
+        for (const label of ['Log in', 'Sign in', 'Continue']) {
+          const match = buttons.find((b) => (b.innerText || '').trim() === label);
+          if (match) {
+            match.click();
+            return label;
+          }
+        }
+        const submit = document.querySelector('button[type="submit"]');
+        if (submit) {
+          submit.click();
+          return 'submit';
+        }
+        return null;
+      });
+      if (!loginClicked) await page.keyboard.press('Enter');
+      await this.humanLikeDelay(5000, 8000);
 
-      const loggedIn = await page.$('[data-testid="SideNav_AccountSwitcher_Button"]');
-      return !!loggedIn;
+      const loggedIn = await page.$('[data-testid="SideNav_AccountSwitcher_Button"], [data-testid="AppTabBar_Home_Link"], a[href="/home"]');
+      if (loggedIn) return true;
+
+      const url = page.url();
+      if (
+        url.includes('/home') ||
+        url.includes('/notifications') ||
+        (url.includes('x.com') && !url.includes('login') && !url.includes('flow') && !url.includes('onboarding') && !url.includes('signup'))
+      ) {
+        return true;
+      }
+
+      await page.screenshot({ path: `/tmp/x-login-failed-${username}.png`, fullPage: true }).catch(() => {});
+      console.log(`X login failed for ${username}. final_url=${url}`);
+      return false;
     } catch (error) {
       console.error('X login error:', error);
+      await page.screenshot({ path: `/tmp/x-login-error-${username}.png`, fullPage: true }).catch(() => {});
       return false;
+    }
+  }
+
+  /** Test login for one account; persists session on success. */
+  async testAccountLogin(accountId) {
+    let browser;
+    try {
+      const account = await this.getAccount(accountId);
+      const password = account.credentials?.password;
+      if (!password || password === 'default_password') {
+        throw new Error('Account has no real password');
+      }
+
+      const result = await this.createBrowserForAccount(accountId, 2, { requireProxy: false });
+      browser = result.browser;
+      const page = result.page;
+
+      const loggedIn = await this.ensureLoggedIn(
+        page,
+        account.platform,
+        accountId,
+        account.username,
+        password
+      );
+
+      if (loggedIn) {
+        await this.persistSession(page, account.platform, accountId);
+        await pool.query(
+          `UPDATE social_accounts
+           SET warmup_status = 'warmed', warmed_up_at = NOW(), updated_at = NOW(), last_used_at = NOW()
+           WHERE id = $1`,
+          [accountId]
+        );
+      } else {
+        await pool.query(
+          `UPDATE social_accounts SET warmup_status = 'failed', updated_at = NOW() WHERE id = $1`,
+          [accountId]
+        ).catch(() => {});
+      }
+
+      return {
+        success: !!loggedIn,
+        accountId,
+        username: account.username,
+        platform: account.platform,
+        warmup_status: loggedIn ? 'warmed' : 'failed',
+      };
+    } catch (error) {
+      await pool.query(
+        `UPDATE social_accounts SET warmup_status = 'failed', updated_at = NOW() WHERE id = $1`,
+        [accountId]
+      ).catch(() => {});
+      return {
+        success: false,
+        accountId,
+        error: error.message,
+      };
+    } finally {
+      if (browser) await browser.close();
+      this._untrackBrowser(accountId);
     }
   }
 
@@ -917,13 +1076,17 @@ class PlaywrightService {
     throw new Error('TikTok automation not implemented - use their business API instead');
   }
 
-  async postComment(platform, accountId, postUrl, comment, parentCommentId = null) {
+  async postComment(platform, accountId, postUrl, comment, parentCommentId = null, { requireProxy = false } = {}) {
     let browser, context, page, proxyId;
     let operationSuccess = false;
 
     try {
+      if (!postUrl || !String(postUrl).startsWith('http')) {
+        throw new Error(`postComment requires a full URL, got: ${postUrl}`);
+      }
+
       const account = await this.getAccount(accountId);
-      const result = await this.createBrowserForAccount(accountId);
+      const result = await this.createBrowserForAccount(accountId, 2, { requireProxy });
       browser = result.browser;
       context = result.context;
       page = result.page;
@@ -932,23 +1095,28 @@ class PlaywrightService {
       const loggedIn = await this.ensureLoggedIn(page, platform, accountId, account.username, account.credentials.password);
       if (!loggedIn) throw new Error('Login failed');
 
+      let platformCommentId = null;
       switch (platform) {
         case 'reddit':
-          await this.redditPostComment(page, postUrl, comment, parentCommentId);
+          platformCommentId = await this.redditPostComment(page, postUrl, comment, parentCommentId);
           break;
         case 'x':
-          await this.xPostComment(page, postUrl, comment, parentCommentId);
+          platformCommentId = await this.xPostComment(page, postUrl, comment, parentCommentId);
           break;
         case 'linkedin':
-          await this.linkedinPostComment(page, postUrl, comment, parentCommentId);
+          platformCommentId = await this.linkedInPostComment(page, postUrl, comment, parentCommentId);
           break;
         default:
-          throw new Error(`Platform ${platform} not supported`);
+          throw new Error(`Platform ${platform} not supported for comments`);
+      }
+
+      if (!platformCommentId) {
+        throw new Error('Comment submit failed — no platform comment id');
       }
 
       await this.persistSession(page, platform, accountId);
       operationSuccess = true;
-      return true;
+      return platformCommentId;
     } catch (error) {
       console.error('Error in postComment:', error);
       throw error;
@@ -962,15 +1130,95 @@ class PlaywrightService {
     }
   }
 
+  /** Lightweight warm-up: browse home + a subreddit without posting. */
+  async warmUpAccount(accountId, platform = 'reddit') {
+    let browser;
+    try {
+      const account = await this.getAccount(accountId);
+      const result = await this.createBrowserForAccount(accountId);
+      browser = result.browser;
+      const page = result.page;
+
+      const loggedIn = await this.ensureLoggedIn(
+        page, platform, accountId, account.username, account.credentials.password
+      );
+      if (!loggedIn) throw new Error('Warm-up login failed');
+
+      if (platform === 'reddit') {
+        await page.goto('https://www.reddit.com/', { waitUntil: 'domcontentloaded' });
+        await this.humanLikeDelay(2000, 4000);
+        await this.simulateHumanBehavior(page);
+        await page.goto('https://www.reddit.com/r/popular/', { waitUntil: 'domcontentloaded' });
+        await this.humanLikeDelay(2000, 5000);
+        await this.simulateHumanBehavior(page);
+      }
+
+      await this.persistSession(page, platform, accountId);
+      await pool.query(
+        `UPDATE social_accounts
+         SET warmup_status = 'warmed', warmed_up_at = NOW(), updated_at = NOW()
+         WHERE id = $1`,
+        [accountId]
+      );
+      return { success: true, accountId, warmup_status: 'warmed' };
+    } catch (error) {
+      await pool.query(
+        `UPDATE social_accounts SET warmup_status = 'failed', updated_at = NOW() WHERE id = $1`,
+        [accountId]
+      ).catch(() => {});
+      throw error;
+    } finally {
+      if (browser) await browser.close();
+      this._untrackBrowser(accountId);
+    }
+  }
+
   async getAccount(accountId) {
     const result = await pool.query(
-      'SELECT username, credentials FROM social_accounts WHERE id = $1',
+      'SELECT id, username, credentials, platform, status, is_simulated FROM social_accounts WHERE id = $1',
       [accountId]
     );
     if (result.rows.length === 0) {
       throw new Error('Account not found');
     }
     return result.rows[0];
+  }
+
+  /**
+   * List real (non-fake) accounts for a platform that have credentials.
+   * Does not open browsers — used as a preflight for live mode.
+   */
+  async verifyAccounts(platform) {
+    const result = await pool.query(
+      `SELECT id, username, platform, status,
+              EXISTS (
+                SELECT 1 FROM social_account_proxies sap
+                WHERE sap.social_account_id = social_accounts.id AND sap.is_active = true
+              ) AS has_proxy
+       FROM social_accounts
+       WHERE platform = $1
+         AND status = 'active'
+         AND COALESCE(is_simulated, false) = false
+         AND credentials IS NOT NULL
+         AND COALESCE(credentials->>'password', '') != ''
+         AND COALESCE(credentials->>'password', '') != 'default_password'`,
+      [platform]
+    );
+    return result.rows;
+  }
+
+  async requireProxyForLive(accountId) {
+    if (process.env.REQUIRE_PROXY_FOR_LIVE === 'false') return true;
+    const result = await pool.query(
+      `SELECT 1 FROM social_account_proxies
+       WHERE social_account_id = $1 AND is_active = true
+       LIMIT 1`,
+      [accountId]
+    );
+    if (!result.rows.length) {
+      throw new Error(`Account ${accountId} has no active proxy — required for live posting`);
+    }
+    return true;
   }
 
   async cleanup() {

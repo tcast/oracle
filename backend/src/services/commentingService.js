@@ -4,31 +4,75 @@ const openai = require('./openai');
 const playwrightService = require('./playwrightService');
 const postingService = require('./postingService');
 const contentStyleService = require('./contentStyleService');
+const campaignAccountService = require('./campaignAccountService');
+const audiencePersonaService = require('./audiencePersonaService');
+const { buildRedditPostUrl } = require('./redditStyleGuide');
+const {
+  scoreCommentSentiment,
+  pickCommenterArchetype,
+  simulateCommentReception,
+} = require('./simReactionService');
+const { generationCompletionOptions } = require('../config/openaiModels');
+const simLearningsService = require('./simLearningsService');
+const campaignScorecardService = require('./campaignScorecardService');
+
+async function buildSimulatedCommentPayload(post, campaign, account, content) {
+  const postReception = post.engagement_metrics?.reception || null;
+  let persona = null;
+  try {
+    if (post.subreddit && campaign?.id) {
+      persona = await audiencePersonaService.getForSubreddit(campaign.id, post.subreddit);
+    }
+  } catch { /* ignore */ }
+
+  const audienceReaction = simulateCommentReception(content, postReception, persona);
+  const sentiment_score = scoreCommentSentiment(content, audienceReaction.reception);
+  const likesBase = audienceReaction.reception === 'supportive' ? 18
+    : audienceReaction.reception === 'curious' ? 10
+      : audienceReaction.reception === 'skeptical' ? 3
+        : audienceReaction.reception === 'hostile' ? 1 : 2;
+
+  return {
+    post_id: post.id,
+    social_account_id: account.id,
+    content,
+    status: 'simulated',
+    sentiment_score,
+    engagement_metrics: {
+      likes: Math.max(0, Math.floor(likesBase + Math.random() * 8)),
+      replies: Math.floor(Math.random() * 2),
+      reception: audienceReaction.reception,
+      fit: audienceReaction.fit,
+      ai_likeness: audienceReaction.ai_likeness,
+      spam_score: audienceReaction.spam_score,
+      post_reception: postReception,
+      reasons: audienceReaction.reasons,
+      sim: true,
+    },
+  };
+}
 
 // Platform-specific comment handlers
 const platformHandlers = {
   reddit: {
     createSimulatedComment: async (post, campaign, account, content) => {
-      return {
-        post_id: post.id,
-        social_account_id: account.id,
-        content,
-        status: 'simulated',
-        sentiment_score: Math.random() * 2 - 1,
-        engagement_metrics: {
-          likes: Math.floor(Math.random() * 50),
-          replies: Math.floor(Math.random() * 5)
-        }
-      };
+      return buildSimulatedCommentPayload(post, campaign, account, content);
     },
 
     createLiveComment: async (post, campaign, account, content, parentCommentId = null) => {
+      const postUrl = buildRedditPostUrl(post) || post.target_url;
+      if (!postUrl) {
+        throw new Error(`Cannot comment on post ${post.id} — missing Reddit URL / platform_post_id`);
+      }
+
+      await playwrightService.requireProxyForLive(account.id);
       const platformCommentId = await playwrightService.postComment(
         'reddit',
         account.id,
-        post.platform_post_id,
+        postUrl,
         content,
-        parentCommentId
+        parentCommentId,
+        { requireProxy: true }
       );
 
       return {
@@ -79,17 +123,7 @@ Write like you're in the middle of a conversation - direct and natural.`;
 
   linkedin: {
     createSimulatedComment: async (post, campaign, account, content) => {
-      return {
-        post_id: post.id,
-        social_account_id: account.id,
-        content,
-        status: 'simulated',
-        sentiment_score: Math.random() * 2 - 1,
-        engagement_metrics: {
-          likes: Math.floor(Math.random() * 30),
-          replies: Math.floor(Math.random() * 3)
-        }
-      };
+      return buildSimulatedCommentPayload(post, campaign, account, content);
     },
 
     createLiveComment: async (post, campaign, account, content, parentCommentId = null) => {
@@ -149,18 +183,7 @@ Write like you're continuing an ongoing professional discussion.`;
 
   x: {
     createSimulatedComment: async (post, campaign, account, content) => {
-      return {
-        post_id: post.id,
-        social_account_id: account.id,
-        content,
-        status: 'simulated',
-        sentiment_score: Math.random() * 2 - 1,
-        engagement_metrics: {
-          likes: Math.floor(Math.random() * 100),
-          retweets: Math.floor(Math.random() * 20),
-          replies: Math.floor(Math.random() * 10)
-        }
-      };
+      return buildSimulatedCommentPayload(post, campaign, account, content);
     },
 
     createLiveComment: async (post, campaign, account, content, parentCommentId = null) => {
@@ -220,18 +243,7 @@ Write like you're in the middle of a Twitter thread - direct and engaging.`;
 
   tiktok: {
     createSimulatedComment: async (post, campaign, account, content) => {
-      return {
-        post_id: post.id,
-        social_account_id: account.id,
-        content,
-        status: 'simulated',
-        sentiment_score: Math.random() * 2 - 1,
-        engagement_metrics: {
-          likes: Math.floor(Math.random() * 1000),
-          replies: Math.floor(Math.random() * 50),
-          shares: Math.floor(Math.random() * 100)
-        }
-      };
+      return buildSimulatedCommentPayload(post, campaign, account, content);
     },
 
     createLiveComment: async (post, campaign, account, content, parentCommentId = null) => {
@@ -297,15 +309,22 @@ class CommentingService {
 
   async createComments(campaignId, isLive = false) {
     try {
-      const posts = await this.getRecentPosts(campaignId);
-      if (!posts.length) {
-        console.log(`No recent posts found for campaign ${campaignId}`);
-        return;
-      }
-
       const campaign = await this.getCampaign(campaignId);
       if (!campaign) {
         console.log(`Campaign not found: ${campaignId}`);
+        return;
+      }
+
+      // External thread engagement (comment on third-party Reddit URLs)
+      try {
+        await this.engageExternalTarget(campaignId, isLive);
+      } catch (extErr) {
+        console.warn('External engagement skipped:', extErr.message);
+      }
+
+      const posts = await this.getRecentPosts(campaignId);
+      if (!posts.length) {
+        console.log(`No recent posts found for campaign ${campaignId}`);
         return;
       }
 
@@ -395,14 +414,27 @@ class CommentingService {
       if (!handler) throw new Error(`Unsupported platform: ${post.platform}`);
 
       // Get a random account that hasn't commented on this post yet
-      const account = await this.getRandomAccount(post.platform, excludeAccountIds);
+      const account = await this.getRandomAccount(
+        post.platform,
+        excludeAccountIds,
+        campaign.id,
+        { allowSimulated: !isLive }
+      );
       if (!account) throw new Error(`No available ${post.platform} accounts found for commenting`);
 
-      const content = await this.generateComment(post, campaign, account);
+      const content = await this.generateComment(post, campaign, account, { isLive });
 
       const commentData = await (isLive ?
         handler.createLiveComment(post, campaign, account, content, parentCommentId) :
         handler.createSimulatedComment(post, campaign, account, content));
+
+      let engagementMetrics = { ...(commentData.engagement_metrics || {}) };
+      if (!isLive) {
+        try {
+          const activeRun = await campaignScorecardService.getActiveRun(campaign.id);
+          if (activeRun?.id) engagementMetrics.sim_run_id = activeRun.id;
+        } catch { /* ignore */ }
+      }
 
       const result = await pool.query(
         `INSERT INTO comments 
@@ -418,7 +450,7 @@ class CommentingService {
           commentData.content,
           commentData.status,
           commentData.sentiment_score,
-          commentData.engagement_metrics
+          JSON.stringify(engagementMetrics)
         ]
       );
 
@@ -429,8 +461,34 @@ class CommentingService {
     }
   }
 
-  async generateComment(post, campaign, account) {
+  async generateComment(post, campaign, account, { isLive = false } = {}) {
     try {
+      // Audience persona + commenter archetype for this community
+      let audienceBlock = '';
+      let archetype = { name: 'skeptic', tone: 'doubtful' };
+      try {
+        let audience = null;
+        if (post.subreddit) {
+          audience = await audiencePersonaService.getForSubreddit(campaign.id, post.subreddit);
+        }
+        if (!audience) {
+          audience = await audiencePersonaService.getPersona(campaign.id, 'platform', post.platform || 'reddit');
+        }
+        if (audience) {
+          audienceBlock = audiencePersonaService.formatForPrompt(audience);
+          archetype = pickCommenterArchetype(audience);
+          // Bias archetype from post reception
+          const reception = post.engagement_metrics?.reception;
+          if (reception === 'hostile' && Math.random() < 0.5) {
+            archetype = { name: 'hostile', tone: 'calls out promo' };
+          } else if (reception === 'supportive' && Math.random() < 0.4) {
+            archetype = { name: 'supportive', tone: 'shares similar experience' };
+          }
+        }
+      } catch (err) {
+        console.warn('Comment audience persona skipped:', err.message);
+      }
+
       // Get network-specific style guidelines
       const networkStyle = await contentStyleService.getNetworkStyle(post.platform, 'comment');
       
@@ -445,7 +503,12 @@ class CommentingService {
       const persona = this.generatePersona(campaign, account);
       
       // Combine network style with persona
-      const finalPrompt = contentStyleService.combineWithPersona(basePrompt, persona);
+      const finalPrompt = contentStyleService.combineWithPersona(basePrompt, persona)
+        + `\n\nYou are commenting as archetype "${archetype.name}" (${archetype.tone}).`
+        + (audienceBlock ? `\n${audienceBlock}` : '')
+        + (post.platform === 'reddit'
+          ? '\nReddit commenters are often cynical. Do not sound like a brand. Short and natural.'
+          : '');
 
       // Add template suggestions based on comment analysis
       const templateSuggestions = `
@@ -482,17 +545,18 @@ Remember: Your comment must be UNIQUE in:
 - Your writing style and tone
 `;
 
-      const completion = await openai.chat.completions.create({
-        model: "gpt-4o",
-        messages: [
-          { role: "system", content: finalPrompt + diversityInstructions + templateSuggestions },
-          { role: "user", content: platformHandlers[post.platform].buildPrompt(post, campaign, account) }
-        ],
-        temperature: 1.2,
-        presence_penalty: 1.5,
-        frequency_penalty: 1.5,
-        top_p: 0.95
+      const learningsBlock = simLearningsService.formatForPrompt(campaign.active_learnings, {
+        emphasizeComments: true,
       });
+
+      const completion = await openai.chat.completions.create(
+        generationCompletionOptions({
+          messages: [
+            { role: "system", content: finalPrompt + diversityInstructions + templateSuggestions + learningsBlock },
+            { role: "user", content: platformHandlers[post.platform].buildPrompt(post, campaign, account) }
+          ],
+        })
+      );
 
       const comment = completion.choices?.[0]?.message?.content.trim();
       if (!comment) throw new Error('Failed to generate comment');
@@ -678,13 +742,14 @@ Remember: Your comment should feel unique and natural, as if coming from a real 
   }
 
   async getRecentPosts(campaignId) {
+    // Prefer posted_at — approved drafts keep an old created_at when published in sim
     const result = await pool.query(
       `SELECT * FROM posts 
        WHERE campaign_id = $1 
        AND status IN ('simulated', 'posted')
-       AND created_at >= NOW() - INTERVAL '1 hour'
-       ORDER BY created_at DESC 
-       LIMIT 5`,
+       AND COALESCE(posted_at, created_at) >= NOW() - INTERVAL '24 hours'
+       ORDER BY COALESCE(posted_at, created_at) DESC
+       LIMIT 10`,
       [campaignId]
     );
     return result.rows;
@@ -741,36 +806,57 @@ Remember: Your comment should feel unique and natural, as if coming from a real 
     if (!campaign) return;
 
     const post = await this.getPost(postId);
-    const content = await this.generateContent(
-      'comment',
-      campaign,
-      { postContent: post.content }
+    if (!post) throw new Error('Post not found');
+    return this.createComment(post, campaign, true, [], parentCommentId);
+  }
+
+  async engageExternalTarget(campaignId, isLive = false) {
+    const target = await campaignAccountService.getPendingEngagementTarget(campaignId);
+    if (!target) return null;
+
+    const campaign = await this.getCampaign(campaignId);
+    const account = await this.getRandomAccount(
+      target.platform || 'reddit',
+      [],
+      campaignId,
+      { allowSimulated: !isLive }
     );
-    const account = await this.getRandomAccount(post.platform);
+    if (!account) throw new Error('No accounts available for external engagement');
 
-    try {
+    const fakePost = {
+      id: null,
+      platform: target.platform || 'reddit',
+      content: `External thread: ${target.target_url}`,
+      platform_post_id: null,
+      target_url: target.target_url,
+      subreddit: (target.target_url.match(/reddit\.com\/r\/([^/]+)/) || [])[1],
+    };
+
+    const content = await this.generateComment(fakePost, campaign, account);
+
+    if (isLive) {
+      await playwrightService.requireProxyForLive(account.id);
       const platformCommentId = await playwrightService.postComment(
-        'reddit',
+        fakePost.platform,
         account.id,
-        post.platform_post_id,
+        target.target_url,
         content,
-        parentCommentId
+        null,
+        { requireProxy: true }
       );
-
-      const comment = await pool.query(
-        `INSERT INTO comments 
-         (post_id, social_account_id, parent_comment_id, platform_comment_id,
-          content, status, posted_at)
-         VALUES ($1, $2, $3, $4, $5, 'posted', NOW())
-         RETURNING *`,
-        [postId, account.id, parentCommentId, platformCommentId, content]
-      );
-
-      return comment.rows[0];
-    } catch (error) {
-      console.error('Error creating live comment:', error);
-      throw error;
+      await campaignAccountService.updateEngagementTarget(campaignId, target.id, {
+        status: 'engaged',
+        notes: `Commented as ${account.username} (${platformCommentId})`,
+      });
+      return { target, platformCommentId, content };
     }
+
+    // Simulation: mark engaged without Playwright
+    await campaignAccountService.updateEngagementTarget(campaignId, target.id, {
+      status: 'engaged',
+      notes: `Simulated comment as ${account.username}: ${content.slice(0, 120)}`,
+    });
+    return { target, content, simulated: true };
   }
 
   async getPost(postId) {
@@ -781,55 +867,10 @@ Remember: Your comment should feel unique and natural, as if coming from a real 
     return result.rows[0];
   }
 
-  async getRandomAccount(platform, excludeIds = []) {
-    try {
-      const query = `
-        SELECT * FROM social_accounts 
-        WHERE platform = $1 
-        AND status = 'active'
-        ${excludeIds.length > 0 ? 'AND id != ANY($2)' : ''}
-        ORDER BY RANDOM()
-        LIMIT 1`;
-      
-      const params = excludeIds.length > 0 ? [platform, excludeIds] : [platform];
-      const result = await pool.query(query, params);
-      
-      if (!result.rows[0]) {
-        // If no accounts are available, create a new one with persona traits
-        const persona = await this.generatePersonalityTraits();
-        const username = `user_${Math.floor(Math.random() * 10000)}`;
-        const newAccount = await pool.query(
-          `INSERT INTO social_accounts 
-           (platform, username, credentials, status, persona_traits)
-           VALUES ($1, $2, $3, 'active', $4)
-           RETURNING *`,
-          [
-            platform,
-            username,
-            JSON.stringify({ password: 'default_password' }),
-            JSON.stringify(persona)
-          ]
-        );
-        return newAccount.rows[0];
-      }
-
-      // If account exists but has no persona, generate one
-      if (!result.rows[0].persona_traits) {
-        const persona = await this.generatePersonalityTraits();
-        await pool.query(
-          `UPDATE social_accounts 
-           SET persona_traits = $1
-           WHERE id = $2`,
-          [JSON.stringify(persona), result.rows[0].id]
-        );
-        result.rows[0].persona_traits = persona;
-      }
-
-      return result.rows[0];
-    } catch (error) {
-      console.error('Error getting random account:', error);
-      throw error;
-    }
+  async getRandomAccount(platform, excludeIds = [], campaignId = null, { allowSimulated = false } = {}) {
+    // Lazy require avoids circular init issues with postingService
+    const posting = require('./postingService');
+    return posting.getRandomAccount(platform, excludeIds, campaignId, { allowSimulated });
   }
 
   async generatePersonalityTraits() {

@@ -166,7 +166,7 @@ const CampaignForm = ({ onClose, onSuccess }) => {
               </span>
               <input
                 type="text"
-                className="flex-1 min-w-0 block w-full px-3 py-2 rounded-none rounded-r-lg border-gray-200 focus:border-oracle-500 focus:ring-oracle-500 sm:text-sm"
+                className="flex-1 min-w-0 block w-full px-3 py-2 rounded-none rounded-r-lg border-gray-200 focus:border-whisper-500 focus:ring-whisper-500 sm:text-sm"
                 placeholder="example.com/your-link"
                 value={campaign.target_url}
                 onChange={(e) => setCampaign({...campaign, target_url: e.target.value})}
@@ -250,7 +250,7 @@ const CampaignForm = ({ onClose, onSuccess }) => {
           <input
             type="checkbox"
             id="is_live"
-            className="h-4 w-4 text-oracle-600 focus:ring-oracle-500 border-gray-300 rounded"
+            className="h-4 w-4 text-whisper-600 focus:ring-whisper-500 border-gray-300 rounded"
             checked={campaign.is_live}
             onChange={(e) => setCampaign({...campaign, is_live: e.target.checked})}
           />

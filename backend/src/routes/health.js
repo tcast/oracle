@@ -18,6 +18,16 @@ router.get('/status', async (req, res) => {
     
     // Get uptime in hours
     const uptime = process.uptime() / 3600; // Convert seconds to hours
+
+    const oauthConfigured = {
+      linkedin: !!(process.env.LINKEDIN_CLIENT_ID && process.env.LINKEDIN_CLIENT_SECRET),
+      x: !!process.env.X_CLIENT_ID,
+      meta: !!(process.env.META_APP_ID && process.env.META_APP_SECRET),
+      google_ads: !!(
+        (process.env.GOOGLE_ADS_CLIENT_ID || process.env.GOOGLE_CLIENT_ID) &&
+        process.env.GOOGLE_ADS_DEVELOPER_TOKEN
+      ),
+    };
     
     // Return health information
     return res.json({
@@ -28,7 +38,8 @@ router.get('/status', async (req, res) => {
       services: {
         api: 'online',
         database: dbStatus
-      }
+      },
+      oauth: oauthConfigured,
     });
   } catch (error) {
     console.error('Health check error:', error);

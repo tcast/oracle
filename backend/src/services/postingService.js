@@ -3,6 +3,14 @@ const openai = require('./openai');
 const playwrightService = require('./playwrightService');
 const commentingService = require('./commentingService');
 const contentStyleService = require('./contentStyleService');
+const subredditService = require('./subredditService');
+const { getRedditSystemPrompt, buildRedditUserPrompt, sanitizeRedditPost, splitRedditTitleBody } = require('./redditStyleGuide');
+const campaignAccountService = require('./campaignAccountService');
+const audiencePersonaService = require('./audiencePersonaService');
+const { simulateReception } = require('./simReactionService');
+const campaignScorecardService = require('./campaignScorecardService');
+const { generationCompletionOptions } = require('../config/openaiModels');
+const simLearningsService = require('./simLearningsService');
 
 class PostingService {
   constructor() {
@@ -33,11 +41,19 @@ class PostingService {
           const subreddit = context.subreddit;
           if (!subreddit) throw new Error('Subreddit required for Reddit posts');
 
+          await playwrightService.requireProxyForLive(account.id);
+          const { title, body } = splitRedditTitleBody(content);
           const platformPostId = await playwrightService.createRedditPost(
             account.id,
             subreddit.subreddit_name,
-            content
+            title,
+            body,
+            true
           );
+
+          if (!platformPostId) {
+            throw new Error('Reddit live post failed — no platform post id returned');
+          }
 
           return {
             campaign_id: campaign.id,
@@ -45,43 +61,18 @@ class PostingService {
             platform: 'reddit',
             platform_post_id: platformPostId,
             subreddit: subreddit.subreddit_name,
-            content,
+            content: body,
             status: 'posted',
-            metadata: { subreddit_rules: subreddit.content_rules }
+            metadata: {
+              subreddit_rules: subreddit.content_rules,
+              title,
+              platform_post_url: `https://www.reddit.com/r/${subreddit.subreddit_name}/comments/${platformPostId}/`,
+            }
           };
         },
 
         buildPrompt: (type, campaign, context, account) => {
-          const traits = account.persona_traits || {};
-          let prompt = `Create a ${traits.tone || 'engaging'} Reddit post that aligns with this campaign:
-
-Campaign Overview: ${campaign.campaign_overview}
-Campaign Goal: ${campaign.campaign_goal}
-Post Goal: ${campaign.post_goal}
-
-Target Subreddit: r/${context.subreddit.subreddit_name}
-${context.subreddit.content_rules ? `\nSubreddit Rules:\n${context.subreddit.content_rules.join('\n')}` : ''}
-
-Writing Guidelines:
-1. Keep your writing style simple and concise
-2. Use clear and straightforward language
-3. Write short, impactful sentences
-4. Add frequent line breaks to separate ideas
-5. Use active voice and avoid passive construction
-6. Propose thought-provoking questions to engage the reader
-7. Address the reader directly with "you" and "your"
-8. Stay clear of introductory phrases like "in conclusion" and "in summary"
-9. Do not include unnecessary extras
-10. Write in a ${traits.tone || 'natural'} style
-11. Keep the content focused on the campaign's message
-12. Adapt the tone to match the campaign's goals
-13. Share relevant experiences naturally
-14. End with a thought-provoking point or call to action
-${traits.quirks?.includes('shares_personal_stories') ? '15. Include a relevant personal story or anecdote' : ''}
-
-Remember: Stay authentic while delivering the campaign's message effectively.`;
-
-          return prompt;
+          return buildRedditUserPrompt(campaign, context, account);
         },
 
         getPostContext: async (campaignId) => {
@@ -426,10 +417,73 @@ Content Requirements:
     });
   }
 
+  async claimApprovedDraft(campaignId, platform = null) {
+    const params = [campaignId];
+    let platformClause = '';
+    if (platform) {
+      params.push(platform);
+      platformClause = 'AND platform = $2';
+    }
+    const draft = await pool.query(
+      `SELECT * FROM posts
+       WHERE campaign_id = $1 AND status = 'approved' ${platformClause}
+       ORDER BY posted_at ASC
+       LIMIT 1`,
+      params
+    );
+    if (!draft.rows[0]) return null;
+
+    const updated = await pool.query(
+      `UPDATE posts SET status = 'publishing'
+       WHERE id = $1 AND status = 'approved'
+       RETURNING *`,
+      [draft.rows[0].id]
+    );
+    return updated.rows[0] || null;
+  }
+
   async createSimulatedPost(campaignId) {
     try {
       const campaign = await this.getCampaign(campaignId);
       if (!campaign) throw new Error('Campaign not found');
+
+      // Prefer publishing an approved draft
+      const approvedDraft = await this.claimApprovedDraft(campaignId);
+      if (approvedDraft) {
+        const account = approvedDraft.social_account_id
+          ? await this.getAccountById(approvedDraft.social_account_id)
+          : await this.getRandomAccount(approvedDraft.platform || 'reddit', [], campaignId, { allowSimulated: true });
+
+        const activeRun = await campaignScorecardService.getActiveRun(campaignId);
+        const reception = await simulateReception(approvedDraft, campaign);
+        const engagement = {
+          ...reception,
+          from_approved_draft: true,
+          sim_run_id: activeRun?.id || null,
+        };
+
+        const result = await pool.query(
+          `UPDATE posts
+           SET status = 'simulated',
+               social_account_id = COALESCE($2, social_account_id),
+               posted_at = NOW(),
+               engagement_metrics = $3::jsonb,
+               metadata = COALESCE(metadata, '{}'::jsonb) || $4::jsonb
+           WHERE id = $1
+           RETURNING *`,
+          [
+            approvedDraft.id,
+            account?.id || null,
+            JSON.stringify(engagement),
+            JSON.stringify({
+              persona_id: reception.persona_id,
+              sim_run_id: activeRun?.id || null,
+              reception: reception.reception,
+            }),
+          ]
+        );
+        return result.rows[0];
+      }
 
       const networks = await this.getCampaignNetworks(campaignId);
       if (!networks.length) throw new Error('No networks configured');
@@ -438,7 +492,7 @@ Content Requirements:
       const network = networks[Math.floor(Math.random() * networks.length)];
       
       // Get a random account for the selected network
-      const account = await this.getRandomAccount(network.network_type);
+      const account = await this.getRandomAccount(network.network_type, [], campaignId, { allowSimulated: true });
       if (!account) throw new Error(`No available accounts for ${network.network_type}`);
 
       // Check post limits
@@ -451,7 +505,11 @@ Content Requirements:
 
       const content = await this.generateContent('post', campaign, {
           platform: network.network_type,
-        subreddit: subreddit.subreddit_name
+          subreddit: {
+            subreddit_name: subreddit.subreddit_name,
+            content_rules: subreddit.content_rules || subreddit.content_guidelines || [],
+          },
+          campaignId,
       });
 
         post = await pool.query(
@@ -511,74 +569,65 @@ Content Requirements:
         );
       }
 
-      // Generate engagement metrics
-      const engagement = this.generateEngagementMetrics(network.network_type);
+      // Persona-driven reception (not random vanity metrics)
+      const activeRun = await campaignScorecardService.getActiveRun(campaignId);
+      const reception = await simulateReception(post.rows[0], campaign);
+      const engagement = {
+        ...reception,
+        sim_run_id: activeRun?.id || null,
+      };
       await pool.query(
         `UPDATE posts 
-         SET engagement_metrics = $1
+         SET engagement_metrics = $1,
+             metadata = COALESCE(metadata, '{}'::jsonb) || $3::jsonb
          WHERE id = $2`,
-        [engagement, post.rows[0].id]
+        [
+          JSON.stringify(engagement),
+          post.rows[0].id,
+          JSON.stringify({
+            persona_id: reception.persona_id,
+            sim_run_id: activeRun?.id || null,
+            reception: reception.reception,
+          }),
+        ]
       );
 
-      return post.rows[0];
+      return { ...post.rows[0], engagement_metrics: engagement };
     } catch (error) {
       console.error('Error creating simulated post:', error);
       throw error;
     }
   }
 
+  /** @deprecated Prefer simulateReception — kept for non-sim callers */
   generateEngagementMetrics(platform) {
-    const baseMetrics = {
-      views: Math.floor(Math.random() * 10000),
-      shares: Math.floor(Math.random() * 100),
+    return {
+      views: Math.floor(Math.random() * 100),
+      shares: 0,
+      upvotes: 0,
+      likes: 0,
+      reception: 'ignored',
+      sim: false,
+      platform,
     };
-
-    switch (platform) {
-      case 'reddit':
-        return {
-          ...baseMetrics,
-          upvotes: Math.floor(Math.random() * 1000),
-          downvotes: Math.floor(Math.random() * 100),
-          awards: Math.floor(Math.random() * 5)
-        };
-      case 'linkedin':
-        return {
-          ...baseMetrics,
-          likes: Math.floor(Math.random() * 500),
-          comments: Math.floor(Math.random() * 50),
-          impressions: Math.floor(Math.random() * 20000)
-        };
-      case 'x':
-        return {
-          ...baseMetrics,
-          likes: Math.floor(Math.random() * 1000),
-          retweets: Math.floor(Math.random() * 200),
-          quotes: Math.floor(Math.random() * 50)
-        };
-      case 'tiktok':
-        return {
-          ...baseMetrics,
-          likes: Math.floor(Math.random() * 10000),
-          comments: Math.floor(Math.random() * 1000),
-          shares: Math.floor(Math.random() * 500),
-          favorites: Math.floor(Math.random() * 2000),
-          watchTime: Math.floor(Math.random() * 3600), // in seconds
-          completionRate: (Math.random() * 0.4 + 0.6).toFixed(2) // 60-100%
-        };
-      default:
-        return baseMetrics;
-    }
   }
 
   async validatePostLimits(campaignId, platform, accountId) {
     const campaign = await this.getCampaign(campaignId);
     if (!campaign) throw new Error('Campaign not found');
 
-    // Get total posts for this platform
-    const totalPosts = await this.getPostCount(campaignId, platform);
-    
-    // Get posts for this specific account
-    const accountPosts = await this.getAccountPostCount(campaignId, accountId);
+    let scope = {};
+    if (campaign.simulation_mode) {
+      try {
+        const activeRun = await campaignScorecardService.getActiveRun(campaignId);
+        if (activeRun?.id) {
+          scope = { simRunId: activeRun.id, since: activeRun.started_at };
+        }
+      } catch { /* ignore */ }
+    }
+
+    const totalPosts = await this.getPostCount(campaignId, platform, scope);
+    const accountPosts = await this.getAccountPostCount(campaignId, accountId, scope);
 
     let limitMessage = null;
 
@@ -637,11 +686,72 @@ Content Requirements:
 
         // Check if enough time has passed since last post
         const lastPost = await this.getLastPost(campaignId);
-        if (lastPost) {
+        if (lastPost && campaign.min_post_interval_hours) {
           const hoursSinceLastPost = (now - new Date(lastPost.posted_at)) / (1000 * 60 * 60);
           if (hoursSinceLastPost < campaign.min_post_interval_hours) {
             throw new Error('Minimum post interval not reached');
           }
+        }
+      }
+
+      // Prefer publishing an approved draft (sim or live)
+      const approvedDraft = await this.claimApprovedDraft(campaignId);
+      if (approvedDraft) {
+        try {
+          const platform = approvedDraft.platform || 'reddit';
+          const handler = this.platformHandlers[platform];
+          if (!handler) throw new Error(`Unsupported platform: ${platform}`);
+
+          const account = approvedDraft.social_account_id
+            ? await this.getAccountById(approvedDraft.social_account_id)
+            : await this.getRandomAccount(platform, [], campaignId);
+          if (!account) throw new Error(`No available ${platform} account found`);
+
+          await this.validatePostLimits(campaignId, platform, account.id);
+
+          const context = approvedDraft.subreddit
+            ? {
+                subreddit: {
+                  subreddit_name: approvedDraft.subreddit,
+                  content_rules: approvedDraft.metadata?.subreddit_rules || [],
+                },
+              }
+            : await handler.getPostContext(campaignId);
+
+          const content = approvedDraft.content;
+          const postData = await (isLive
+            ? handler.createLivePost(campaign, account, content, context)
+            : handler.createSimulatedPost(campaign, account, content, context));
+
+          const result = await pool.query(
+            `UPDATE posts SET
+               social_account_id = $2,
+               platform_post_id = $3,
+               content = $4,
+               status = $5,
+               metadata = COALESCE(metadata, '{}'::jsonb) || COALESCE($6::jsonb, '{}'::jsonb),
+               subreddit = COALESCE($7, subreddit),
+               posted_at = NOW()
+             WHERE id = $1
+             RETURNING *`,
+            [
+              approvedDraft.id,
+              postData.social_account_id,
+              postData.platform_post_id || null,
+              postData.content,
+              postData.status,
+              JSON.stringify({ ...(postData.metadata || {}), from_approved_draft: true }),
+              postData.subreddit || null,
+            ]
+          );
+          console.log(`Published approved draft ${approvedDraft.id} as ${postData.status}`);
+          return result.rows[0];
+        } catch (draftErr) {
+          await pool.query(
+            `UPDATE posts SET status = 'approved' WHERE id = $1 AND status = 'publishing'`,
+            [approvedDraft.id]
+          ).catch(() => {});
+          throw draftErr;
         }
       }
 
@@ -664,7 +774,7 @@ Content Requirements:
           console.log(`Current post count for ${network.network_type}: ${postCount}`);
 
           // Get account before checking limits
-          const account = await this.getRandomAccount(network.network_type);
+          const account = await this.getRandomAccount(network.network_type, [], campaignId);
           if (!account) {
             const error = `No available ${network.network_type} account found`;
             console.warn(error);
@@ -770,14 +880,44 @@ Content Requirements:
       if (!handler) throw new Error(`Unsupported platform: ${context.platform}`);
 
       // Get the account and its personality
-      const account = await this.getRandomAccount(context.platform);
+      const account = await this.getRandomAccount(
+        context.platform,
+        [],
+        context.campaignId || campaign.id,
+        { allowSimulated: true }
+      );
+
+      // Inject audience persona for subreddit/platform
+      let enrichedContext = { ...context };
+      try {
+        const subName = context.subreddit?.subreddit_name || context.subreddit;
+        let audience = null;
+        if (subName && typeof subName === 'string') {
+          audience = await audiencePersonaService.getForSubreddit(campaign.id, subName);
+          if (!audience) {
+            audience = await audiencePersonaService.ensureForSubreddit(campaign.id, {
+              subreddit_name: subName,
+              content_guidelines: context.subreddit?.content_rules || [],
+              reason: '',
+            });
+          }
+        } else {
+          audience = await audiencePersonaService.getPersona(campaign.id, 'platform', context.platform);
+        }
+        if (audience) {
+          enrichedContext.audiencePersonaPrompt = audiencePersonaService.formatForPrompt(audience);
+          enrichedContext.audiencePersona = audience;
+        }
+      } catch (personaErr) {
+        console.warn('Audience persona inject skipped:', personaErr.message);
+      }
       
       // Get network-specific style guidelines
       const networkStyle = await contentStyleService.getNetworkStyle(context.platform, type);
       
       // Generate base prompt from network style
       const basePrompt = contentStyleService.generateBasePrompt(networkStyle, type, {
-        ...context,
+        ...enrichedContext,
         campaign_overview: campaign.campaign_overview,
         campaign_goal: campaign.campaign_goal,
         post_goal: campaign.post_goal
@@ -796,20 +936,29 @@ Content Requirements:
         ? `\n\nAvoid repeating these ideas from recent content:\n${recentContent.join('\n')}`
         : '';
 
-      const completion = await openai.chat.completions.create({
-        model: "gpt-4o",
-        messages: [
-          { role: "system", content: finalPrompt },
-          { role: "user", content: handler.buildPrompt(type, campaign, context, account) + diversityGuidance }
-        ],
-        temperature: 1.0,
-        presence_penalty: 1.0,
-        frequency_penalty: 1.0,
-        top_p: 0.9
-      });
+      const learnings = campaign.active_learnings || context.active_learnings || null;
+      const learningsBlock = simLearningsService.formatForPrompt(learnings);
+
+      const isReddit = context.platform === 'reddit';
+      const systemContent = isReddit
+        ? `${getRedditSystemPrompt()}\n\n${finalPrompt}${learningsBlock}`
+        : `${finalPrompt}${learningsBlock}`;
+
+      const completion = await openai.chat.completions.create(
+        generationCompletionOptions({
+          messages: [
+            { role: "system", content: systemContent },
+            { role: "user", content: handler.buildPrompt(type, campaign, enrichedContext, account) + diversityGuidance }
+          ],
+        })
+      );
 
       let content = completion.choices?.[0]?.message?.content.trim();
       if (!content) throw new Error('Failed to generate content');
+
+      if (isReddit) {
+        content = sanitizeRedditPost(content);
+      }
 
       this.validateContentLength(content, context.platform);
       this.recentContentCache.add(content);
@@ -902,14 +1051,35 @@ Remember: You're a real person having a real conversation, not following a scrip
   async getRandomApprovedSubreddit(campaignId) {
     try {
       console.log('Getting random approved subreddit for campaign:', campaignId);
-      
-      // Get all approved subreddits that haven't reached their post limit
+
+      // Scope simulated post counts to the active sim run so each run can post again
+      let activeRun = null;
+      try {
+        activeRun = await campaignScorecardService.getActiveRun(campaignId);
+      } catch { /* ignore */ }
+
+      const params = [campaignId];
+      let runFilter = '';
+      if (activeRun?.id) {
+        params.push(String(activeRun.id), activeRun.started_at);
+        runFilter = `AND (
+          (engagement_metrics->>'sim_run_id') = $2
+          OR (metadata->>'sim_run_id') = $2
+          OR (
+            (engagement_metrics->>'sim_run_id') IS NULL
+            AND (metadata->>'sim_run_id') IS NULL
+            AND COALESCE(posted_at, created_at) >= $3
+          )
+        )`;
+      }
+
       const query = `
         WITH subreddit_posts AS (
           SELECT subreddit, COUNT(*) as post_count
           FROM posts
-         WHERE campaign_id = $1
-          AND status IN ('simulated', 'posted')
+          WHERE campaign_id = $1
+            AND status IN ('simulated', 'posted')
+            ${runFilter}
           GROUP BY subreddit
         )
         SELECT s.subreddit_name, s.reason
@@ -918,25 +1088,20 @@ Remember: You're a real person having a real conversation, not following a scrip
         WHERE s.campaign_id = $1
         AND s.status = 'approved'
         AND (p.post_count IS NULL OR p.post_count < (
-          SELECT posts_per_subreddit 
-          FROM campaigns 
+          SELECT posts_per_subreddit
+          FROM campaigns
           WHERE id = $1
         ))
          ORDER BY RANDOM()
         LIMIT 1`;
-      
-      console.log('Executing query:', query);
-      console.log('With campaign ID:', campaignId);
-      
-      const suggestionsResult = await pool.query(query, [campaignId]);
-      console.log('Query result:', suggestionsResult.rows);
 
-      // If we find an approved suggestion that hasn't reached its limit, use it
+      const suggestionsResult = await pool.query(query, params);
+
       if (suggestionsResult.rows.length > 0) {
         console.log('Found approved subreddit from suggestions:', suggestionsResult.rows[0]);
         return {
           subreddit_name: suggestionsResult.rows[0].subreddit_name,
-          content_rules: [], // Add any rules if needed
+          content_rules: [],
         };
       }
 
@@ -948,12 +1113,52 @@ Remember: You're a real person having a real conversation, not following a scrip
     }
   }
 
-  async getRandomAccount(platform, excludeIds = []) {
+  async getAccountById(accountId) {
+    if (!accountId) return null;
+    const result = await pool.query('SELECT * FROM social_accounts WHERE id = $1', [accountId]);
+    return result.rows[0] || null;
+  }
+
+  async getRandomAccount(platform, excludeIds = [], campaignId = null, { allowSimulated = false } = {}) {
     try {
+      if (campaignId) {
+        const available = await campaignAccountService.getAvailableAccounts(
+          campaignId, platform, excludeIds
+        );
+        const usable = allowSimulated
+          ? available
+          : available.filter(a =>
+              !a.is_simulated && a.credentials?.password !== 'default_password'
+            );
+        if (usable.length) {
+          const account = usable[0];
+          if (!account.persona_traits) {
+            const persona = await commentingService.generatePersonalityTraits();
+            await pool.query(
+              `UPDATE social_accounts SET persona_traits = $1 WHERE id = $2`,
+              [JSON.stringify(persona), account.id]
+            );
+            account.persona_traits = persona;
+          }
+          return account;
+        }
+        if (!allowSimulated) {
+          throw new Error(
+            `No real ${platform} accounts available for campaign ${campaignId}. Assign accounts on the Launch tab.`
+          );
+        }
+      }
+
+      const realFilter = allowSimulated
+        ? ''
+        : `AND COALESCE(is_simulated, false) = false
+           AND COALESCE(credentials->>'password', '') != 'default_password'`;
+
       const query = `
         SELECT * FROM social_accounts 
         WHERE platform = $1 
         AND status = 'active'
+        ${realFilter}
         ${excludeIds.length > 0 ? 'AND id != ANY($2)' : ''}
         ORDER BY RANDOM()
         LIMIT 1`;
@@ -962,31 +1167,27 @@ Remember: You're a real person having a real conversation, not following a scrip
       const result = await pool.query(query, params);
       
       if (!result.rows[0]) {
-        // If no accounts are available, create a new one with persona traits
-        const persona = await commentingService.generatePersonalityTraits();
-        const username = `user_${Math.floor(Math.random() * 10000)}`;
-        const newAccount = await pool.query(
-          `INSERT INTO social_accounts 
-           (platform, username, credentials, status, persona_traits)
-           VALUES ($1, $2, $3, 'active', $4)
-           RETURNING *`,
-          [
-            platform,
-            username,
-            JSON.stringify({ password: 'default_password' }),
-            JSON.stringify(persona)
-          ]
+        if (allowSimulated) {
+          const persona = await commentingService.generatePersonalityTraits();
+          const username = `sim_${Math.floor(Math.random() * 10000)}`;
+          const created = await pool.query(
+            `INSERT INTO social_accounts
+             (platform, username, credentials, status, persona_traits, is_simulated)
+             VALUES ($1, $2, $3, 'active', $4, true)
+             RETURNING *`,
+            [platform, username, JSON.stringify({ password: 'default_password' }), JSON.stringify(persona)]
+          );
+          return created.rows[0];
+        }
+        throw new Error(
+          `No real ${platform} accounts available. Create accounts under Social Accounts.`
         );
-        return newAccount.rows[0];
       }
 
-      // If account exists but has no persona, generate one
       if (!result.rows[0].persona_traits) {
         const persona = await commentingService.generatePersonalityTraits();
         await pool.query(
-          `UPDATE social_accounts 
-           SET persona_traits = $1
-           WHERE id = $2`,
+          `UPDATE social_accounts SET persona_traits = $1 WHERE id = $2`,
           [JSON.stringify(persona), result.rows[0].id]
         );
         result.rows[0].persona_traits = persona;
@@ -1093,30 +1294,188 @@ Remember: You're a real person having a real conversation, not following a scrip
     return result.rows[0];
   }
 
-  async getPostCount(campaignId, platform) {
+  async getPostCount(campaignId, platform, { simRunId = null, since = null } = {}) {
     try {
+      const params = [campaignId, platform];
+      let runFilter = '';
+      if (simRunId) {
+        params.push(String(simRunId));
+        runFilter = `AND (
+          (engagement_metrics->>'sim_run_id') = $3
+          OR (metadata->>'sim_run_id') = $3
+        )`;
+        if (since) {
+          params.push(since);
+          runFilter = `AND (
+            (engagement_metrics->>'sim_run_id') = $3
+            OR (metadata->>'sim_run_id') = $3
+            OR (
+              (engagement_metrics->>'sim_run_id') IS NULL
+              AND (metadata->>'sim_run_id') IS NULL
+              AND COALESCE(posted_at, created_at) >= $4
+            )
+          )`;
+        }
+      }
       const result = await pool.query(
-        'SELECT COUNT(*) FROM posts WHERE campaign_id = $1 AND platform = $2',
-        [campaignId, platform]
+        `SELECT COUNT(*) FROM posts
+         WHERE campaign_id = $1 AND platform = $2
+           AND status IN ('simulated', 'posted')
+           ${runFilter}`,
+        params
       );
-      return parseInt(result.rows[0].count);
+      return parseInt(result.rows[0].count, 10);
     } catch (error) {
       console.error('Error getting post count:', error);
       throw error;
     }
   }
 
-  async getAccountPostCount(campaignId, accountId) {
+  async getAccountPostCount(campaignId, accountId, { simRunId = null, since = null } = {}) {
     try {
+      const params = [campaignId, accountId];
+      let runFilter = '';
+      if (simRunId) {
+        params.push(String(simRunId));
+        runFilter = `AND (
+          (engagement_metrics->>'sim_run_id') = $3
+          OR (metadata->>'sim_run_id') = $3
+        )`;
+        if (since) {
+          params.push(since);
+          runFilter = `AND (
+            (engagement_metrics->>'sim_run_id') = $3
+            OR (metadata->>'sim_run_id') = $3
+            OR (
+              (engagement_metrics->>'sim_run_id') IS NULL
+              AND (metadata->>'sim_run_id') IS NULL
+              AND COALESCE(posted_at, created_at) >= $4
+            )
+          )`;
+        }
+      }
       const result = await pool.query(
-        'SELECT COUNT(*) FROM posts WHERE campaign_id = $1 AND social_account_id = $2',
-        [campaignId, accountId]
+        `SELECT COUNT(*) FROM posts
+         WHERE campaign_id = $1 AND social_account_id = $2
+           AND status IN ('simulated', 'posted')
+           ${runFilter}`,
+        params
       );
-      return parseInt(result.rows[0].count);
+      return parseInt(result.rows[0].count, 10);
     } catch (error) {
       console.error('Error getting account post count:', error);
       throw error;
     }
+  }
+
+  async generateDraftPosts(campaignId, count = 3) {
+    const campaign = await this.getCampaign(campaignId);
+    if (!campaign) throw new Error('Campaign not found');
+
+    const approved = await subredditService.getApprovedSubreddits(campaignId);
+    if (!approved.length) {
+      throw new Error('Approve at least one subreddit before generating posts');
+    }
+
+    const uniqueSubs = [...new Map(
+      approved.map(s => [s.subreddit_name.toLowerCase(), s])
+    ).values()];
+
+    const drafts = [];
+    const errors = [];
+
+    for (let i = 0; i < count; i++) {
+      const sub = uniqueSubs[i % uniqueSubs.length];
+      try {
+        const guidelines = Array.isArray(sub.content_guidelines)
+          ? sub.content_guidelines
+          : (sub.content_guidelines ? JSON.parse(sub.content_guidelines) : []);
+
+        try {
+          // Only generate persona if missing — don't block draft gen on existing ones
+          const existing = await audiencePersonaService.getForSubreddit(campaignId, sub.subreddit_name);
+          if (!existing) {
+            await audiencePersonaService.ensureForSubreddit(campaignId, sub);
+          }
+        } catch { /* non-blocking */ }
+
+        const context = {
+          platform: 'reddit',
+          campaignId,
+          subreddit: {
+            subreddit_name: sub.subreddit_name,
+            content_rules: guidelines,
+          },
+        };
+
+        const content = await this.generateContent('post', campaign, context);
+        let account = null;
+        try {
+          account = await this.getRandomAccount('reddit', [], campaignId);
+        } catch {
+          /* drafts can exist without an assigned account yet */
+        }
+
+        const result = await pool.query(
+          `INSERT INTO posts (campaign_id, platform, content, subreddit, social_account_id, status, metadata, posted_at)
+           VALUES ($1, 'reddit', $2, $3, $4, 'draft', $5, NOW())
+           RETURNING *`,
+          [
+            campaignId,
+            content,
+            sub.subreddit_name,
+            account?.id || null,
+            JSON.stringify({ generated: true, subreddit_reason: sub.reason }),
+          ]
+        );
+        drafts.push(result.rows[0]);
+      } catch (err) {
+        errors.push(`r/${sub.subreddit_name}: ${err.message}`);
+      }
+    }
+
+    if (drafts.length === 0) {
+      throw new Error(errors.join('; ') || 'Failed to generate any draft posts');
+    }
+
+    return drafts;
+  }
+
+  async updatePostStatus(postId, campaignId, status) {
+    const allowed = ['draft', 'approved', 'rejected', 'simulated', 'posted', 'publishing'];
+    if (!allowed.includes(status)) {
+      throw new Error(`Invalid status. Must be one of: ${allowed.join(', ')}`);
+    }
+
+    const result = await pool.query(
+      `UPDATE posts SET status = $1 WHERE id = $2 AND campaign_id = $3 RETURNING *`,
+      [status, postId, campaignId]
+    );
+
+    if (result.rows.length === 0) {
+      throw new Error('Post not found');
+    }
+
+    return result.rows[0];
+  }
+
+  async listPostsForReview(campaignId) {
+    const result = await pool.query(
+      `SELECT p.*, sa.username as posted_by
+       FROM posts p
+       LEFT JOIN social_accounts sa ON p.social_account_id = sa.id
+       WHERE p.campaign_id = $1
+       ORDER BY
+         CASE p.status
+           WHEN 'approved' THEN 1
+           WHEN 'draft' THEN 2
+           WHEN 'rejected' THEN 3
+           ELSE 4
+         END,
+         p.posted_at DESC`,
+      [campaignId]
+    );
+    return result.rows;
   }
 }
 

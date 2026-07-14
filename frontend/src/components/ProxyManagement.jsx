@@ -179,7 +179,7 @@ const ProxyManagement = () => {
 
   if (loading) {
     return <div className="flex items-center justify-center py-12">
-      <div className="animate-spin rounded-full h-8 w-8 border-2 border-oracle-400 border-t-transparent"></div>
+      <div className="animate-spin rounded-full h-8 w-8 border-2 border-whisper-400 border-t-transparent"></div>
     </div>;
   }
 
@@ -485,7 +485,7 @@ const ProxyManagement = () => {
                   <label className="flex items-center gap-2.5 cursor-pointer">
                     <input
                       type="checkbox"
-                      className="w-4 h-4 rounded border-gray-300 text-oracle-600 focus:ring-oracle-500"
+                      className="w-4 h-4 rounded border-gray-300 text-whisper-600 focus:ring-whisper-500"
                       checked={newProxy.is_residential}
                       onChange={(e) => setNewProxy({ ...newProxy, is_residential: e.target.checked })}
                     />
@@ -601,7 +601,7 @@ const ProxyAssignment = ({ proxy, socialAccounts, onClose, onAssigned }) => {
           <div className="px-6 py-4">
             {loading ? (
               <div className="flex items-center justify-center py-8">
-                <div className="animate-spin rounded-full h-6 w-6 border-2 border-oracle-400 border-t-transparent"></div>
+                <div className="animate-spin rounded-full h-6 w-6 border-2 border-whisper-400 border-t-transparent"></div>
               </div>
             ) : (
               <>
@@ -614,13 +614,13 @@ const ProxyAssignment = ({ proxy, socialAccounts, onClose, onAssigned }) => {
                       key={account.id}
                       className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
                         selectedAccounts.includes(account.id)
-                          ? 'border-oracle-300 bg-oracle-50/50'
+                          ? 'border-whisper-300 bg-whisper-50/50'
                           : 'border-gray-200 hover:border-gray-300'
                       }`}
                     >
                       <input
                         type="checkbox"
-                        className="mt-0.5 w-4 h-4 rounded border-gray-300 text-oracle-600 focus:ring-oracle-500"
+                        className="mt-0.5 w-4 h-4 rounded border-gray-300 text-whisper-600 focus:ring-whisper-500"
                         checked={selectedAccounts.includes(account.id)}
                         onChange={() => toggleAccount(account.id)}
                       />

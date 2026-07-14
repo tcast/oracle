@@ -1,5 +1,6 @@
 const pool = require('./db');
 const OpenAI = require('openai');
+const { generationCompletionOptions } = require('../config/openaiModels');
 
 class SubredditService {
   constructor() {
@@ -10,7 +11,7 @@ class SubredditService {
     }
   }
 
-  async suggestSubreddits(campaignId, goal) {
+  async suggestSubreddits(campaignId, goal, options = {}) {
     try {
       if (!campaignId) {
         throw new Error('Campaign ID is required');
@@ -21,7 +22,6 @@ class SubredditService {
 
       console.log('Starting subreddit suggestion generation for campaign:', campaignId);
       
-      // Get campaign details
       const campaignResult = await pool.query(
         'SELECT campaign_overview, campaign_goal FROM campaigns WHERE id = $1',
         [campaignId]
@@ -32,49 +32,95 @@ class SubredditService {
       }
 
       const { campaign_overview, campaign_goal } = campaignResult.rows[0];
-      console.log('Campaign overview:', campaign_overview);
-      console.log('Campaign goal:', campaign_goal);
+      const existing = await this.getSubredditsForCampaign(campaignId);
+      const prompt = this.buildSuggestionPrompt({
+        campaign_overview,
+        campaign_goal: campaign_goal || goal,
+        existing,
+        ...options,
+      });
 
-      // Verify OpenAI configuration
-      if (!process.env.OPENAI_API_KEY) {
-        throw new Error('OpenAI API key is not configured');
-      }
+      const formattedSuggestions = await this.fetchSuggestionsFromAI(prompt);
+      return await this.storeSuggestions(campaignId, formattedSuggestions);
+    } catch (error) {
+      console.error('Error in suggestSubreddits:', error);
+      throw new Error(`Failed to generate suggestions: ${error.message}`);
+    }
+  }
 
-      if (!this.openai) {
-        this.openai = new OpenAI({
-          apiKey: process.env.OPENAI_API_KEY,
-        });
-      }
+  async refineSubreddits(campaignId, { seedSubreddits = [], hint = '' } = {}) {
+    if (!campaignId) throw new Error('Campaign ID is required');
+    if (!seedSubreddits.length) throw new Error('At least one approved subreddit is required to refine');
 
-      console.log('Making OpenAI API request...');
-      
-      const completion = await this.openai.chat.completions.create({
-        model: "gpt-4o",
-        messages: [
-          {
-            role: "system",
-            content: "You are a Reddit expert who understands each subreddit's culture, rules, and engagement patterns. Suggest both mainstream and niche subreddits that would be receptive to the content. Always format subscriber counts as numbers or with K/M suffix (e.g., 50000, 50K, 1.8M)."
-          },
-          {
-            role: "user",
-            content: `Based on this campaign:
+    const campaignResult = await pool.query(
+      'SELECT campaign_overview, campaign_goal FROM campaigns WHERE id = $1',
+      [campaignId]
+    );
+    if (campaignResult.rows.length === 0) throw new Error('Campaign not found');
 
-Campaign Overview: "${campaign_overview}"
-Campaign Goal: "${campaign_goal}"
+    const existing = await this.getSubredditsForCampaign(campaignId);
+    const seeds = existing.filter(s => seedSubreddits.includes(s.subreddit_name));
+    const rejected = existing.filter(s => s.status === 'rejected').map(s => s.subreddit_name);
 
-Suggest relevant subreddits where this content would be well-received.
+    const prompt = this.buildSuggestionPrompt({
+      campaign_overview: campaignResult.rows[0].campaign_overview,
+      campaign_goal: campaignResult.rows[0].campaign_goal,
+      existing,
+      seedSubreddits: seeds,
+      rejectedSubreddits: rejected,
+      hint,
+      refine: true,
+    });
+
+    const formattedSuggestions = await this.fetchSuggestionsFromAI(prompt);
+    return await this.storeSuggestions(campaignId, formattedSuggestions);
+  }
+
+  buildSuggestionPrompt({
+    campaign_overview,
+    campaign_goal,
+    existing = [],
+    seedSubreddits = [],
+    rejectedSubreddits = [],
+    hint = '',
+    refine = false,
+  }) {
+    const existingNames = existing.map(s => s.subreddit_name).join(', ') || 'none';
+    const seedBlock = seedSubreddits.length
+      ? seedSubreddits.map(s => `- r/${s.subreddit_name}: ${s.reason}`).join('\n')
+      : '';
+    const rejectedBlock = rejectedSubreddits.length ? rejectedSubreddits.map(n => `- r/${n}`).join('\n') : '';
+
+    const task = refine
+      ? `The user approved these subreddits as a good fit. Suggest 5-8 MORE subreddits that are similar in audience, tone, and topic — adjacent communities, sister subs, and niches the same users frequent.
+
+Approved subreddits (use as seeds):
+${seedBlock}
+
+Do NOT suggest any subreddit already in the list or rejected list.`
+      : `Suggest 6-10 relevant subreddits where this content would be well-received.
 Include a mix of:
 1. Large, mainstream subreddits (1M+ subscribers)
 2. Medium-sized topical subreddits (100K-1M subscribers)
-3. Smaller, highly-focused niche subreddits (<100K subscribers)
+3. Smaller, highly-focused niche subreddits (<100K subscribers)`;
 
+    let extra = '';
+    if (rejectedBlock) extra += `\nRejected subreddits (do NOT suggest these):\n${rejectedBlock}\n`;
+    if (hint) extra += `\nUser refinement hint: "${hint}"\n`;
+    if (existingNames !== 'none') extra += `\nAlready suggested (do NOT duplicate): ${existingNames}\n`;
+
+    return `${task}
+
+Campaign Overview: "${campaign_overview}"
+Campaign Goal: "${campaign_goal}"
+${extra}
 For each subreddit, provide:
 1. The exact subreddit name (without r/)
 2. A detailed reason why this community would be interested
 3. Estimated subscriber count (use format: 50000, 50K, or 1.8M)
 4. Key content guidelines to follow
-                     
-Format your response as a JSON object with this structure:
+
+Format your response as a JSON object:
 {
   "subreddits": [
     {
@@ -84,46 +130,67 @@ Format your response as a JSON object with this structure:
       "content_guidelines": ["Guideline 1", "Guideline 2"]
     }
   ]
-}`
-          }
-        ],
-        temperature: 0.7
-      });
+}`;
+  }
 
-
-      // ... rest of OpenAI response handling ...
-
-      const content = completion.choices[0].message.content;
-      console.log('Received response from OpenAI:', content);
-
-      // Parse and clean the response before JSON parsing
-      let cleanedContent = content.replace(/Million/g, 'M')
-                                .replace(/Thousand/g, 'K')
-                                .replace(/(\d+)K/g, '$1000')
-                                .replace(/(\d+\.\d+)K/g, (match, p1) => (parseFloat(p1) * 1000).toString());
-
-      const jsonMatch = cleanedContent.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        throw new Error('Invalid response format from OpenAI');
-      }
-
-      let suggestions = JSON.parse(jsonMatch[0]);
-      
-      // Convert subscriber counts and format data
-      const formattedSuggestions = suggestions.subreddits.map(s => ({
-        subreddit_name: s.subreddit_name,
-        reason: s.reason,
-        subscriber_count: this.parseSubscriberCount(s.subscriber_count)
-      }));
-
-      console.log('Formatted suggestions:', formattedSuggestions);  // Add this for debugging
-
-      return await this.storeSuggestions(campaignId, formattedSuggestions);
-
-    } catch (error) {
-      console.error('Error in suggestSubreddits:', error);
-      throw new Error(`Failed to generate suggestions: ${error.message}`);
+  async fetchSuggestionsFromAI(userPrompt) {
+    if (!process.env.OPENAI_API_KEY) {
+      throw new Error('OpenAI API key is not configured');
     }
+
+    if (!this.openai) {
+      this.openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    }
+
+    const completion = await this.openai.chat.completions.create(
+      generationCompletionOptions({
+        messages: [
+          {
+            role: 'system',
+            content: 'You are a Reddit expert who understands each subreddit\'s culture, rules, and engagement patterns. Suggest real, active subreddits. Always format subscriber counts as numbers or with K/M suffix (e.g., 50000, 50K, 1.8M). Return valid JSON only.',
+          },
+          { role: 'user', content: userPrompt },
+        ],
+        response_format: { type: 'json_object' },
+      })
+    );
+
+    const content = completion.choices[0].message.content;
+    let cleanedContent = content
+      .replace(/Million/g, 'M')
+      .replace(/Thousand/g, 'K');
+
+    const jsonMatch = cleanedContent.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error('Invalid response format from OpenAI');
+
+    const suggestions = JSON.parse(jsonMatch[0]);
+    return (suggestions.subreddits || []).map(s => ({
+      subreddit_name: s.subreddit_name.replace(/^\/?r\//, ''),
+      reason: s.reason,
+      subscriber_count: this.parseSubscriberCount(s.subscriber_count),
+      content_guidelines: s.content_guidelines || [],
+    }));
+  }
+
+  async addManualSubreddit(campaignId, subredditName, reason) {
+    const name = subredditName.replace(/^\/?r\//, '').trim();
+    if (!name) throw new Error('Subreddit name is required');
+
+    const existing = await pool.query(
+      'SELECT id FROM subreddit_suggestions WHERE campaign_id = $1 AND LOWER(subreddit_name) = LOWER($2)',
+      [campaignId, name]
+    );
+    if (existing.rows.length) {
+      throw new Error(`r/${name} is already in the list`);
+    }
+
+    const rows = await this.storeSuggestions(campaignId, [{
+      subreddit_name: name,
+      reason: reason || `Manually added r/${name}`,
+      subscriber_count: 0,
+      content_guidelines: [],
+    }]);
+    return rows[0];
   }
 
   parseSubscriberCount(count) {
@@ -150,47 +217,45 @@ Format your response as a JSON object with this structure:
     return 0; // fallback value
   }
 
-  async storeSuggestions(campaignId, suggestions) {
+  async storeSuggestions(campaignId, suggestions, client = null) {
+    const db = client || pool;
     try {
-      console.log('Storing suggestions:', suggestions);  // Add this for debugging
-
-      // Validate input
       if (!Array.isArray(suggestions)) {
         throw new Error('Suggestions must be an array');
       }
 
-      const values = suggestions.map(s => {
-        // Only check for required fields
+      const existing = await db.query(
+        'SELECT subreddit_name FROM subreddit_suggestions WHERE campaign_id = $1',
+        [campaignId]
+      );
+      const existingNames = new Set(existing.rows.map(r => r.subreddit_name.toLowerCase()));
+
+      const toInsert = suggestions.filter(s => {
         if (!s.subreddit_name || !s.reason || typeof s.subscriber_count === 'undefined') {
-          console.error('Invalid suggestion format:', s);  // Add this for debugging
           throw new Error('Invalid suggestion format - missing required fields');
         }
-        return [
-          campaignId,
-          s.subreddit_name,
-          s.reason,
-          s.subscriber_count,
-          s.content_guidelines ? JSON.stringify(s.content_guidelines) : JSON.stringify([])
-        ];
+        return !existingNames.has(s.subreddit_name.toLowerCase());
       });
 
-      const results = await Promise.all(values.map(async v => {
-        try {
-          const result = await pool.query(
-            `INSERT INTO subreddit_suggestions 
-             (campaign_id, subreddit_name, reason, subscriber_count, content_guidelines)
-             VALUES ($1, $2, $3, $4, $5)
-             RETURNING *`,
-            v
-          );
-          return result.rows[0];
-        } catch (error) {
-          console.error('Error inserting suggestion:', error, 'Values:', v);
-          throw error;
-        }
+      if (toInsert.length === 0) return [];
+
+      const results = await Promise.all(toInsert.map(async s => {
+        const result = await db.query(
+          `INSERT INTO subreddit_suggestions
+           (campaign_id, subreddit_name, reason, subscriber_count, content_guidelines)
+           VALUES ($1, $2, $3, $4, $5)
+           RETURNING *`,
+          [
+            campaignId,
+            s.subreddit_name,
+            s.reason,
+            s.subscriber_count,
+            s.content_guidelines ? JSON.stringify(s.content_guidelines) : JSON.stringify([]),
+          ]
+        );
+        return result.rows[0];
       }));
 
-      console.log('Successfully stored suggestions:', results);
       return results;
     } catch (error) {
       console.error('Error in storeSuggestions:', error);
@@ -226,8 +291,22 @@ Format your response as a JSON object with this structure:
         throw new Error('Subreddit suggestion not found');
       }
 
-      console.log('Updated subreddit suggestion:', result.rows[0]);
-      return result.rows[0];
+      const suggestion = result.rows[0];
+      console.log('Updated subreddit suggestion:', suggestion);
+
+      // Generate persona in background — don't block the approve response
+      if (status === 'approved' && suggestion.campaign_id) {
+        setImmediate(() => {
+          const audiencePersonaService = require('./audiencePersonaService');
+          audiencePersonaService
+            .ensureForSubreddit(suggestion.campaign_id, suggestion)
+            .catch((personaErr) => {
+              console.warn('Persona generation on approve failed:', personaErr.message);
+            });
+        });
+      }
+
+      return suggestion;
     } catch (error) {
       console.error('Error in updateSuggestionStatus:', error);
       throw new Error(`Failed to update suggestion status: ${error.message}`);
