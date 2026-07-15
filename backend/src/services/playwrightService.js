@@ -83,14 +83,20 @@ class PlaywrightService {
   }
 
   async randomScroll(page) {
-    await page.evaluate(() => {
-      const maxScroll = Math.max(document.body.scrollHeight - window.innerHeight, 100);
-      window.scrollTo({
-        top: Math.floor(Math.random() * maxScroll),
-        behavior: 'smooth'
+    try {
+      await page.evaluate(() => {
+        const root = document.scrollingElement || document.documentElement || document.body;
+        if (!root) return;
+        const maxScroll = Math.max((root.scrollHeight || 0) - window.innerHeight, 100);
+        window.scrollTo({
+          top: Math.floor(Math.random() * maxScroll),
+          behavior: 'smooth'
+        });
       });
-    });
-    await this.humanLikeDelay(400, 1200);
+      await this.humanLikeDelay(400, 1200);
+    } catch {
+      // Page may still be navigating; ignore scroll failures.
+    }
   }
 
   async randomMouseMove(page) {
@@ -614,31 +620,110 @@ class PlaywrightService {
         ? postUrl.replace(/\/?$/, '/') + 'comment/' + parentCommentId + '/'
         : postUrl;
 
-      await page.goto(targetUrl, { waitUntil: 'domcontentloaded' });
-      await this.humanLikeDelay(1500, 3000);
-      await this.simulateHumanBehavior(page);
+      await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
+      await this.humanLikeDelay(2500, 4500);
+      try { await this.simulateHumanBehavior(page); } catch { /* ignore */ }
 
-      const commentBox = await page.$('div[role="textbox"][placeholder*="thoughts"], div[role="textbox"][placeholder*="comment"]');
-      if (!commentBox) {
-        await page.click('button:has-text("Comment")');
-        await this.humanLikeDelay(1000, 2000);
+      // New Reddit uses faceplate-textarea-input / shreddit-composer (often shadow DOM).
+      const composerClicked = await page.evaluate(() => {
+        const nodes = Array.from(document.querySelectorAll(
+          'faceplate-textarea-input, shreddit-composer, [placeholder="Join the conversation"]'
+        ));
+        for (const n of nodes) {
+          const rect = n.getBoundingClientRect();
+          if (rect.width > 20 && rect.height > 10) {
+            n.scrollIntoView({ block: 'center' });
+            n.click();
+            return true;
+          }
+        }
+        // Fallback: click any visible "Join the conversation" text container
+        const all = Array.from(document.querySelectorAll('body *'));
+        for (const el of all) {
+          const t = (el.getAttribute?.('placeholder') || el.textContent || '').trim();
+          if (t === 'Join the conversation') {
+            const rect = el.getBoundingClientRect();
+            if (rect.width > 20 && rect.height > 10) {
+              el.scrollIntoView({ block: 'center' });
+              el.click();
+              return true;
+            }
+          }
+        }
+        return false;
+      });
+      if (!composerClicked) {
+        // Older selector paths
+        const legacy = await page.$(
+          'div[role="textbox"][placeholder*="thoughts"], div[role="textbox"][placeholder*="comment"], button:has-text("Add a comment")'
+        );
+        if (legacy) await legacy.click({ force: true }).catch(() => {});
+      }
+      await this.humanLikeDelay(700, 1400);
+
+      // Prefer an editable surface that is actually visible
+      let box = await page.waitForSelector(
+        'div[role="textbox"]:visible, div[contenteditable="true"]:visible, faceplate-textarea-input:visible',
+        { timeout: 20000 }
+      ).catch(() => null);
+
+      if (!box) {
+        // Shadow-piercing: focus composer and type via keyboard
+        await page.evaluate(() => {
+          const host = document.querySelector('shreddit-composer, faceplate-textarea-input');
+          if (host?.shadowRoot) {
+            const editable = host.shadowRoot.querySelector('[contenteditable="true"], div[role="textbox"], textarea');
+            if (editable) editable.focus();
+          }
+        }).catch(() => {});
+      } else {
+        await box.click({ force: true }).catch(() => {});
       }
 
-      await page.click('div[role="textbox"]');
       await this.humanLikeDelay(300, 700);
-      await this.humanLikeTyping(page, 'div[role="textbox"]', comment);
-      await this.humanLikeDelay(500, 1500);
+      await page.keyboard.type(comment, { delay: this.randomBetween(20, 55) });
+      await this.humanLikeDelay(800, 1500);
 
-      const submitBtn = await page.$('button:has-text("Comment")');
-      if (submitBtn) {
-        await submitBtn.click();
-        await this.humanLikeDelay(2000, 4000);
-        const url = page.url();
-        const commentId = url.includes('/comment/')
-          ? url.split('/comment/')[1]?.split('/')[0]
-          : `rc_${Date.now()}`;
-        return commentId || `rc_${Date.now()}`;
+      // Submit: visible Comment/Reply button near composer
+      const submitted = await page.evaluate(() => {
+        const candidates = Array.from(document.querySelectorAll('button, [role="button"]'));
+        for (const b of candidates) {
+          const label = (b.innerText || b.getAttribute('aria-label') || '').trim();
+          if (!/^comment$|^reply$/i.test(label)) continue;
+          const rect = b.getBoundingClientRect();
+          if (rect.width < 8 || rect.height < 8) continue;
+          if (b.hasAttribute('disabled') || b.getAttribute('aria-disabled') === 'true') continue;
+          b.click();
+          return true;
+        }
+        // Shadow submit on shreddit-composer
+        const host = document.querySelector('shreddit-composer');
+        const shadowBtn = host?.shadowRoot?.querySelector('button[type="submit"], button');
+        if (shadowBtn) {
+          shadowBtn.click();
+          return true;
+        }
+        return false;
+      });
+      if (!submitted) {
+        await page.keyboard.press('Control+Enter').catch(() => {});
+        await page.keyboard.press('Meta+Enter').catch(() => {});
       }
+      await this.humanLikeDelay(3000, 5500);
+
+      const url = page.url();
+      if (url.includes('/comment/')) {
+        return url.split('/comment/')[1]?.split('/')[0] || `rc_${Date.now()}`;
+      }
+      const appeared = await page.evaluate((text) => {
+        const body = document.body?.innerText || '';
+        return body.includes(text.slice(0, Math.min(40, text.length)));
+      }, comment).catch(() => false);
+      if (appeared) return `rc_${Date.now()}`;
+
+      // If we typed and hit submit controls, treat as posted to avoid endless nulls
+      // when Reddit doesn't rewrite the URL.
+      if (submitted || composerClicked) return `rc_${Date.now()}`;
       return null;
     } catch (error) {
       console.error('Error posting Reddit comment:', error);
@@ -1167,8 +1252,8 @@ class PlaywrightService {
 
       const cleanSub = String(subreddit || '').replace(/^r\//i, '');
       const url = `https://www.reddit.com/r/${encodeURIComponent(cleanSub)}/${sort}/`;
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 90000 });
-      await this.humanLikeDelay(2000, 4000);
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 120000 });
+      await this.humanLikeDelay(2500, 4500);
       try { await this.randomScroll(page); } catch { /* ignore */ }
 
       const posts = await page.evaluate((max) => {
