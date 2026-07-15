@@ -9,6 +9,8 @@ const AdLibrary = () => {
   const [ads, setAds] = useState([]);
   const [campaigns, setCampaigns] = useState([]);
   const [links, setLinks] = useState({});
+  const [attachingId, setAttachingId] = useState(null);
+  const [notice, setNotice] = useState(null);
   const [form, setForm] = useState({
     name: '',
     brief: '',
@@ -65,9 +67,26 @@ const AdLibrary = () => {
   const attach = async (adId) => {
     const campaignId = links[adId];
     if (!campaignId) return;
+    const campaign = campaigns.find((c) => String(c.id) === String(campaignId));
+    setAttachingId(adId);
+    setError(null);
     try {
       await api.post(`/api/campaigns/${campaignId}/ads`, { ad_creative_id: adId });
       setLinks((current) => ({ ...current, [adId]: '' }));
+      setNotice(`Attached to ${campaign?.name || 'campaign'}`);
+      await load();
+    } catch (err) {
+      setError(err.response?.data?.error || err.message);
+    } finally {
+      setAttachingId(null);
+    }
+  };
+
+  const detach = async (adId, campaignId, campaignName) => {
+    setError(null);
+    try {
+      await api.delete(`/api/campaigns/${campaignId}/ads/${adId}`);
+      setNotice(`Removed from ${campaignName}`);
       await load();
     } catch (err) {
       setError(err.response?.data?.error || err.message);
@@ -96,6 +115,12 @@ const AdLibrary = () => {
       </div>
 
       {error && <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>}
+      {notice && (
+        <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800 flex items-center justify-between gap-3">
+          <span>{notice}</span>
+          <button type="button" className="text-xs text-emerald-700 hover:underline" onClick={() => setNotice(null)}>Dismiss</button>
+        </div>
+      )}
 
       <div className="card p-4">
         <label className="block max-w-sm">
@@ -156,35 +181,87 @@ const AdLibrary = () => {
       <div>
         <h2 className="text-base font-semibold text-gray-900 mb-3">Saved ads</h2>
         <div className="grid gap-4 lg:grid-cols-2">
-          {ads.map((ad) => (
-            <article key={ad.id} className="card overflow-hidden">
-              <div className="grid sm:grid-cols-[10rem_1fr]">
-                {ad.image_url ? (
-                  <img src={ad.image_url} alt="" className="w-full h-48 sm:h-full object-cover bg-gray-50" />
-                ) : (
-                  <div className="h-32 sm:h-full bg-gray-50 flex items-center justify-center text-xs text-gray-400">Text ad</div>
-                )}
-                <div className="p-4 space-y-3 min-w-0">
-                  <div>
-                    <div className="flex justify-between gap-3">
-                      <h3 className="font-semibold text-gray-900">{ad.name}</h3>
-                      <button type="button" className="text-xs text-red-600 hover:underline" onClick={() => remove(ad.id)}>Delete</button>
+          {ads.map((ad) => {
+            const linkedCampaigns = Array.isArray(ad.campaigns) ? ad.campaigns : [];
+            const linkedIds = new Set(linkedCampaigns.map((c) => String(c.id)));
+            const availableCampaigns = campaigns.filter((c) => !linkedIds.has(String(c.id)));
+
+            return (
+              <article key={ad.id} className="card overflow-hidden">
+                <div className="grid sm:grid-cols-[10rem_1fr]">
+                  {ad.image_url ? (
+                    <img src={ad.image_url} alt="" className="w-full h-48 sm:h-full object-cover bg-gray-50" />
+                  ) : (
+                    <div className="h-32 sm:h-full bg-gray-50 flex items-center justify-center text-xs text-gray-400">Text ad</div>
+                  )}
+                  <div className="p-4 space-y-3 min-w-0">
+                    <div>
+                      <div className="flex justify-between gap-3">
+                        <h3 className="font-semibold text-gray-900">{ad.name}</h3>
+                        <button type="button" className="text-xs text-red-600 hover:underline" onClick={() => remove(ad.id)}>Delete</button>
+                      </div>
+                      <p className="text-xs text-gray-500 capitalize">
+                        {ad.format} · {linkedCampaigns.length} campaign{linkedCampaigns.length === 1 ? '' : 's'}
+                      </p>
                     </div>
-                    <p className="text-xs text-gray-500 capitalize">{ad.format} · linked to {ad.campaign_count || 0} campaigns</p>
-                  </div>
-                  {ad.content?.headline && <p className="text-sm font-medium text-gray-900">{ad.content.headline}</p>}
-                  {ad.content?.message && <p className="text-xs text-gray-600 line-clamp-4">{ad.content.message}</p>}
-                  <div className="flex gap-2">
-                    <select className="input-field text-xs" value={links[ad.id] || ''} onChange={(event) => setLinks({ ...links, [ad.id]: event.target.value })}>
-                      <option value="">Attach to campaign…</option>
-                      {campaigns.map((campaign) => <option key={campaign.id} value={campaign.id}>{campaign.name}</option>)}
-                    </select>
-                    <button type="button" className="btn-secondary text-xs" disabled={!links[ad.id]} onClick={() => attach(ad.id)}>Attach</button>
+                    {ad.content?.headline && <p className="text-sm font-medium text-gray-900">{ad.content.headline}</p>}
+                    {ad.content?.message && <p className="text-xs text-gray-600 line-clamp-4">{ad.content.message}</p>}
+
+                    <div className="space-y-2">
+                      <p className="text-[11px] font-medium uppercase tracking-wide text-gray-500">Attached to</p>
+                      {linkedCampaigns.length ? (
+                        <ul className="space-y-1.5">
+                          {linkedCampaigns.map((campaign) => (
+                            <li key={campaign.id} className="flex items-center justify-between gap-2 rounded-md bg-gray-50 px-2.5 py-1.5">
+                              <Link
+                                to={`/campaigns/${campaign.id}`}
+                                className="text-xs font-medium text-whisper-700 hover:underline truncate"
+                              >
+                                {campaign.name}
+                              </Link>
+                              <button
+                                type="button"
+                                className="text-[11px] text-gray-500 hover:text-red-600 shrink-0"
+                                onClick={() => detach(ad.id, campaign.id, campaign.name)}
+                              >
+                                Remove
+                              </button>
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="text-xs text-gray-400">Not attached to any campaign yet.</p>
+                      )}
+                    </div>
+
+                    <div className="flex gap-2">
+                      <select
+                        className="input-field text-xs"
+                        value={links[ad.id] || ''}
+                        onChange={(event) => setLinks({ ...links, [ad.id]: event.target.value })}
+                        disabled={!availableCampaigns.length}
+                      >
+                        <option value="">
+                          {availableCampaigns.length ? 'Attach to campaign…' : 'All campaigns already linked'}
+                        </option>
+                        {availableCampaigns.map((campaign) => (
+                          <option key={campaign.id} value={campaign.id}>{campaign.name}</option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        className="btn-secondary text-xs"
+                        disabled={!links[ad.id] || attachingId === ad.id}
+                        onClick={() => attach(ad.id)}
+                      >
+                        {attachingId === ad.id ? 'Attaching…' : 'Attach'}
+                      </button>
+                    </div>
                   </div>
                 </div>
-              </div>
-            </article>
-          ))}
+              </article>
+            );
+          })}
           {brandId && !ads.length && (
             <div className="lg:col-span-2 rounded-lg border border-dashed border-gray-300 p-10 text-center text-sm text-gray-500">
               No saved ads for this company yet.

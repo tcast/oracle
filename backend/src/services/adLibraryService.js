@@ -4,21 +4,40 @@ async function listCreatives(brandId) {
   const { rows } = await pool.query(
     `SELECT ac.*,
             COALESCE(
-              json_agg(DISTINCT jsonb_build_object(
-                'id', ba.id,
-                'kind', ba.kind,
-                'label', ba.label,
-                'url', ba.url
-              )) FILTER (WHERE ba.id IS NOT NULL),
-              '[]'
+              (
+                SELECT json_agg(jsonb_build_object(
+                  'id', ba.id,
+                  'kind', ba.kind,
+                  'label', ba.label,
+                  'url', ba.url
+                ) ORDER BY ba.id)
+                FROM ad_creative_assets aca
+                JOIN brand_assets ba ON ba.id = aca.brand_asset_id
+                WHERE aca.ad_creative_id = ac.id
+              ),
+              '[]'::json
             ) AS source_assets,
-            COUNT(DISTINCT cac.campaign_id)::int AS campaign_count
+            COALESCE(
+              (
+                SELECT json_agg(jsonb_build_object(
+                  'id', c.id,
+                  'name', c.name,
+                  'campaign_type', c.campaign_type,
+                  'linked_at', cac.created_at
+                ) ORDER BY cac.created_at DESC)
+                FROM campaign_ad_creatives cac
+                JOIN campaigns c ON c.id = cac.campaign_id
+                WHERE cac.ad_creative_id = ac.id
+              ),
+              '[]'::json
+            ) AS campaigns,
+            (
+              SELECT COUNT(*)::int
+              FROM campaign_ad_creatives cac
+              WHERE cac.ad_creative_id = ac.id
+            ) AS campaign_count
      FROM ad_creatives ac
-     LEFT JOIN ad_creative_assets aca ON aca.ad_creative_id = ac.id
-     LEFT JOIN brand_assets ba ON ba.id = aca.brand_asset_id
-     LEFT JOIN campaign_ad_creatives cac ON cac.ad_creative_id = ac.id
      WHERE ac.brand_id = $1
-     GROUP BY ac.id
      ORDER BY ac.created_at DESC`,
     [brandId]
   );
