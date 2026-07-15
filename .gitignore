@@ -37,6 +37,9 @@ yarn-error.log*
 uploads/
 backend/uploads/
 
+# Local secrets / proxy credential dumps
+backend/private/
+
 # Empty files
 App
 Building

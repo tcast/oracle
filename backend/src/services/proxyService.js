@@ -83,24 +83,39 @@ class ProxyService {
     try {
       await client.query('BEGIN');
 
-      // Remove existing inactive assignments
+      // Soft-disable existing assignments for this account
       await client.query(
         'UPDATE social_account_proxies SET is_active = false WHERE social_account_id = $1',
         [accountId]
       );
 
-      // Add new assignments
       const assignments = [];
       for (let i = 0; i < proxyIds.length; i++) {
-        const result = await client.query(
-          `INSERT INTO social_account_proxies 
-           (social_account_id, proxy_id, priority)
-           VALUES ($1, $2, $3)
-           ON CONFLICT (social_account_id, proxy_id) 
-           DO UPDATE SET priority = $3, is_active = true
-           RETURNING *`,
-          [accountId, proxyIds[i], i + 1]
+        const existing = await client.query(
+          `SELECT id FROM social_account_proxies
+           WHERE social_account_id = $1 AND proxy_id = $2
+           LIMIT 1`,
+          [accountId, proxyIds[i]]
         );
+
+        let result;
+        if (existing.rows[0]) {
+          result = await client.query(
+            `UPDATE social_account_proxies
+             SET priority = $1, is_active = true, assigned_at = NOW()
+             WHERE id = $2
+             RETURNING *`,
+            [i + 1, existing.rows[0].id]
+          );
+        } else {
+          result = await client.query(
+            `INSERT INTO social_account_proxies
+               (social_account_id, proxy_id, priority, is_active)
+             VALUES ($1, $2, $3, true)
+             RETURNING *`,
+            [accountId, proxyIds[i], i + 1]
+          );
+        }
         assignments.push(result.rows[0]);
       }
 
