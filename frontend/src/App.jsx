@@ -18,6 +18,7 @@ import BrandDetail from './components/BrandDetail';
 import BrandCampaignCreator from './components/BrandCampaignCreator';
 import BrandDataRoom from './components/BrandDataRoom';
 import AdLibrary from './components/AdLibrary';
+import OrganicActivity from './components/OrganicActivity';
 
 const PublicRoute = ({ children }) => {
   const { user, loading } = useAuth();
@@ -80,6 +81,7 @@ function App() {
             <Route path="/login" element={<PublicRoute><Login /></PublicRoute>} />
             <Route path="/users/new" element={<PrivateRoute fallback={<LoadingScreen />}><AppLayout><UserManagement /></AppLayout></PrivateRoute>} />
             <Route path="/social-accounts" element={<PrivateRoute fallback={<LoadingScreen />}><AppLayout><SocialAccounts /></AppLayout></PrivateRoute>} />
+            <Route path="/organic-activity" element={<PrivateRoute fallback={<LoadingScreen />}><AppLayout><OrganicActivity /></AppLayout></PrivateRoute>} />
             <Route path="/proxy-management" element={<PrivateRoute fallback={<LoadingScreen />}><AppLayout><ProxyManagement /></AppLayout></PrivateRoute>} />
             <Route path="/email-accounts" element={<PrivateRoute fallback={<LoadingScreen />}><AppLayout><EmailAccountManager /></AppLayout></PrivateRoute>} />
             <Route path="/proxy-assignments" element={<PrivateRoute fallback={<LoadingScreen />}><AppLayout><ProxyAccountAssignment /></AppLayout></PrivateRoute>} />

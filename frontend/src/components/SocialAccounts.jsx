@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { Link } from 'react-router-dom';
 import CreateAccountsForm from './CreateAccountsForm';
 import OrganicCommentsPanel from './OrganicCommentsPanel';
 import api from '../utils/api';
@@ -88,7 +89,12 @@ const SocialAccounts = () => {
         </div>
       )}
 
-      <OrganicCommentsPanel />
+      <div className="space-y-2">
+        <OrganicCommentsPanel />
+        <Link to="/organic-activity" className="text-sm text-whisper-700 hover:underline inline-block">
+          Open full organic activity log →
+        </Link>
+      </div>
 
       <div className="card p-4 sm:p-5">
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">

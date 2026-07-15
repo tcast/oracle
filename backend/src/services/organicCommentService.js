@@ -298,7 +298,7 @@ Write only the comment text.`;
        FROM organic_comments oc
        JOIN social_accounts sa ON sa.id = oc.social_account_id
        ORDER BY oc.created_at DESC
-       LIMIT 50`
+       LIMIT 200`
     );
     const todayStats = await pool.query(
       `SELECT COUNT(*)::int AS posted_today
