@@ -8,6 +8,7 @@ const ProxyAccountAssignment = () => {
   const [loading, setLoading] = useState(true);
   const [selectedAccount, setSelectedAccount] = useState(null);
   const [assigningProxies, setAssigningProxies] = useState([]);
+  const [mappingStatus, setMappingStatus] = useState(null);
 
   useEffect(() => {
     fetchData();
@@ -20,6 +21,13 @@ const ProxyAccountAssignment = () => {
 
       const proxiesResponse = await api.get('/api/proxies');
       setAllProxies(proxiesResponse.data);
+
+      try {
+        const mapping = await api.get('/api/organic-comments/proxy-mapping');
+        setMappingStatus(mapping.data);
+      } catch {
+        setMappingStatus(null);
+      }
 
       const accountProxyMap = {};
       for (const account of accountsResponse.data) {
@@ -40,6 +48,10 @@ const ProxyAccountAssignment = () => {
 
   const handleAssignProxies = async (accountId) => {
     try {
+      if (assigningProxies.length !== 1) {
+        alert('Assign exactly one dedicated proxy per account.');
+        return;
+      }
       await api.post(`/api/proxies/account/${accountId}/assign`, {
         proxy_ids: assigningProxies
       });
@@ -52,9 +64,19 @@ const ProxyAccountAssignment = () => {
 
       setSelectedAccount(null);
       setAssigningProxies([]);
+      fetchData();
     } catch (error) {
       console.error('Error assigning proxies:', error);
-      alert('Failed to assign proxies: ' + error.message);
+      alert('Failed to assign proxies: ' + (error.response?.data?.error || error.message));
+    }
+  };
+
+  const handleReconcile = async () => {
+    try {
+      await api.post('/api/organic-comments/proxy-mapping/reconcile', { create_missing: true });
+      await fetchData();
+    } catch (error) {
+      alert('Reconcile failed: ' + (error.response?.data?.error || error.message));
     }
   };
 
@@ -137,8 +159,27 @@ const ProxyAccountAssignment = () => {
         <svg className="w-5 h-5 mt-0.5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
           <path strokeLinecap="round" strokeLinejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
         </svg>
-        <span>Prefer one sticky ProxyBase proxy per account (posts and comments share that IP). Keep a few spares unassigned for new accounts.</span>
+        <span>Strict 1:1 mapping: every active proxy belongs to exactly one account, and every live account has exactly one proxy.</span>
       </div>
+
+      {mappingStatus && !mappingStatus.ok && (
+        <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 text-sm text-amber-900 flex flex-col sm:flex-row sm:items-center gap-3 justify-between">
+          <div>
+            Proxy mapping incomplete:
+            {' '}{mappingStatus.overview?.unassigned_proxies || 0} unassigned proxies,
+            {' '}{mappingStatus.overview?.accounts_without_proxy || 0} accounts without a proxy.
+          </div>
+          <button type="button" className="btn-secondary whitespace-nowrap" onClick={handleReconcile}>
+            Create accounts &amp; reconcile
+          </button>
+        </div>
+      )}
+
+      {mappingStatus?.ok && (
+        <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-4 text-sm text-emerald-800">
+          Proxy mapping healthy: {mappingStatus.overview?.active_proxies} proxies ↔ {mappingStatus.overview?.accounts_with_proxy} accounts.
+        </div>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {socialAccounts.length === 0 && (
@@ -241,22 +282,10 @@ const ProxyAccountAssignment = () => {
               </div>
               <div className="px-6 py-4">
                 <p className="text-sm text-gray-500 mb-4">
-                  Select proxies to assign to this account. The system will automatically rotate between them.
+                  Pick exactly one dedicated sticky proxy for this account (1:1).
                 </p>
 
                 <div className="flex gap-2 mb-4">
-                  <button
-                    className="px-3 py-1.5 text-xs font-medium rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-50 transition-colors"
-                    onClick={() => setAssigningProxies(allProxies.filter(p => p.is_active).map(p => p.id))}
-                  >
-                    Select All Active
-                  </button>
-                  <button
-                    className="px-3 py-1.5 text-xs font-medium rounded-lg border border-green-300 text-green-700 hover:bg-green-50 transition-colors"
-                    onClick={() => setAssigningProxies(allProxies.filter(p => p.is_residential && p.is_active).map(p => p.id))}
-                  >
-                    Select Residential Only
-                  </button>
                   <button
                     className="px-3 py-1.5 text-xs font-medium rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-50 transition-colors"
                     onClick={() => setAssigningProxies([])}
@@ -276,16 +305,11 @@ const ProxyAccountAssignment = () => {
                       }`}
                     >
                       <input
-                        type="checkbox"
-                        className="mt-0.5 w-4 h-4 rounded border-gray-300 text-whisper-600 focus:ring-whisper-500"
+                        type="radio"
+                        name="dedicated-proxy"
+                        className="mt-0.5 w-4 h-4 border-gray-300 text-whisper-600 focus:ring-whisper-500"
                         checked={assigningProxies.includes(proxy.id)}
-                        onChange={(e) => {
-                          if (e.target.checked) {
-                            setAssigningProxies([...assigningProxies, proxy.id]);
-                          } else {
-                            setAssigningProxies(assigningProxies.filter(id => id !== proxy.id));
-                          }
-                        }}
+                        onChange={() => setAssigningProxies([proxy.id])}
                       />
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center justify-between">
@@ -303,7 +327,7 @@ const ProxyAccountAssignment = () => {
                 </div>
 
                 <div className="mt-3 text-xs text-gray-500">
-                  <strong>Selected:</strong> {assigningProxies.length} proxies
+                  <strong>Selected:</strong> {assigningProxies.length === 1 ? '1 dedicated proxy' : 'none'}
                 </div>
               </div>
               <div className="px-6 py-4 border-t border-gray-100 flex justify-end gap-2">

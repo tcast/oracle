@@ -1130,6 +1130,90 @@ class PlaywrightService {
     }
   }
 
+  /**
+   * Browse a subreddit listing via the account's dedicated proxy to find threads.
+   * Reddit blocks JSON APIs through many proxies; scrape the public HTML feed instead.
+   * Login is not required for discovery (posting still logs in separately).
+   */
+  async listRedditSubredditPosts(accountId, subreddit, { sort = 'hot', limit = 20 } = {}) {
+    let browser;
+    let proxyId = null;
+    try {
+      await this.requireProxyForLive(accountId);
+      const result = await this.createBrowserForAccount(accountId, 2, { requireProxy: true });
+      browser = result.browser;
+      proxyId = result.proxyConfig?._proxyId || null;
+      const page = result.page;
+
+      try {
+        await this.restoreSession(page, 'reddit', accountId);
+      } catch { /* optional */ }
+
+      const cleanSub = String(subreddit || '').replace(/^r\//i, '');
+      const url = `https://www.reddit.com/r/${encodeURIComponent(cleanSub)}/${sort}/`;
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 90000 });
+      await this.humanLikeDelay(2000, 4000);
+      try { await this.randomScroll(page); } catch { /* ignore */ }
+
+      const posts = await page.evaluate((max) => {
+        const seen = new Set();
+        const out = [];
+        const anchors = Array.from(document.querySelectorAll('a[href*="/comments/"]'));
+        for (const a of anchors) {
+          const href = a.href || '';
+          const m = href.match(/reddit\.com\/r\/([^/]+)\/comments\/([a-z0-9]+)/i);
+          if (!m) continue;
+          const key = m[2];
+          if (seen.has(key)) continue;
+          seen.add(key);
+
+          let title = (a.textContent || '').trim();
+          const article = a.closest('article, shreddit-post, [data-testid="post-container"]');
+          if (!title || title.length < 5) {
+            const titleEl = article?.querySelector('h1, h2, h3, a[slot="title"], [id^="post-title"]');
+            title = (titleEl?.textContent || '').trim();
+          }
+          if (!title || title.length < 5) continue;
+          // Skip nav/sidebar noise
+          if (/^(comment|comments|share|award|reply)$/i.test(title)) continue;
+
+          let selftext = '';
+          const body = article?.querySelector('[data-click-id="text"], [slot="text-body"], .md');
+          if (body) selftext = (body.textContent || '').trim().slice(0, 1200);
+
+          const scoreAttr = article?.getAttribute?.('score')
+            || article?.getAttribute?.('data-score')
+            || '';
+          const commentsAttr = article?.getAttribute?.('comment-count')
+            || article?.getAttribute?.('data-comment-count')
+            || '';
+
+          out.push({
+            subreddit: m[1],
+            platform_post_id: key,
+            title,
+            selftext,
+            post_url: `https://www.reddit.com/r/${m[1]}/comments/${key}/`,
+            score: Number(scoreAttr) || 0,
+            num_comments: Number(commentsAttr) || 0,
+            created_utc: Date.now() / 1000,
+          });
+          if (out.length >= max) break;
+        }
+        return out;
+      }, limit);
+
+      return posts;
+    } finally {
+      if (browser) await browser.close();
+      this._untrackBrowser(accountId);
+      if (proxyId != null) {
+        try { await proxyService.updateProxyStats(proxyId, true); }
+        catch { /* ignore */ }
+      }
+    }
+  }
+
   /** Lightweight warm-up: browse home + a subreddit without posting. */
   async warmUpAccount(accountId, platform = 'reddit') {
     let browser;

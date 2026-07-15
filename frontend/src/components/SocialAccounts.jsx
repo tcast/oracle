@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import CreateAccountsForm from './CreateAccountsForm';
+import OrganicCommentsPanel from './OrganicCommentsPanel';
 import api from '../utils/api';
 
 const SocialAccounts = () => {
@@ -86,6 +87,8 @@ const SocialAccounts = () => {
           </div>
         </div>
       )}
+
+      <OrganicCommentsPanel />
 
       <div className="card p-4 sm:p-5">
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">

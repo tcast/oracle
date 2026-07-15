@@ -124,7 +124,8 @@ router.post('/account/:accountId/assign', authMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error('Error assigning proxies:', error);
-    res.status(500).json({ error: 'Failed to assign proxies' });
+    const status = /Exactly one proxy/.test(error.message) ? 400 : 500;
+    res.status(status).json({ error: error.message || 'Failed to assign proxies' });
   }
 });
 

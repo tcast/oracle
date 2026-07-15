@@ -21,6 +21,8 @@ const adLibraryRouter = require('./routes/adLibrary');
 const pool = require('./services/db'); // Import the shared database pool
 const postingService = require('./services/postingService');
 const taskQueue = require('./services/taskQueue');
+const organicCommentScheduler = require('./services/organicCommentScheduler');
+const organicCommentsRouter = require('./routes/organicComments');
 const commentingService = require('./services/commentingService');
 const playwrightService = require('./services/playwrightService');
 const subredditService = require('./services/subredditService');
@@ -1150,6 +1152,7 @@ app.use('/api/social-accounts', socialAccountsRouter);
 app.use('/api/campaigns', campaignsRouter);
 app.use('/api/health', healthRouter);
 app.use('/api/proxies', proxyRouter);
+app.use('/api/organic-comments', organicCommentsRouter);
 app.use('/api/email-accounts', emailAccountsRouter);
 app.use('/api/campaign-builder', campaignBuilderRouter);
 
@@ -1161,6 +1164,8 @@ process.on('SIGTERM', async () => {
   for (const campaignId of taskQueue.activeCampaigns) {
     await taskQueue.stopCampaign(campaignId);
   }
+
+  organicCommentScheduler.stop();
   
   // Clean up browser sessions
   await playwrightService.cleanup();
@@ -1185,6 +1190,7 @@ if (require('fs').existsSync(distPath)) {
 app.listen(port, async () => {
   await initDb();
   await taskQueue.initialize();
+  await organicCommentScheduler.start();
   console.log(`Server running on port ${port}`);
 });
 

@@ -29,6 +29,14 @@ router.get('/status', async (req, res) => {
       ),
     };
     
+    let proxyMapping = null;
+    try {
+      const proxyService = require('../services/proxyService');
+      proxyMapping = await proxyService.getProxyMappingStatus();
+    } catch (err) {
+      proxyMapping = { ok: false, error: err.message };
+    }
+
     // Return health information
     return res.json({
       status: 'healthy',
@@ -40,6 +48,7 @@ router.get('/status', async (req, res) => {
         database: dbStatus
       },
       oauth: oauthConfigured,
+      proxy_mapping: proxyMapping,
     });
   } catch (error) {
     console.error('Health check error:', error);

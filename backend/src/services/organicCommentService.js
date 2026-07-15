@@ -1,0 +1,466 @@
+const pool = require('./db');
+const openai = require('./openai');
+const playwrightService = require('./playwrightService');
+const proxyService = require('./proxyService');
+const organicDiscoveryService = require('./organicDiscoveryService');
+const commentingService = require('./commentingService');
+const { scoreAiLikeness, scoreSpamSignals } = require('./campaignReputationService');
+const { generationCompletionOptions } = require('../config/openaiModels');
+
+const BAD_OPENERS = [
+  /^great post[!.,\s]/i,
+  /^thanks for (sharing|this)[!.,\s]/i,
+  /^this is (so |very )?(interesting|insightful|important)[!.,\s]/i,
+  /^as an ai\b/i,
+  /^i completely agree[!.,\s]/i,
+  /^absolutely[!.,\s]/i,
+  /^couldn't agree more/i,
+];
+
+const URL_RE = /https?:\/\/|www\.|\bbit\.ly\b|\bt\.co\b/i;
+
+class OrganicCommentService {
+  async getSettings() {
+    const result = await pool.query('SELECT * FROM organic_comment_settings WHERE id = 1');
+    if (result.rows[0]) return result.rows[0];
+    const inserted = await pool.query(
+      `INSERT INTO organic_comment_settings (id, enabled)
+       VALUES (1, false)
+       ON CONFLICT (id) DO UPDATE SET updated_at = NOW()
+       RETURNING *`
+    );
+    return inserted.rows[0];
+  }
+
+  async updateSettings(patch) {
+    const current = await this.getSettings();
+    const enabled = patch.enabled !== undefined ? !!patch.enabled : current.enabled;
+    const min_per_day = patch.min_per_day ?? current.min_per_day;
+    const max_per_day = patch.max_per_day ?? current.max_per_day;
+    const quiet_hours_start = patch.quiet_hours_start ?? current.quiet_hours_start;
+    const quiet_hours_end = patch.quiet_hours_end ?? current.quiet_hours_end;
+    const max_concurrent = patch.max_concurrent ?? current.max_concurrent;
+
+    if (min_per_day < 1 || max_per_day < min_per_day || max_per_day > 5) {
+      throw new Error('min_per_day/max_per_day must satisfy 1 <= min <= max <= 5');
+    }
+
+    const result = await pool.query(
+      `UPDATE organic_comment_settings
+       SET enabled = $1,
+           min_per_day = $2,
+           max_per_day = $3,
+           quiet_hours_start = $4,
+           quiet_hours_end = $5,
+           max_concurrent = $6,
+           updated_at = NOW()
+       WHERE id = 1
+       RETURNING *`,
+      [enabled, min_per_day, max_per_day, quiet_hours_start, quiet_hours_end, max_concurrent]
+    );
+    return result.rows[0];
+  }
+
+  async getBrandBanTerms() {
+    try {
+      const result = await pool.query('SELECT name, website FROM brands');
+      const terms = new Set();
+      for (const row of result.rows) {
+        if (row.name) terms.add(String(row.name).toLowerCase());
+        if (row.website) {
+          try {
+            const host = new URL(
+              row.website.startsWith('http') ? row.website : `https://${row.website}`
+            ).hostname.replace(/^www\./, '');
+            if (host) terms.add(host);
+          } catch { /* ignore */ }
+        }
+      }
+      return [...terms].filter((t) => t && t.length >= 3);
+    } catch {
+      return [];
+    }
+  }
+
+  async ensureJob(accountId) {
+    const existing = await pool.query(
+      'SELECT * FROM organic_comment_jobs WHERE social_account_id = $1',
+      [accountId]
+    );
+    if (existing.rows[0]) return existing.rows[0];
+
+    const settings = await this.getSettings();
+    const target = this.rollDailyTarget(settings);
+    const next = this.computeNextDue(settings, 0);
+
+    const inserted = await pool.query(
+      `INSERT INTO organic_comment_jobs
+         (social_account_id, enabled, next_due_at, comments_today, day_key, daily_target, status)
+       VALUES ($1, true, $2, 0, CURRENT_DATE, $3, 'idle')
+       ON CONFLICT (social_account_id) DO UPDATE SET updated_at = NOW()
+       RETURNING *`,
+      [accountId, next, target]
+    );
+    return inserted.rows[0];
+  }
+
+  rollDailyTarget(settings) {
+    const min = settings.min_per_day || 1;
+    const max = settings.max_per_day || 3;
+    return min + Math.floor(Math.random() * (max - min + 1));
+  }
+
+  inQuietHours(settings, date = new Date()) {
+    const hour = date.getHours();
+    const start = settings.quiet_hours_start ?? 1;
+    const end = settings.quiet_hours_end ?? 7;
+    if (start === end) return false;
+    if (start < end) return hour >= start && hour < end;
+    return hour >= start || hour < end;
+  }
+
+  computeNextDue(settings, commentsToday, warnings = {}) {
+    const now = new Date();
+    const target = warnings.daily_target || settings.max_per_day || 3;
+
+    // Min gap 2–6h, push out of quiet hours
+    let gapMs = (2 + Math.random() * 4) * 60 * 60 * 1000;
+    if (commentsToday === 0 && !warnings.immediate) {
+      // First comment of day: sometimes later morning/afternoon
+      gapMs = Math.random() * 4 * 60 * 60 * 1000;
+    }
+
+    let due = new Date(now.getTime() + gapMs);
+    let guard = 0;
+    while (this.inQuietHours(settings, due) && guard < 24) {
+      due = new Date(due.getTime() + 60 * 60 * 1000);
+      guard += 1;
+    }
+
+    // Don't schedule past end of day if target already reachable
+    const endOfDay = new Date(now);
+    endOfDay.setHours(22, 30, 0, 0);
+    if (due > endOfDay && commentsToday < target) {
+      // park until tomorrow morning after quiet hours
+      const tomorrow = new Date(now);
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      tomorrow.setHours((settings.quiet_hours_end ?? 7) + Math.floor(Math.random() * 3), Math.floor(Math.random() * 60), 0, 0);
+      return tomorrow;
+    }
+    return due;
+  }
+
+  async refreshDayState(job, settings) {
+    const today = new Date().toISOString().slice(0, 10);
+    const dayKey = job.day_key ? new Date(job.day_key).toISOString().slice(0, 10) : null;
+    if (dayKey === today && job.daily_target) return job;
+
+    const target = this.rollDailyTarget(settings);
+    const next = this.computeNextDue(settings, 0);
+    const result = await pool.query(
+      `UPDATE organic_comment_jobs
+       SET day_key = CURRENT_DATE,
+           comments_today = 0,
+           daily_target = $2,
+           next_due_at = $3,
+           status = 'idle',
+           updated_at = NOW()
+       WHERE id = $1
+       RETURNING *`,
+      [job.id, target, next]
+    );
+    return result.rows[0];
+  }
+
+  parsePersona(account) {
+    let traits = account.persona_traits;
+    if (typeof traits === 'string') {
+      try { traits = JSON.parse(traits); } catch { traits = {}; }
+    }
+    return traits || {};
+  }
+
+  async generateOrganicComment(account, thread) {
+    const persona = this.parsePersona(account);
+    const brandTerms = await this.getBrandBanTerms();
+
+    const system = `You write short Reddit comments that sound like a real person, not a brand or an AI.
+
+Hard rules:
+- Purely helpful / conversational. Never promote products, companies, services, waitlists, or links.
+- Never mention these brands/products: ${brandTerms.slice(0, 40).join(', ') || '(none)'}.
+- No URLs. No hashtags. No "Great post!". No "As an AI".
+- 15–45 words. Prefer 1–2 sentences OR one specific question.
+- React to ONE concrete detail from the title/body. Add a small personal take or clarifying question.
+- Sound mid-conversation, slightly imperfect is fine.
+- Ban marketing tone, cheerleading, and corporate polish.
+
+Persona:
+- writingStyle: ${persona.writingStyle || 'casual'}
+- tone: ${persona.tone || 'neutral'}
+- quirks: ${(persona.quirks || []).join(', ') || 'none'}
+- expertise: ${(persona.expertise || []).join(', ') || 'general'}
+- engagementStyle: ${persona.engagementStyle || 'questioner'}
+- responseLength: concise`;
+
+    const user = `Subreddit: r/${thread.subreddit}
+Title: ${thread.title}
+Body excerpt: ${thread.selftext || '(no body — title-only post)'}
+
+Write only the comment text.`;
+
+    const completion = await openai.chat.completions.create(
+      generationCompletionOptions({
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: user },
+        ],
+      })
+    );
+
+    let content = (completion.choices?.[0]?.message?.content || '').trim();
+    content = content.replace(/^["']|["']$/g, '').trim();
+    return content;
+  }
+
+  async validateComment(content, brandTerms = []) {
+    const reasons = [];
+    if (!content || content.length < 12) reasons.push('too_short');
+    if (content.length > 320) reasons.push('too_long');
+    if (URL_RE.test(content)) reasons.push('contains_url');
+    for (const opener of BAD_OPENERS) {
+      if (opener.test(content)) {
+        reasons.push('bad_opener');
+        break;
+      }
+    }
+    const lower = content.toLowerCase();
+    for (const term of brandTerms) {
+      if (term && lower.includes(term)) {
+        reasons.push(`brand:${term}`);
+        break;
+      }
+    }
+
+    const ai = scoreAiLikeness(content);
+    const spam = scoreSpamSignals(content, {});
+    if (ai.ai_likeness > 0.45) reasons.push('ai_likeness');
+    if (spam.spam_score > 0.3) reasons.push('spam_score');
+
+    return {
+      ok: reasons.length === 0,
+      reasons,
+      ai_likeness: ai.ai_likeness,
+      spam_score: spam.spam_score,
+    };
+  }
+
+  async generateWithGate(account, thread, attempts = 3) {
+    const brandTerms = await this.getBrandBanTerms();
+    let last = null;
+    for (let i = 0; i < attempts; i++) {
+      const content = await this.generateOrganicComment(account, thread);
+      const gate = await this.validateComment(content, brandTerms);
+      last = { content, gate };
+      if (gate.ok) return last;
+    }
+    return last;
+  }
+
+  async listEligibleAccounts() {
+    const result = await pool.query(
+      `SELECT sa.*
+       FROM social_accounts sa
+       WHERE sa.platform = 'reddit'
+         AND COALESCE(sa.is_simulated, false) = false
+         AND sa.status = 'active'
+         AND COALESCE(sa.credentials->>'password', '') NOT IN ('', 'default_password')
+         AND COALESCE(sa.credentials->>'needs_signup', 'false') != 'true'
+         AND EXISTS (
+           SELECT 1 FROM social_account_proxies sap
+           WHERE sap.social_account_id = sa.id AND sap.is_active = true
+         )`
+    );
+    return result.rows;
+  }
+
+  async getDashboard() {
+    const settings = await this.getSettings();
+    const mapping = await proxyService.getProxyMappingStatus();
+    const jobs = await pool.query(
+      `SELECT j.*, sa.username, sa.status AS account_status
+       FROM organic_comment_jobs j
+       JOIN social_accounts sa ON sa.id = j.social_account_id
+       ORDER BY j.next_due_at NULLS LAST`
+    );
+    const recent = await pool.query(
+      `SELECT oc.*, sa.username
+       FROM organic_comments oc
+       JOIN social_accounts sa ON sa.id = oc.social_account_id
+       ORDER BY oc.created_at DESC
+       LIMIT 50`
+    );
+    const todayStats = await pool.query(
+      `SELECT COUNT(*)::int AS posted_today
+       FROM organic_comments
+       WHERE status = 'posted' AND created_at::date = CURRENT_DATE`
+    );
+
+    return {
+      settings,
+      proxy_mapping: mapping,
+      jobs: jobs.rows,
+      recent: recent.rows,
+      posted_today: todayStats.rows[0]?.posted_today || 0,
+    };
+  }
+
+  async setAccountEnabled(accountId, enabled) {
+    await this.ensureJob(accountId);
+    const result = await pool.query(
+      `UPDATE organic_comment_jobs
+       SET enabled = $2, updated_at = NOW()
+       WHERE social_account_id = $1
+       RETURNING *`,
+      [accountId, !!enabled]
+    );
+    return result.rows[0];
+  }
+
+  async runOneForAccount(account, { dryRun = false } = {}) {
+    const settings = await this.getSettings();
+    let job = await this.ensureJob(account.id);
+    job = await this.refreshDayState(job, settings);
+
+    if (!job.enabled) {
+      return { skipped: true, reason: 'account_disabled' };
+    }
+    if (job.comments_today >= (job.daily_target || settings.max_per_day)) {
+      return { skipped: true, reason: 'daily_cap' };
+    }
+    if (job.next_due_at && new Date(job.next_due_at) > new Date()) {
+      return { skipped: true, reason: 'not_due' };
+    }
+    if (this.inQuietHours(settings)) {
+      const next = this.computeNextDue(settings, job.comments_today, { daily_target: job.daily_target });
+      await pool.query(
+        `UPDATE organic_comment_jobs SET next_due_at = $2, status = 'idle', updated_at = NOW() WHERE id = $1`,
+        [job.id, next]
+      );
+      return { skipped: true, reason: 'quiet_hours' };
+    }
+
+    await pool.query(
+      `UPDATE organic_comment_jobs SET status = 'running', last_error = NULL, updated_at = NOW() WHERE id = $1`,
+      [job.id]
+    );
+
+    const proxies = await proxyService.getAccountProxies(account.id, true);
+    if (proxies.length !== 1) {
+      const msg = proxies.length === 0
+        ? 'No dedicated proxy assigned'
+        : 'Account has multiple active proxies; enforce 1:1';
+      await pool.query(
+        `UPDATE organic_comment_jobs SET status = 'error', last_error = $2, updated_at = NOW() WHERE id = $1`,
+        [job.id, msg]
+      );
+      return { skipped: true, reason: 'proxy', error: msg };
+    }
+
+    try {
+      // Ensure persona exists
+      if (!account.persona_traits) {
+        const traits = await commentingService.generatePersonalityTraits();
+        await pool.query(
+          'UPDATE social_accounts SET persona_traits = $2 WHERE id = $1',
+          [account.id, JSON.stringify(traits)]
+        );
+        account.persona_traits = traits;
+      }
+
+      const thread = await organicDiscoveryService.findCommentableThread(account);
+      const generated = await this.generateWithGate(account, thread, 3);
+      if (!generated?.gate?.ok) {
+        const reason = (generated?.gate?.reasons || ['gate_failed']).join(',');
+        // Soft skip: bump due later, do NOT burn daily budget
+        const next = this.computeNextDue(settings, job.comments_today, { daily_target: job.daily_target });
+        await pool.query(
+          `UPDATE organic_comment_jobs
+           SET status = 'idle', last_error = $2, next_due_at = $3, updated_at = NOW()
+           WHERE id = $1`,
+          [job.id, `gate_failed:${reason}`, next]
+        );
+        return { skipped: true, reason: 'gate_failed', details: generated?.gate, thread };
+      }
+
+      const content = generated.content;
+      let platformCommentId = null;
+      let status = 'simulated';
+
+      if (!dryRun) {
+        await playwrightService.requireProxyForLive(account.id);
+        platformCommentId = await playwrightService.postComment(
+          'reddit',
+          account.id,
+          thread.post_url,
+          content,
+          null,
+          { requireProxy: true }
+        );
+        status = 'posted';
+      }
+
+      const inserted = await pool.query(
+        `INSERT INTO organic_comments
+           (social_account_id, proxy_id, subreddit, post_url, post_title, content, status,
+            ai_likeness, spam_score, platform_comment_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+         RETURNING *`,
+        [
+          account.id,
+          proxies[0].id,
+          thread.subreddit,
+          thread.post_url,
+          thread.title,
+          content,
+          status,
+          generated.gate.ai_likeness,
+          generated.gate.spam_score,
+          platformCommentId,
+        ]
+      );
+
+      const commentsToday = job.comments_today + 1;
+      const next = this.computeNextDue(settings, commentsToday, { daily_target: job.daily_target });
+      await pool.query(
+        `UPDATE organic_comment_jobs
+         SET comments_today = $2,
+             next_due_at = $3,
+             status = 'idle',
+             last_error = NULL,
+             updated_at = NOW()
+         WHERE id = $1`,
+        [job.id, commentsToday, next]
+      );
+
+      return {
+        success: true,
+        comment: inserted.rows[0],
+        thread,
+        comments_today: commentsToday,
+        next_due_at: next,
+      };
+    } catch (error) {
+      const next = this.computeNextDue(settings, job.comments_today, { daily_target: job.daily_target });
+      await pool.query(
+        `UPDATE organic_comment_jobs
+         SET status = 'error', last_error = $2, next_due_at = $3, updated_at = NOW()
+         WHERE id = $1`,
+        [job.id, error.message, next]
+      );
+      return { skipped: true, reason: 'error', error: error.message };
+    }
+  }
+}
+
+module.exports = new OrganicCommentService();
