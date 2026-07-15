@@ -42,6 +42,15 @@ router.get('/', async (req, res) => {
         email,
         status,
         persona_traits,
+        total_karma,
+        post_karma,
+        comment_karma,
+        post_count,
+        comment_count,
+        likes_count,
+        dislikes_count,
+        stats_audited_at,
+        stats_audit_error,
         CASE 
           WHEN credentials->>'password' = 'default_password' THEN true 
           ELSE false 

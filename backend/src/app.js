@@ -23,6 +23,8 @@ const postingService = require('./services/postingService');
 const taskQueue = require('./services/taskQueue');
 const organicCommentScheduler = require('./services/organicCommentScheduler');
 const organicCommentsRouter = require('./routes/organicComments');
+const accountStatsScheduler = require('./services/accountStatsScheduler');
+const accountStatsRouter = require('./routes/accountStats');
 const commentingService = require('./services/commentingService');
 const playwrightService = require('./services/playwrightService');
 const subredditService = require('./services/subredditService');
@@ -1153,6 +1155,7 @@ app.use('/api/campaigns', campaignsRouter);
 app.use('/api/health', healthRouter);
 app.use('/api/proxies', proxyRouter);
 app.use('/api/organic-comments', organicCommentsRouter);
+app.use('/api/account-stats', accountStatsRouter);
 app.use('/api/email-accounts', emailAccountsRouter);
 app.use('/api/campaign-builder', campaignBuilderRouter);
 
@@ -1166,6 +1169,7 @@ process.on('SIGTERM', async () => {
   }
 
   organicCommentScheduler.stop();
+  accountStatsScheduler.stop();
   
   // Clean up browser sessions
   await playwrightService.cleanup();
@@ -1191,6 +1195,7 @@ app.listen(port, async () => {
   await initDb();
   await taskQueue.initialize();
   await organicCommentScheduler.start();
+  await accountStatsScheduler.start();
   console.log(`Server running on port ${port}`);
 });
 

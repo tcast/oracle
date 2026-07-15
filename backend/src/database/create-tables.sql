@@ -95,6 +95,15 @@ CREATE TABLE IF NOT EXISTS social_accounts (
   last_used_at TIMESTAMP,
   warmed_up_at TIMESTAMP,
   warmup_status VARCHAR(50) DEFAULT 'new',
+  total_karma INTEGER,
+  post_karma INTEGER,
+  comment_karma INTEGER,
+  post_count INTEGER,
+  comment_count INTEGER,
+  likes_count INTEGER,
+  dislikes_count INTEGER,
+  stats_audited_at TIMESTAMP,
+  stats_audit_error TEXT,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -425,4 +434,31 @@ CREATE TABLE IF NOT EXISTS organic_comments (
   platform_comment_id VARCHAR(255),
   error TEXT,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS social_account_stats_audits (
+  id SERIAL PRIMARY KEY,
+  social_account_id INTEGER NOT NULL REFERENCES social_accounts(id) ON DELETE CASCADE,
+  audited_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  total_karma INTEGER,
+  post_karma INTEGER,
+  comment_karma INTEGER,
+  post_count INTEGER,
+  comment_count INTEGER,
+  likes_count INTEGER,
+  dislikes_count INTEGER,
+  status VARCHAR(50) NOT NULL DEFAULT 'ok',
+  error TEXT,
+  raw JSONB DEFAULT '{}'::jsonb
+);
+
+CREATE TABLE IF NOT EXISTS account_stats_audit_settings (
+  id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+  enabled BOOLEAN NOT NULL DEFAULT true,
+  run_hour_local INTEGER NOT NULL DEFAULT 3,
+  timezone VARCHAR(64) NOT NULL DEFAULT 'America/New_York',
+  last_run_date DATE,
+  last_run_at TIMESTAMP,
+  last_run_summary JSONB DEFAULT '{}'::jsonb,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

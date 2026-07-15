@@ -8,7 +8,12 @@ const statusClass = (status) => {
   return 'badge-neutral';
 };
 
-const OrganicCommentsPanel = ({ standalone = false }) => {
+const OrganicCommentsPanel = ({
+  standalone = false,
+  showControls = true,
+  showLog = true,
+  showSchedule = true,
+}) => {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -86,6 +91,7 @@ const OrganicCommentsPanel = ({ standalone = false }) => {
         </div>
       )}
 
+      {showControls && (
       <div className="card p-5">
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
           <div>
@@ -132,7 +138,9 @@ const OrganicCommentsPanel = ({ standalone = false }) => {
           </div>
         </div>
       </div>
+      )}
 
+      {showLog && (
       <div className="card overflow-hidden">
         <div className="px-5 py-3 border-b border-gray-100 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
           <h2 className="text-sm font-semibold text-gray-900">Comment log</h2>
@@ -209,8 +217,9 @@ const OrganicCommentsPanel = ({ standalone = false }) => {
           </div>
         )}
       </div>
+      )}
 
-      {jobs.length > 0 && (
+      {showSchedule && (
         <div className="card overflow-hidden">
           <div className="px-5 py-3 border-b border-gray-100 text-sm font-semibold text-gray-900">
             Per-account schedule
@@ -228,20 +237,28 @@ const OrganicCommentsPanel = ({ standalone = false }) => {
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-50">
-                {jobs.map((job) => (
-                  <tr key={job.id}>
-                    <td className="px-5 py-2 text-gray-900">{job.username}</td>
-                    <td className="px-5 py-2 text-gray-700">{job.comments_today ?? 0}</td>
-                    <td className="px-5 py-2 text-gray-700">{job.daily_target ?? '—'}</td>
-                    <td className="px-5 py-2 text-gray-500 whitespace-nowrap">{formatWhen(job.next_due_at)}</td>
-                    <td className="px-5 py-2">
-                      <span className="badge badge-neutral">{job.enabled === false ? 'paused' : job.status}</span>
-                    </td>
-                    <td className="px-5 py-2 text-xs text-red-600 max-w-xs truncate" title={job.last_error || ''}>
-                      {job.last_error || '—'}
+                {jobs.length === 0 ? (
+                  <tr>
+                    <td colSpan={6} className="px-5 py-8 text-center text-gray-500">
+                      No schedule jobs yet — they appear when organic commenting is on.
                     </td>
                   </tr>
-                ))}
+                ) : (
+                  jobs.map((job) => (
+                    <tr key={job.id}>
+                      <td className="px-5 py-2 text-gray-900">{job.username}</td>
+                      <td className="px-5 py-2 text-gray-700">{job.comments_today ?? 0}</td>
+                      <td className="px-5 py-2 text-gray-700">{job.daily_target ?? '—'}</td>
+                      <td className="px-5 py-2 text-gray-500 whitespace-nowrap">{formatWhen(job.next_due_at)}</td>
+                      <td className="px-5 py-2">
+                        <span className="badge badge-neutral">{job.enabled === false ? 'paused' : job.status}</span>
+                      </td>
+                      <td className="px-5 py-2 text-xs text-red-600 max-w-xs truncate" title={job.last_error || ''}>
+                        {job.last_error || '—'}
+                      </td>
+                    </tr>
+                  ))
+                )}
               </tbody>
             </table>
           </div>
