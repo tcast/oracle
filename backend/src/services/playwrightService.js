@@ -383,12 +383,23 @@ class PlaywrightService {
     try {
       switch (platform) {
         case 'reddit':
-          await page.goto('https://www.reddit.com/', { waitUntil: 'domcontentloaded', timeout: 15000 });
-          await this.humanLikeDelay(500, 1000);
-          const redditUser = await page.$(
-            '[aria-label="User menu"], [aria-label="Expand user menu"], #USER_DROPDOWN_ID, button:has-text("Create")'
-          );
-          return !!redditUser;
+          await page.goto('https://www.reddit.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+          await this.humanLikeDelay(800, 1500);
+          // New Reddit often hides user-menu selectors inside custom elements / shadow DOM.
+          // Prefer content signals that remain when logged in.
+          const redditLoggedIn = await page.evaluate(() => {
+            const text = (document.body?.innerText || '').slice(0, 4000);
+            if (/Expand user menu|Open inbox|Create post/i.test(text)) return true;
+            if (document.querySelector('#USER_DROPDOWN_ID, [aria-label="Expand user menu"], [aria-label="User menu"]')) {
+              return true;
+            }
+            // Logged-out pages advertise login/signup prominently
+            if (/Log( ?In| in)|Sign Up/i.test(text) && /Advertise on Reddit/i.test(text) && !/Open inbox/i.test(text)) {
+              return false;
+            }
+            return false;
+          });
+          return !!redditLoggedIn;
         case 'x':
           await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 15000 });
           await this.humanLikeDelay(500, 1000);
@@ -487,10 +498,15 @@ class PlaywrightService {
       }
       await this.humanLikeDelay(5000, 8000);
 
-      const loggedIn = await page.$(
+      const loggedInEl = await page.$(
         '[aria-label="User menu"], [aria-label="Expand user menu"], #USER_DROPDOWN_ID, button:has-text("Create"), faceplate-tracker[source="user_dropdown"]'
       );
-      if (loggedIn) return true;
+      if (loggedInEl) return true;
+      const loggedInByText = await page.evaluate(() => {
+        const text = (document.body?.innerText || '').slice(0, 4000);
+        return /Expand user menu|Open inbox|Create post/i.test(text);
+      });
+      if (loggedInByText) return true;
 
       const url = page.url();
       const stillOnLogin = url.includes('/login');
