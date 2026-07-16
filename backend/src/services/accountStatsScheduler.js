@@ -1,41 +1,19 @@
 const accountStatsService = require('./accountStatsService');
 
+/**
+ * Nightly account-stats audit tick. Scheduling is owned by durableQueue (BullMQ/Redis).
+ */
 class AccountStatsScheduler {
   constructor() {
-    this.timeoutId = null;
-    this.running = false;
     this.inFlight = false;
   }
 
   async start() {
-    if (this.running) return;
-    this.running = true;
-    console.log('Account stats audit scheduler started (nightly ~3am America/New_York)');
-    this.scheduleNext(20000);
+    // Loop is started by durableQueue.start()
   }
 
   stop() {
-    this.running = false;
-    if (this.timeoutId) {
-      clearTimeout(this.timeoutId);
-      this.timeoutId = null;
-    }
-  }
-
-  scheduleNext(overrideMs = null) {
-    if (!this.running) return;
-    if (this.timeoutId) clearTimeout(this.timeoutId);
-    // Check every ~10–15 minutes
-    const delay = overrideMs != null ? overrideMs : (10 + Math.random() * 5) * 60 * 1000;
-    this.timeoutId = setTimeout(async () => {
-      try {
-        await this.tick();
-      } catch (err) {
-        console.error('Account stats scheduler tick failed:', err.message);
-      } finally {
-        this.scheduleNext();
-      }
-    }, delay);
+    // Loop is stopped by durableQueue.stop()
   }
 
   async tick() {

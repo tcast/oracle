@@ -8,7 +8,7 @@
 
 ## Scheduling/orchestration (learn from Postiz)
 - [Postiz](https://github.com/gitroomhq/postiz-app) is API/OAuth-based compliant posting (explicitly no scraping/automation), so not a drop-in for our stealth organic-commenting model.
-- Worth borrowing:
-  - **Durable job orchestration** (Postiz uses Temporal; formerly BullMQ) instead of our in-process `setTimeout` schedulers, which lose state on restart. Would make organic + nightly audit survive crashes/reboots.
+- **Done:** organic comments + nightly account-stats audits use **BullMQ + Redis** (`backend/src/services/durableQueue.js`). Delayed jobs live in Redis and survive backend restarts; `/api/health/status` exposes `durable_queue` counts.
+- Still worth borrowing later:
   - **Abstract provider pattern** for multi-network posting (we have `platformHandlers`; could formalize).
   - **Visual content calendar + analytics** UI ideas.

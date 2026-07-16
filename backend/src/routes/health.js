@@ -37,6 +37,13 @@ router.get('/status', async (req, res) => {
       proxyMapping = { ok: false, error: err.message };
     }
 
+    let durableQueue = null;
+    try {
+      durableQueue = await require('../services/durableQueue').getStatus();
+    } catch (err) {
+      durableQueue = { started: false, error: err.message };
+    }
+
     // Return health information
     return res.json({
       status: 'healthy',
@@ -45,10 +52,12 @@ router.get('/status', async (req, res) => {
       timestamp: new Date().toISOString(),
       services: {
         api: 'online',
-        database: dbStatus
+        database: dbStatus,
+        redis: durableQueue?.started ? 'online' : 'offline',
       },
       oauth: oauthConfigured,
       proxy_mapping: proxyMapping,
+      durable_queue: durableQueue,
     });
   } catch (error) {
     console.error('Health check error:', error);

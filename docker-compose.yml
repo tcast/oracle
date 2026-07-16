@@ -17,6 +17,21 @@ services:
       timeout: 5s
       retries: 5
 
+  redis:
+    image: redis:7-alpine
+    container_name: whisper-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   backend:
     build: ./backend
     container_name: whisper-backend
@@ -32,6 +47,8 @@ services:
       - DB_NAME=whisper
       - DB_SSL=false
       - DATABASE_URL=postgresql://postgres:password@postgres:5432/whisper
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
       - JWT_SECRET=1ac86a81f6082c1fe8394a6af49cd7ad85263d47b48d8af30db1e78b5de91d9c
       - FIVESIM_API_KEY=eyJhbGciOiJSUzUxMiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3NzIzOTg2NDksImlhdCI6MTc0MDg2MjY0OSwicmF5IjoiZDgxODJiZTU0NTc5MjMyMWRmNDhiODY3YzQ4M2RkZmEiLCJzdWIiOjMwNjQ5OTZ9.FjGc--NXbuM_RSbceN4TqvR1oJzx8UiGjb5rFbiuGlgT9FOxB_QHdS_K27xiUZOhDP12QNFOaQDNDcrlKXrTA2pE1igK8yVPssR9G1x398MVCW-VsXahKL3RpCg-kXCRKpSahO5xTe-VSElVm6dTbDc6VaCLMoGI7bjd7-9ajgM-bXqgUxu7ScELlgoDEXUxBSr5vjqRWJodl-GGaTxp1n-wl1TU1dEdYPG1KaDokv35FzAM2TZnvDxgZWoaigxAB4GFrDpXH3_jJQyblOxn29p-fj-57fimRD2_Vj-bQqdvXytDTI9X67e3A427UzegvyhAlhMT1WWBzmYfwRVgDA
       - TWOCAPTCHA_API_KEY=acde364c7433b278656840ece205f91a
@@ -42,6 +59,8 @@ services:
     restart: unless-stopped
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/api/health/status"]
@@ -67,5 +86,6 @@ services:
 
 volumes:
   pgdata:
+  redisdata:
   uploads:
     driver: local

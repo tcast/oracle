@@ -1,46 +1,20 @@
 const organicCommentService = require('./organicCommentService');
 
+/**
+ * Organic comment tick logic. Scheduling is owned by durableQueue (BullMQ/Redis)
+ * so delayed jobs survive backend restarts.
+ */
 class OrganicCommentScheduler {
   constructor() {
-    this.timeoutId = null;
-    this.running = false;
     this.activeRuns = 0;
   }
 
   async start() {
-    if (this.running) return;
-    this.running = true;
-    console.log('Organic comment scheduler started');
-    this.scheduleNext(5000);
+    // Loop is started by durableQueue.start()
   }
 
   stop() {
-    this.running = false;
-    if (this.timeoutId) {
-      clearTimeout(this.timeoutId);
-      this.timeoutId = null;
-    }
-    console.log('Organic comment scheduler stopped');
-  }
-
-  scheduleNext(overrideMs = null) {
-    if (!this.running) return;
-    if (this.timeoutId) clearTimeout(this.timeoutId);
-
-    // 15–30 min base with jitter
-    const base = 15 * 60 * 1000;
-    const jitter = Math.random() * 15 * 60 * 1000;
-    const delay = overrideMs != null ? overrideMs : base + jitter;
-
-    this.timeoutId = setTimeout(async () => {
-      try {
-        await this.tick();
-      } catch (err) {
-        console.error('Organic scheduler tick failed:', err.message);
-      } finally {
-        this.scheduleNext();
-      }
-    }, delay);
+    // Loop is stopped by durableQueue.stop()
   }
 
   async tick() {
@@ -56,7 +30,6 @@ class OrganicCommentScheduler {
     }
 
     const accounts = await organicCommentService.listEligibleAccounts();
-    // Shuffle for fairness
     for (let i = accounts.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [accounts[i], accounts[j]] = [accounts[j], accounts[i]];
@@ -89,12 +62,15 @@ class OrganicCommentScheduler {
     );
 
     if (results.length) {
-      console.log(`Organic comments tick: ${results.length} job(s)`, results.map((r) => ({
-        accountId: r.accountId,
-        success: r.success,
-        skipped: r.skipped,
-        reason: r.reason,
-      })));
+      console.log(
+        `Organic comments tick: ${results.length} job(s)`,
+        results.map((r) => ({
+          accountId: r.accountId,
+          success: r.success,
+          skipped: r.skipped,
+          reason: r.reason,
+        }))
+      );
     }
 
     return { ran: results.length, results };

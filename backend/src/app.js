@@ -21,9 +21,8 @@ const adLibraryRouter = require('./routes/adLibrary');
 const pool = require('./services/db'); // Import the shared database pool
 const postingService = require('./services/postingService');
 const taskQueue = require('./services/taskQueue');
-const organicCommentScheduler = require('./services/organicCommentScheduler');
+const durableQueue = require('./services/durableQueue');
 const organicCommentsRouter = require('./routes/organicComments');
-const accountStatsScheduler = require('./services/accountStatsScheduler');
 const accountStatsRouter = require('./routes/accountStats');
 const commentingService = require('./services/commentingService');
 const playwrightService = require('./services/playwrightService');
@@ -1168,8 +1167,7 @@ process.on('SIGTERM', async () => {
     await taskQueue.stopCampaign(campaignId);
   }
 
-  organicCommentScheduler.stop();
-  accountStatsScheduler.stop();
+  await durableQueue.stop();
   
   // Clean up browser sessions
   await playwrightService.cleanup();
@@ -1194,8 +1192,12 @@ if (require('fs').existsSync(distPath)) {
 app.listen(port, async () => {
   await initDb();
   await taskQueue.initialize();
-  await organicCommentScheduler.start();
-  await accountStatsScheduler.start();
+  try {
+    await durableQueue.start();
+  } catch (err) {
+    console.error('Durable queue failed to start (Redis required):', err.message);
+    throw err;
+  }
   console.log(`Server running on port ${port}`);
 });
 
