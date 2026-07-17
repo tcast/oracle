@@ -1886,8 +1886,17 @@ class PlaywrightService {
         await this.simulateHumanBehavior(page);
 
         const userInput = await page.waitForSelector(
-          'input[name="username"], input[aria-label="Phone number, username, or email"], input[aria-label*="username" i]',
-          { timeout: 30000, state: 'visible' }
+          [
+            'input[name="username"]',
+            'input[aria-label="Phone number, username, or email"]',
+            'input[aria-label="Mobile number, username or email"]',
+            'input[aria-label*="username" i]',
+            'input[aria-label*="Mobile number" i]',
+            'input[aria-label*="email" i]',
+            'form input[type="text"]',
+            'input[type="text"]',
+          ].join(', '),
+          { timeout: 30000, state: 'attached' }
         ).catch(() => null);
         if (!userInput) {
           const bodyHint = await page.evaluate(() => (document.body?.innerText || '').slice(0, 500)).catch(() => '');
@@ -1897,14 +1906,21 @@ class PlaywrightService {
           continue;
         }
 
+        // Force visible interaction even if IG animates inputs
+        await userInput.scrollIntoViewIfNeeded().catch(() => {});
         await userInput.click({ force: true });
         await userInput.fill('');
         await userInput.type(loginId, { delay: 35 });
         await this.humanLikeDelay(400, 900);
 
         const passInput = await page.waitForSelector(
-          'input[name="password"], input[type="password"]',
-          { timeout: 10000, state: 'visible' }
+          [
+            'input[name="password"]',
+            'input[aria-label="Password"]',
+            'input[aria-label*="Password" i]',
+            'input[type="password"]',
+          ].join(', '),
+          { timeout: 10000, state: 'attached' }
         );
         await passInput.click({ force: true });
         await passInput.fill('');
