@@ -158,13 +158,14 @@ function pickRandom(arr) {
  * Prefer Android when proxy looks mobile (ProxyBase sticky mobile pools).
  * Otherwise ~55% Android / 45% desktop so the fleet is mixed.
  */
-function pickProfileTemplate({ preferMobile = false } = {}) {
+function pickProfileTemplate({ preferMobile = false, forceDesktop = false } = {}) {
+  if (forceDesktop) return pickRandom(DESKTOP_PROFILES);
   if (preferMobile) return pickRandom(ANDROID_PROFILES);
   return Math.random() < 0.55 ? pickRandom(ANDROID_PROFILES) : pickRandom(DESKTOP_PROFILES);
 }
 
-function buildStickyProfile({ preferMobile = false } = {}) {
-  const base = pickProfileTemplate({ preferMobile });
+function buildStickyProfile({ preferMobile = false, forceDesktop = false } = {}) {
+  const base = pickProfileTemplate({ preferMobile, forceDesktop });
   return {
     ...base,
     timezoneId: pickRandom(TIMEZONES),

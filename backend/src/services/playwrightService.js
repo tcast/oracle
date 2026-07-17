@@ -33,7 +33,7 @@ class PlaywrightService {
   /**
    * Sticky fingerprint per account. Prefer Android when the assigned proxy is mobile.
    */
-  async getOrCreateDeviceProfile(accountId, { preferMobile = false } = {}) {
+  async getOrCreateDeviceProfile(accountId, { preferMobile = false, forceDesktop = false } = {}) {
     const existing = await pool.query(
       'SELECT device_profile FROM social_accounts WHERE id = $1',
       [accountId]
@@ -42,11 +42,22 @@ class PlaywrightService {
     if (typeof profile === 'string') {
       try { profile = JSON.parse(profile); } catch { profile = null; }
     }
-    if (profile && profile.userAgent && profile.viewport) {
+
+    // Reassign if missing, or if we must force desktop but currently have mobile
+    const needsReassign =
+      !profile ||
+      !profile.userAgent ||
+      !profile.viewport ||
+      (forceDesktop && profile.platform === 'android');
+
+    if (!needsReassign) {
       return profile;
     }
 
-    profile = buildStickyProfile({ preferMobile });
+    profile = buildStickyProfile({
+      preferMobile: forceDesktop ? false : preferMobile,
+      forceDesktop,
+    });
     await pool.query(
       'UPDATE social_accounts SET device_profile = $2 WHERE id = $1',
       [accountId, JSON.stringify(profile)]
@@ -284,14 +295,23 @@ class PlaywrightService {
           console.log(`Using proxy for account ${accountId} (attempt ${attempt + 1}):`, proxyConfig.server);
         }
 
-        // Prefer Android fingerprints for mobile ProxyBase pools
+        // Prefer Android for mobile ProxyBase pools — except X, whose mobile web
+        // aggressively pushes the app and breaks login/automation.
         let preferMobile = false;
+        let forceDesktop = false;
         try {
-          const proxies = await proxyService.getAccountProxies(accountId, false);
-          preferMobile = proxies.some((p) => proxyService.isMobileProxy(p));
+          const account = await this.getAccount(accountId);
+          forceDesktop = account.platform === 'x';
+          if (!forceDesktop) {
+            const proxies = await proxyService.getAccountProxies(accountId, false);
+            preferMobile = proxies.some((p) => proxyService.isMobileProxy(p));
+          }
         } catch (_) { /* ignore */ }
 
-        const deviceProfile = await this.getOrCreateDeviceProfile(accountId, { preferMobile });
+        const deviceProfile = await this.getOrCreateDeviceProfile(accountId, {
+          preferMobile: forceDesktop ? false : preferMobile,
+          forceDesktop,
+        });
         const result = await this.createBrowser(proxyConfig, false, deviceProfile);
         result.proxyConfig = proxyConfig;
         result.accountId = accountId;
@@ -316,7 +336,7 @@ class PlaywrightService {
 
     console.log(`All proxy attempts failed for account ${accountId}, trying direct connection`);
     try {
-      const deviceProfile = await this.getOrCreateDeviceProfile(accountId, { preferMobile: false });
+      const deviceProfile = await this.getOrCreateDeviceProfile(accountId, { preferMobile: false, forceDesktop: true });
       const result = await this.createBrowser(null, false, deviceProfile);
       result.proxyConfig = null;
       result.accountId = accountId;
@@ -935,7 +955,15 @@ class PlaywrightService {
       if (homeOk) return true;
 
       await page.screenshot({ path: `/tmp/x-login-failed-${username}.png`, fullPage: true }).catch(() => {});
-      console.log(`X login failed for ${username}. final_url=${page.url()}`);
+      const errHint = await page.evaluate(() => {
+        const text = (document.body?.innerText || '').slice(0, 2500);
+        const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+        const interesting = lines.filter((l) =>
+          /wrong|incorrect|password|suspicious|verify|locked|suspended|couldn.t|try again|unusual/i.test(l)
+        );
+        return interesting.slice(0, 5).join(' | ') || lines.slice(0, 8).join(' | ');
+      }).catch(() => '');
+      console.log(`X login failed for ${username}. final_url=${page.url()} hint=${errHint}`);
       return false;
     } catch (error) {
       console.error('X login error:', error);
