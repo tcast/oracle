@@ -4,6 +4,7 @@ const pool = require('./db');
 const proxyService = require('./proxyService');
 const { buildStickyProfile } = require('./deviceProfiles');
 const { classifyFailure } = require('./failureClassifier');
+const { generateTotp } = require('../utils/totp');
 
 chromium.use(stealth);
 
@@ -301,7 +302,7 @@ class PlaywrightService {
         let forceDesktop = false;
         try {
           const account = await this.getAccount(accountId);
-          forceDesktop = account.platform === 'x';
+          forceDesktop = account.platform === 'x' || account.platform === 'instagram';
           if (!forceDesktop) {
             const proxies = await proxyService.getAccountProxies(accountId, false);
             preferMobile = proxies.some((p) => proxyService.isMobileProxy(p));
@@ -449,6 +450,20 @@ class PlaywrightService {
           await this.humanLikeDelay(500, 1000);
           const liUser = await page.$('[data-control-name="nav.settings"]');
           return !!liUser;
+        case 'instagram':
+          await page.goto('https://www.instagram.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+          await this.humanLikeDelay(800, 1500);
+          return await page.evaluate(() => {
+            const text = (document.body?.innerText || '').slice(0, 3000);
+            if (/Log in|Sign up/i.test(text) && /Create a new account|Forgot password/i.test(text)) {
+              return false;
+            }
+            return !!(
+              document.querySelector('svg[aria-label="Home"], a[href="/"]') &&
+              (document.querySelector('svg[aria-label="New post"], svg[aria-label="Profile"], img[alt*="profile"]') ||
+                /Home|Search|Reels|Messages/i.test(text))
+            );
+          });
         default:
           return false;
       }
@@ -457,16 +472,17 @@ class PlaywrightService {
     }
   }
 
-  async performLogin(page, platform, username, password) {
+  async performLogin(page, platform, username, password, extras = {}) {
     switch (platform) {
       case 'reddit': return this.redditLogin(page, username, password);
       case 'x': return this.xLogin(page, username, password);
       case 'linkedin': return this.linkedInLogin(page, username, password);
+      case 'instagram': return this.instagramLogin(page, username, password, extras);
       default: throw new Error(`Unknown platform: ${platform}`);
     }
   }
 
-  async ensureLoggedIn(page, platform, accountId, username, password) {
+  async ensureLoggedIn(page, platform, accountId, username, password, extras = {}) {
     const sessionRestored = await this.restoreSession(page, platform, accountId);
     if (sessionRestored) {
       const alive = await this.verifySessionAlive(page, platform);
@@ -477,7 +493,7 @@ class PlaywrightService {
       console.log(`Session expired for ${platform}/${username}, re-logging in`);
     }
 
-    const loginSuccess = await this.performLogin(page, platform, username, password);
+    const loginSuccess = await this.performLogin(page, platform, username, password, extras);
     if (loginSuccess) {
       await this.persistSession(page, platform, accountId);
     }
@@ -1793,6 +1809,241 @@ class PlaywrightService {
       [platform]
     );
     return result.rows;
+  }
+
+  async dismissInstagramOverlays(page) {
+    for (const label of [
+      'Allow all cookies',
+      'Accept all',
+      'Accept',
+      'Only allow essential cookies',
+      'Decline optional cookies',
+      'Not Now',
+      'Not now',
+      'Dismiss',
+    ]) {
+      const clicked = await page.evaluate((label) => {
+        const nodes = [...document.querySelectorAll('button, [role="button"]')];
+        const match = nodes.find((b) => (b.innerText || '').trim() === label);
+        if (match) {
+          match.click();
+          return true;
+        }
+        return false;
+      }, label).catch(() => false);
+      if (clicked) {
+        console.log(`IG overlay dismissed: ${label}`);
+        await this.humanLikeDelay(600, 1200);
+      }
+    }
+  }
+
+  async instagramLogin(page, username, password, extras = {}) {
+    const loginIds = [username, extras.email].filter(Boolean);
+    let lastHint = '';
+
+    try {
+      for (const loginId of loginIds) {
+        console.log(`IG login attempt as ${loginId}`);
+        await page.goto('https://www.instagram.com/accounts/login/', {
+          waitUntil: 'domcontentloaded',
+          timeout: 90000,
+        });
+        await this.humanLikeDelay(2500, 4500);
+        await this.dismissInstagramOverlays(page);
+        await this.simulateHumanBehavior(page);
+
+        const userInput = await page.waitForSelector(
+          'input[name="username"], input[aria-label="Phone number, username, or email"], input[aria-label*="username" i]',
+          { timeout: 30000, state: 'visible' }
+        ).catch(() => null);
+        if (!userInput) {
+          await page.screenshot({ path: `/tmp/ig-login-nouser-${username}.png`, fullPage: true }).catch(() => {});
+          lastHint = 'username_input_missing';
+          continue;
+        }
+
+        await userInput.click({ force: true });
+        await userInput.fill('');
+        await userInput.type(loginId, { delay: 35 });
+        await this.humanLikeDelay(400, 900);
+
+        const passInput = await page.waitForSelector(
+          'input[name="password"], input[type="password"]',
+          { timeout: 10000, state: 'visible' }
+        );
+        await passInput.click({ force: true });
+        await passInput.fill('');
+        await passInput.type(password, { delay: 35 });
+        await this.humanLikeDelay(400, 900);
+
+        const submitted = await page.evaluate(() => {
+          const buttons = [...document.querySelectorAll('button, [role="button"]')];
+          const match = buttons.find((b) => /^(Log in|Log In)$/i.test((b.innerText || '').trim()));
+          if (match) {
+            match.click();
+            return 'Log in';
+          }
+          const submit = document.querySelector('button[type="submit"]');
+          if (submit) {
+            submit.click();
+            return 'submit';
+          }
+          return null;
+        });
+        if (!submitted) await page.keyboard.press('Enter');
+        await this.humanLikeDelay(4500, 7500);
+        await this.dismissInstagramOverlays(page);
+
+        // 2FA / email code challenges
+        const challenge = await page.evaluate(() => {
+          const text = (document.body?.innerText || '').slice(0, 3500);
+          return {
+            totp: /authentication app|security code|6-digit|Enter the code|two-factor|verification code/i.test(text),
+            email: /email|sent a code|confirmation code/i.test(text) && /code/i.test(text),
+            suspicious: /suspicious|confirm it.s you|we detected/i.test(text),
+            wrong: /sorry, your password|incorrect|password was incorrect|user not found/i.test(text),
+            snippet: text.split('\n').map((l) => l.trim()).filter(Boolean).slice(0, 10).join(' | '),
+          };
+        }).catch(() => ({}));
+
+        if (challenge.wrong) {
+          lastHint = challenge.snippet || 'bad_credentials';
+          console.log(`IG bad credentials for ${loginId}: ${lastHint}`);
+          continue;
+        }
+
+        if ((challenge.totp || challenge.email || challenge.suspicious) && extras.totpSecret) {
+          const code = generateTotp(extras.totpSecret);
+          console.log(`IG challenge for ${loginId} — submitting TOTP`);
+          const codeInput = await page.waitForSelector(
+            'input[name="verificationCode"], input[name="security_code"], input[aria-label*="Security Code" i], input[aria-label*="Code" i], input[type="tel"], input[type="text"]',
+            { timeout: 10000, state: 'visible' }
+          ).catch(() => null);
+          if (codeInput) {
+            await codeInput.click({ force: true });
+            await codeInput.fill('');
+            await codeInput.type(code, { delay: 40 });
+            await this.humanLikeDelay(400, 800);
+            await page.evaluate(() => {
+              const buttons = [...document.querySelectorAll('button, [role="button"]')];
+              const match = buttons.find((b) => /^(Confirm|Continue|Next|Submit)$/i.test((b.innerText || '').trim()));
+              if (match) match.click();
+              else {
+                const submit = document.querySelector('button[type="submit"]');
+                if (submit) submit.click();
+              }
+            });
+            await this.humanLikeDelay(4000, 7000);
+            await this.dismissInstagramOverlays(page);
+          }
+        }
+
+        // Save login / notifications prompts
+        await this.dismissInstagramOverlays(page);
+        await page.evaluate(() => {
+          const buttons = [...document.querySelectorAll('button, [role="button"]')];
+          const notNow = buttons.find((b) => /^(Not Now|Not now)$/i.test((b.innerText || '').trim()));
+          if (notNow) notNow.click();
+        }).catch(() => {});
+        await this.humanLikeDelay(1000, 2000);
+
+        const alive = await this.verifySessionAlive(page, 'instagram');
+        if (alive) {
+          console.log(`IG login success as ${loginId}`);
+          return true;
+        }
+
+        // Sometimes still on challenge — check home URL
+        const url = page.url();
+        if (/instagram\.com\/?($|\?)/.test(url) && !/accounts\/login|challenge|onetap/i.test(url)) {
+          const homeIcons = await page.$('svg[aria-label="Home"], a[href="/"]');
+          if (homeIcons) return true;
+        }
+
+        lastHint = challenge.snippet || `url=${url}`;
+        await page.screenshot({ path: `/tmp/ig-login-failed-${username}-${loginId.replace(/[^a-z0-9]/gi, '_')}.png`, fullPage: true }).catch(() => {});
+        console.log(`IG login failed for ${loginId}. hint=${lastHint}`);
+      }
+
+      console.log(`IG login exhausted for ${username}. last=${lastHint}`);
+      return false;
+    } catch (error) {
+      console.error('IG login error:', error);
+      await page.screenshot({ path: `/tmp/ig-login-error-${username}.png`, fullPage: true }).catch(() => {});
+      return false;
+    }
+  }
+
+  /**
+   * Smoke-test Instagram login (username, then email if provided).
+   */
+  async smokeTestInstagramLogin(accountId, { requireProxy = false } = {}) {
+    let browser;
+    let proxyId = null;
+    try {
+      const account = await this.getAccount(accountId);
+      if (account.platform !== 'instagram') {
+        throw new Error(`Account ${accountId} is ${account.platform}, expected instagram`);
+      }
+      const creds = typeof account.credentials === 'string'
+        ? JSON.parse(account.credentials)
+        : (account.credentials || {});
+      const password = creds.password;
+      if (!password || password === 'default_password') {
+        throw new Error('Account has no real password');
+      }
+
+      if (requireProxy) await this.requireProxyForLive(accountId);
+      const result = await this.createBrowserForAccount(accountId, 2, { requireProxy });
+      browser = result.browser;
+      proxyId = result.proxyConfig?._proxyId || null;
+      const page = result.page;
+
+      const loggedIn = await this.ensureLoggedIn(
+        page,
+        'instagram',
+        accountId,
+        account.username,
+        password,
+        {
+          email: creds.email || account.email,
+          totpSecret: creds.totp_secret || creds.totp || creds.twofa,
+        }
+      );
+
+      if (loggedIn) {
+        await this.persistSession(page, 'instagram', accountId);
+        await pool.query(
+          `UPDATE social_accounts
+           SET warmup_status = 'warmed', warmed_up_at = NOW(), last_used_at = NOW(), updated_at = NOW()
+           WHERE id = $1`,
+          [accountId]
+        ).catch(() => {});
+      }
+
+      if (proxyId) {
+        await proxyService.updateProxyStats(proxyId, !!loggedIn, {
+          reason: loggedIn ? null : 'ig_login_failed',
+        }).catch(() => {});
+      }
+
+      return {
+        success: !!loggedIn,
+        accountId,
+        username: account.username,
+        email: creds.email || account.email || null,
+        usedProxy: !!proxyId,
+      };
+    } catch (error) {
+      if (proxyId) {
+        await proxyService.updateProxyStats(proxyId, false, { reason: error.message }).catch(() => {});
+      }
+      return { success: false, accountId, error: error.message };
+    } finally {
+      if (browser) await browser.close();
+      this._untrackBrowser(accountId);
+    }
   }
 
   async requireProxyForLive(accountId) {
