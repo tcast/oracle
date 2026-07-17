@@ -799,30 +799,50 @@ class PlaywrightService {
     }
   }
 
+  async dismissXConsent(page) {
+    for (const label of [
+      'Accept all cookies',
+      'Accept all',
+      'Refuse non-essential cookies',
+      'Accept',
+      'Agree',
+      'Allow all',
+    ]) {
+      const clicked = await page.evaluate((label) => {
+        const buttons = [...document.querySelectorAll('button, [role="button"], div[role="button"]')];
+        const match = buttons.find((b) => (b.innerText || '').trim() === label);
+        if (match) {
+          match.click();
+          return true;
+        }
+        return false;
+      }, label).catch(() => false);
+      if (clicked) {
+        console.log(`X consent dismissed: ${label}`);
+        await this.humanLikeDelay(800, 1600);
+        return true;
+      }
+    }
+    return false;
+  }
+
   async xLogin(page, username, password) {
     try {
       // Prefer the dedicated login flow — mobile landing only shows "Sign in"
       await page.goto('https://x.com/i/flow/login', { waitUntil: 'domcontentloaded', timeout: 90000 });
       await this.humanLikeDelay(2500, 4500);
+      await this.dismissXConsent(page);
 
-      for (const label of ['Accept all', 'Accept', 'Agree', 'Allow all']) {
-        const btn = await page.$(`button:has-text("${label}"), div[role="button"]:has-text("${label}")`).catch(() => null);
-        if (btn) {
-          await btn.click().catch(() => {});
-          await this.humanLikeDelay(500, 1200);
-          break;
-        }
-      }
-
-      // Mobile landing sometimes redirects to marketing page — click Sign in
+      // Mobile / cookie redirect sometimes lands on marketing — click Sign in
       const needsSignIn = await page.evaluate(() => {
         const text = (document.body?.innerText || '').slice(0, 2000);
         const hasUserInput = !!document.querySelector(
           'input[name="username_or_email"], input[autocomplete="username"], input[name="text"]'
         );
-        return !hasUserInput && /Already have an account|Sign in/i.test(text);
+        return !hasUserInput && /Already have an account|Sign in|Happening now/i.test(text);
       });
       if (needsSignIn) {
+        await this.dismissXConsent(page);
         const signedIn = await page.evaluate(() => {
           const buttons = [...document.querySelectorAll('a, button, [role="button"]')];
           const exact = buttons.find((b) => /^(Sign in|Log in)$/i.test((b.innerText || '').trim()));
@@ -841,6 +861,7 @@ class PlaywrightService {
           await page.goto('https://x.com/i/flow/login', { waitUntil: 'domcontentloaded', timeout: 90000 });
         }
         await this.humanLikeDelay(2500, 4500);
+        await this.dismissXConsent(page);
       }
 
       await this.simulateHumanBehavior(page);
@@ -852,9 +873,17 @@ class PlaywrightService {
         'input[autocomplete="on"]',
       ].join(', ');
 
-      const userInput = await page.waitForSelector(userSelector, { timeout: 45000, state: 'visible' });
+      let userInput = await page.waitForSelector(userSelector, { timeout: 20000, state: 'visible' }).catch(() => null);
+      if (!userInput) {
+        // Last resort: click Sign in again then retry
+        await page.goto('https://x.com/i/flow/login', { waitUntil: 'domcontentloaded', timeout: 90000 });
+        await this.humanLikeDelay(2000, 3500);
+        await this.dismissXConsent(page);
+        userInput = await page.waitForSelector(userSelector, { timeout: 30000, state: 'visible' });
+      }
       if (!userInput) throw new Error('X username input not found');
 
+      console.log(`X login: username step for ${username} url=${page.url()}`);
       await userInput.click({ force: true });
       await userInput.fill('');
       await userInput.type(username, { delay: 40 });
@@ -874,6 +903,7 @@ class PlaywrightService {
       });
       if (!continueClicked) await page.keyboard.press('Enter');
       await this.humanLikeDelay(2500, 4500);
+      await this.dismissXConsent(page);
 
       let passwordInput = await page.waitForSelector(
         'input[name="password"], input[type="password"]',
@@ -907,6 +937,7 @@ class PlaywrightService {
         return false;
       }
 
+      console.log(`X login: password step for ${username} url=${page.url()}`);
       await passwordInput.focus().catch(() => {});
       await passwordInput.click({ force: true }).catch(() => {});
       await passwordInput.fill('');
@@ -941,7 +972,7 @@ class PlaywrightService {
       if (
         url.includes('/home') ||
         url.includes('/notifications') ||
-        (url.includes('x.com') && !url.includes('login') && !url.includes('flow') && !url.includes('onboarding') && !url.includes('signup'))
+        (url.includes('x.com') && !url.includes('login') && !url.includes('flow') && !url.includes('onboarding') && !url.includes('signup') && !url.match(/x\.com\/?$/))
       ) {
         return true;
       }
@@ -949,6 +980,7 @@ class PlaywrightService {
       // One more check via home
       await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
       await this.humanLikeDelay(1500, 2500);
+      await this.dismissXConsent(page);
       const homeOk = await page.$(
         '[data-testid="SideNav_AccountSwitcher_Button"], [data-testid="AppTabBar_Home_Link"], [data-testid="BottomBar_Home_Link"]'
       );
