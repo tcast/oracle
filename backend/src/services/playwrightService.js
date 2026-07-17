@@ -451,9 +451,13 @@ class PlaywrightService {
         case 'linkedin':
           await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded', timeout: 30000 });
           await this.humanLikeDelay(800, 1500);
+          if (/authwall|\/login|\/signup|\/uas\//i.test(page.url())) return false;
           return await page.evaluate(() => {
             const text = (document.body?.innerText || '').slice(0, 3500);
             if (/Sign in|Join now|Forgot password/i.test(text) && /Email or phone/i.test(text)) {
+              return false;
+            }
+            if (/authwall|Sign Up|Join LinkedIn/i.test(text) && !/Start a post|Messaging|My Network/i.test(text)) {
               return false;
             }
             return !!(
@@ -1751,6 +1755,284 @@ class PlaywrightService {
         try { await proxyService.updateProxyStats(proxyId, operationSuccess); }
         catch (statsError) { console.error('Error updating proxy stats:', statsError); }
       }
+    }
+  }
+
+  /**
+   * Upload / replace LinkedIn profile photo for an account.
+   * photoPath: absolute path to jpg/png inside the container/host.
+   */
+  async updateLinkedInProfilePhoto(accountId, photoPath, { requireProxy = false } = {}) {
+    const fs = require('fs');
+    if (!photoPath || !fs.existsSync(photoPath)) {
+      throw new Error(`Photo not found: ${photoPath}`);
+    }
+
+    let browser;
+    let proxyId = null;
+    try {
+      const account = await this.getAccount(accountId);
+      if (account.platform !== 'linkedin') {
+        throw new Error(`Account ${accountId} is ${account.platform}, expected linkedin`);
+      }
+      const creds = typeof account.credentials === 'string'
+        ? JSON.parse(account.credentials)
+        : (account.credentials || {});
+      const password = creds.password;
+      const loginEmail = account.email || account.username;
+      const profileUrl = (creds.profile_url || `https://www.linkedin.com/in/${account.username}`).replace(/\/?$/, '/');
+      const extras = {
+        totpSecret: creds.totp_secret || creds.totp || creds.twofa,
+        emailPassword: creds.email_password,
+        profileUrl,
+      };
+
+      const openBrowser = async (withProxy) => {
+        if (browser) {
+          await browser.close().catch(() => {});
+          this._untrackBrowser(accountId);
+          browser = null;
+        }
+        if (withProxy) {
+          const result = await this.createBrowserForAccount(accountId, 2, { requireProxy });
+          browser = result.browser;
+          proxyId = result.proxyConfig?._proxyId || null;
+          return result.page;
+        }
+        const result = await this.createBrowser(
+          null,
+          false,
+          await this.getOrCreateDeviceProfile(accountId, { forceDesktop: true })
+        );
+        browser = result.browser;
+        proxyId = null;
+        result.accountId = accountId;
+        this._trackBrowser(accountId, result.browser);
+        return result.page;
+      };
+
+      let page = await openBrowser(false);
+
+      // Prefer restored session (avoids LinkedIn captcha on re-login).
+      // Fall back to fresh login only if /in/me/ lands on authwall.
+      let loggedIn = false;
+      const restored = await this.restoreSession(page, 'linkedin', accountId);
+      if (restored) {
+        await page.goto('https://www.linkedin.com/in/me/', {
+          waitUntil: 'domcontentloaded',
+          timeout: 60000,
+        });
+        await this.humanLikeDelay(2000, 3500);
+        if (!/authwall|\/login|\/signup|\/uas\//i.test(page.url())) {
+          loggedIn = true;
+          console.log(`LinkedIn #${accountId}: reused session on ${page.url()}`);
+        } else {
+          console.log(`LinkedIn #${accountId}: restored cookies hit authwall`);
+        }
+      }
+
+      if (!loggedIn) {
+        await page.goto('https://www.linkedin.com/login', {
+          waitUntil: 'domcontentloaded',
+          timeout: 60000,
+        });
+        await this.humanLikeDelay(1500, 2500);
+        loggedIn = await this.performLogin(page, 'linkedin', loginEmail, password, extras);
+        if (!loggedIn && !requireProxy) {
+          page = await openBrowser(true);
+          await page.goto('https://www.linkedin.com/login', {
+            waitUntil: 'domcontentloaded',
+            timeout: 60000,
+          });
+          loggedIn = await this.performLogin(page, 'linkedin', loginEmail, password, extras);
+        }
+        if (!loggedIn) throw new Error('LinkedIn login failed');
+        await this.persistSession(page, 'linkedin', accountId);
+        await page.goto('https://www.linkedin.com/in/me/', {
+          waitUntil: 'domcontentloaded',
+          timeout: 60000,
+        });
+        await this.humanLikeDelay(2500, 4000);
+      }
+
+      if (/authwall|\/login|\/signup|\/uas\//i.test(page.url())) {
+        await page.screenshot({ path: `/tmp/linkedin-photo-authwall-${accountId}.png` }).catch(() => {});
+        throw new Error(`Still on authwall after login: ${page.url()}`);
+      }
+      console.log(`LinkedIn #${accountId}: on profile ${page.url()}`);
+
+      // Open Add/Edit photo modal (prefer visible control — duplicates exist in DOM)
+      let opened = false;
+      const addCandidates = await page.$$(
+        'a[aria-label="Add photo"], button[aria-label="Add photo"], a[aria-label*="Edit profile photo" i], button[aria-label*="Edit profile photo" i], a[aria-label*="Change photo" i], button[aria-label*="Change photo" i], a[aria-label*="profile photo" i], button[aria-label*="profile photo" i], button[aria-label*="Edit photo" i], a[aria-label*="Edit photo" i]'
+      );
+      for (const el of addCandidates) {
+        if (await el.isVisible().catch(() => false)) {
+          await el.click({ force: true });
+          opened = true;
+          break;
+        }
+      }
+      if (!opened) {
+        opened = await page.evaluate(() => {
+          const els = [...document.querySelectorAll('a, button, [role="button"]')];
+          const el =
+            els.find((e) => {
+              const label = `${e.getAttribute('aria-label') || ''} ${e.innerText || ''}`;
+              if (!/add photo|edit (your )?profile photo|change photo|profile photo/i.test(label)) return false;
+              const r = e.getBoundingClientRect();
+              return r.width > 0 && r.height > 0;
+            }) ||
+            els.find((e) =>
+              /add photo|edit (your )?profile photo|change photo/i.test(
+                `${e.getAttribute('aria-label') || ''} ${e.innerText || ''}`
+              )
+            );
+          if (el) {
+            el.scrollIntoView({ block: 'center' });
+            el.click();
+            return true;
+          }
+          return false;
+        });
+      }
+      if (!opened) {
+        await page.screenshot({ path: `/tmp/linkedin-photo-no-add-${accountId}.png` }).catch(() => {});
+        throw new Error('Add photo control not found');
+      }
+      await this.humanLikeDelay(1500, 2500);
+
+      // Upload via filechooser (LinkedIn "Upload photo" button)
+      try {
+        const [chooser] = await Promise.all([
+          page.waitForEvent('filechooser', { timeout: 12000 }),
+          page.evaluate(() => {
+            const b = [...document.querySelectorAll('button, [role="button"]')].find((x) =>
+              /^Upload photo$/i.test((x.innerText || '').trim())
+            );
+            if (b) b.click();
+          }),
+        ]);
+        await chooser.setFiles(photoPath);
+        console.log(`LinkedIn #${accountId}: file set via chooser`);
+      } catch (e) {
+        console.warn(`LinkedIn #${accountId}: filechooser failed (${e.message}), trying input`);
+        const input = await page.$('input[type="file"]');
+        if (!input) {
+          await page.screenshot({ path: `/tmp/linkedin-photo-no-input-${accountId}.png` }).catch(() => {});
+          throw new Error('LinkedIn photo file input not found');
+        }
+        await input.setInputFiles(photoPath);
+      }
+
+      await this.humanLikeDelay(3000, 5000);
+
+      // Dismiss content-credentials tip if present (can block Save)
+      for (let i = 0; i < 2; i++) {
+        await page.evaluate(() => {
+          const b = [...document.querySelectorAll('button')].find((x) =>
+            /^Got it$/i.test((x.innerText || '').trim())
+          );
+          if (b) b.click();
+        }).catch(() => {});
+        await this.humanLikeDelay(400, 800);
+      }
+
+      await page.screenshot({ path: `/tmp/linkedin-photo-before-save-${accountId}.png` }).catch(() => {});
+
+      // Crop editor → Save changes (may need a couple confirms / skip feed share)
+      for (let i = 0; i < 6; i++) {
+        const clicked = await page.evaluate(() => {
+          const buttons = [...document.querySelectorAll('button, [role="button"]')];
+          const order = [
+            /^Save changes$/i,
+            /^Save photo$/i,
+            /^Save to profile$/i,
+            /^Apply$/i,
+            /^Done$/i,
+            /^Save$/i,
+            /^Skip$/i,
+            /^Not now$/i,
+          ];
+          for (const re of order) {
+            const b = buttons.find((x) => {
+              if (!re.test((x.innerText || '').trim()) || x.disabled) return false;
+              const r = x.getBoundingClientRect();
+              return r.width > 0 && r.height > 0;
+            });
+            if (b) {
+              b.click();
+              return (b.innerText || '').trim();
+            }
+          }
+          return null;
+        });
+        if (!clicked) break;
+        console.log(`LinkedIn #${accountId}: clicked "${clicked}"`);
+        await this.humanLikeDelay(3000, 5000);
+        await page.screenshot({ path: `/tmp/linkedin-photo-after-save-${accountId}-${i}.png` }).catch(() => {});
+
+        // Detect rejection / error toast
+        const err = await page.evaluate(() => {
+          const text = (document.body?.innerText || '').slice(0, 2500);
+          if (/couldn.?t (save|upload)|failed|not allowed|try again|content credential/i.test(text) &&
+              /error|unable|problem/i.test(text)) {
+            return text.split('\n').map((l) => l.trim()).filter(Boolean).slice(0, 8).join(' | ');
+          }
+          return null;
+        }).catch(() => null);
+        if (err) console.warn(`LinkedIn #${accountId}: possible error — ${err}`);
+      }
+
+      // Extra settle time for CDN photo propagation
+      await this.humanLikeDelay(4000, 6000);
+
+      await page.goto('https://www.linkedin.com/in/me/', {
+        waitUntil: 'domcontentloaded',
+        timeout: 60000,
+      });
+      await this.humanLikeDelay(2500, 4000);
+      await page.screenshot({ path: `/tmp/linkedin-photo-done-${accountId}.png` }).catch(() => {});
+
+      const photoInfo = await page.evaluate(() => {
+        const addStill = [...document.querySelectorAll('a, button')].some((e) =>
+          /^Add photo$/i.test((e.getAttribute('aria-label') || '').trim())
+        );
+        const imgs = [...document.querySelectorAll('img')].filter((i) => i.width >= 72);
+        const profileImg =
+          imgs.find((i) =>
+            /profile-displayphoto|profile-display|EntityPhoto|presencephoto|eprofile/i.test(
+              `${i.className} ${i.alt} ${i.src}`
+            )
+          ) || imgs.find((i) => /media\.licdn\.com.*profile/i.test(i.src));
+        return {
+          addStill,
+          src: profileImg?.src || null,
+          alt: profileImg?.alt || null,
+          url: location.href,
+        };
+      }).catch(() => ({}));
+
+      await this.persistSession(page, 'linkedin', accountId);
+
+      const success =
+        !/authwall|\/login/i.test(photoInfo.url || '') &&
+        !!(photoInfo.src && /media\.licdn\.com/i.test(photoInfo.src));
+      return {
+        success,
+        accountId,
+        email: loginEmail,
+        profileUrl,
+        finalUrl: photoInfo.url || null,
+        photoSrc: photoInfo.src || null,
+        usedProxy: !!proxyId,
+      };
+    } catch (error) {
+      console.error(`LinkedIn photo update failed for ${accountId}:`, error.message);
+      return { success: false, accountId, error: error.message, usedProxy: !!proxyId };
+    } finally {
+      if (browser) await browser.close();
+      this._untrackBrowser(accountId);
     }
   }
 
