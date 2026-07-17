@@ -411,10 +411,19 @@ class PlaywrightService {
           });
           return !!redditLoggedIn;
         case 'x':
-          await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 15000 });
-          await this.humanLikeDelay(500, 1000);
-          const xUser = await page.$('[data-testid="SideNav_AccountSwitcher_Button"]');
-          return !!xUser;
+          await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 });
+          await this.humanLikeDelay(800, 1500);
+          const xUser = await page.$(
+            '[data-testid="SideNav_AccountSwitcher_Button"], [data-testid="AppTabBar_Home_Link"], [data-testid="BottomBar_Home_Link"], a[href="/home"]'
+          );
+          if (xUser) return true;
+          return await page.evaluate(() => {
+            const text = (document.body?.innerText || '').slice(0, 3000);
+            if (/Sign in|Create account|Already have an account/i.test(text) && !/Home|Notifications|Messages/i.test(text)) {
+              return false;
+            }
+            return !!document.querySelector('[data-testid="primaryColumn"], [aria-label="Home timeline"]');
+          });
         case 'linkedin':
           await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded', timeout: 15000 });
           await this.humanLikeDelay(500, 1000);
@@ -772,8 +781,8 @@ class PlaywrightService {
 
   async xLogin(page, username, password) {
     try {
-      // Landing page hosts the current username → Continue → password form
-      await page.goto('https://x.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+      // Prefer the dedicated login flow — mobile landing only shows "Sign in"
+      await page.goto('https://x.com/i/flow/login', { waitUntil: 'domcontentloaded', timeout: 90000 });
       await this.humanLikeDelay(2500, 4500);
 
       for (const label of ['Accept all', 'Accept', 'Agree', 'Allow all']) {
@@ -785,15 +794,45 @@ class PlaywrightService {
         }
       }
 
+      // Mobile landing sometimes redirects to marketing page — click Sign in
+      const needsSignIn = await page.evaluate(() => {
+        const text = (document.body?.innerText || '').slice(0, 2000);
+        const hasUserInput = !!document.querySelector(
+          'input[name="username_or_email"], input[autocomplete="username"], input[name="text"]'
+        );
+        return !hasUserInput && /Already have an account|Sign in/i.test(text);
+      });
+      if (needsSignIn) {
+        const signedIn = await page.evaluate(() => {
+          const buttons = [...document.querySelectorAll('a, button, [role="button"]')];
+          const exact = buttons.find((b) => /^(Sign in|Log in)$/i.test((b.innerText || '').trim()));
+          if (exact) {
+            exact.click();
+            return true;
+          }
+          const href = document.querySelector('a[href*="login"], a[href*="/i/flow/login"]');
+          if (href) {
+            href.click();
+            return true;
+          }
+          return false;
+        });
+        if (!signedIn) {
+          await page.goto('https://x.com/i/flow/login', { waitUntil: 'domcontentloaded', timeout: 90000 });
+        }
+        await this.humanLikeDelay(2500, 4500);
+      }
+
       await this.simulateHumanBehavior(page);
 
       const userSelector = [
         'input[name="username_or_email"]',
         'input[autocomplete="username"]',
         'input[name="text"]',
+        'input[autocomplete="on"]',
       ].join(', ');
 
-      const userInput = await page.waitForSelector(userSelector, { timeout: 30000, state: 'visible' });
+      const userInput = await page.waitForSelector(userSelector, { timeout: 45000, state: 'visible' });
       if (!userInput) throw new Error('X username input not found');
 
       await userInput.click({ force: true });
@@ -801,15 +840,17 @@ class PlaywrightService {
       await userInput.type(username, { delay: 40 });
       await this.humanLikeDelay(800, 1500);
 
-      // Exact "Continue" only — never "Continue with phone/Google/Apple"
+      // Exact "Next"/"Continue" only — never OAuth continue buttons
       const continueClicked = await page.evaluate(() => {
         const buttons = [...document.querySelectorAll('button, [role="button"]')];
-        const exact = buttons.find((b) => (b.innerText || '').trim() === 'Continue');
-        if (exact) {
-          exact.click();
-          return true;
+        for (const label of ['Next', 'Continue']) {
+          const exact = buttons.find((b) => (b.innerText || '').trim() === label);
+          if (exact) {
+            exact.click();
+            return label;
+          }
         }
-        return false;
+        return null;
       });
       if (!continueClicked) await page.keyboard.press('Enter');
       await this.humanLikeDelay(2500, 4500);
@@ -854,7 +895,7 @@ class PlaywrightService {
 
       const loginClicked = await page.evaluate(() => {
         const buttons = [...document.querySelectorAll('button, [role="button"]')];
-        for (const label of ['Log in', 'Sign in', 'Continue']) {
+        for (const label of ['Log in', 'Sign in', 'Next', 'Continue']) {
           const match = buttons.find((b) => (b.innerText || '').trim() === label);
           if (match) {
             match.click();
@@ -871,7 +912,9 @@ class PlaywrightService {
       if (!loginClicked) await page.keyboard.press('Enter');
       await this.humanLikeDelay(5000, 8000);
 
-      const loggedIn = await page.$('[data-testid="SideNav_AccountSwitcher_Button"], [data-testid="AppTabBar_Home_Link"], a[href="/home"]');
+      const loggedIn = await page.$(
+        '[data-testid="SideNav_AccountSwitcher_Button"], [data-testid="AppTabBar_Home_Link"], a[href="/home"], [data-testid="BottomBar_Home_Link"]'
+      );
       if (loggedIn) return true;
 
       const url = page.url();
@@ -883,8 +926,16 @@ class PlaywrightService {
         return true;
       }
 
+      // One more check via home
+      await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      await this.humanLikeDelay(1500, 2500);
+      const homeOk = await page.$(
+        '[data-testid="SideNav_AccountSwitcher_Button"], [data-testid="AppTabBar_Home_Link"], [data-testid="BottomBar_Home_Link"]'
+      );
+      if (homeOk) return true;
+
       await page.screenshot({ path: `/tmp/x-login-failed-${username}.png`, fullPage: true }).catch(() => {});
-      console.log(`X login failed for ${username}. final_url=${url}`);
+      console.log(`X login failed for ${username}. final_url=${page.url()}`);
       return false;
     } catch (error) {
       console.error('X login error:', error);
