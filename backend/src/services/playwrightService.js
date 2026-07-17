@@ -963,10 +963,29 @@ class PlaywrightService {
       if (!loginClicked) await page.keyboard.press('Enter');
       await this.humanLikeDelay(5000, 8000);
 
+      // Capture immediate post-submit state before navigating away
+      const postSubmit = await page.evaluate(() => {
+        const text = (document.body?.innerText || '').slice(0, 3000);
+        const url = location.href;
+        const hasHome = !!document.querySelector(
+          '[data-testid="SideNav_AccountSwitcher_Button"], [data-testid="AppTabBar_Home_Link"], [aria-label="Home timeline"]'
+        );
+        const wrong = /Wrong password|Incorrect|Couldn.t find your account|Try again|suspended|locked/i.test(text);
+        const stillPassword = !!document.querySelector('input[type="password"]');
+        return { url, hasHome, wrong, stillPassword, snippet: text.split('\n').map((l) => l.trim()).filter(Boolean).slice(0, 12).join(' | ') };
+      }).catch(() => ({}));
+      console.log(`X login post-submit for ${username}:`, JSON.stringify(postSubmit));
+      await page.screenshot({ path: `/tmp/x-login-postsubmit-${username}.png`, fullPage: true }).catch(() => {});
+
+      if (postSubmit.wrong) {
+        console.log(`X login bad credentials for ${username}`);
+        return false;
+      }
+
       const loggedIn = await page.$(
         '[data-testid="SideNav_AccountSwitcher_Button"], [data-testid="AppTabBar_Home_Link"], a[href="/home"], [data-testid="BottomBar_Home_Link"]'
       );
-      if (loggedIn) return true;
+      if (loggedIn || postSubmit.hasHome) return true;
 
       const url = page.url();
       if (
