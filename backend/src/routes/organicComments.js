@@ -20,7 +20,21 @@ router.get('/status', async (req, res) => {
 
 router.patch('/settings', async (req, res) => {
   try {
-    const settings = await organicCommentService.updateSettings(req.body || {});
+    const body = req.body || {};
+    const settings = await organicCommentService.updateSettings(body);
+    const shouldKick =
+      body.warm === true ||
+      body.min_per_day != null ||
+      body.max_per_day != null ||
+      body.max_concurrent != null;
+    if (shouldKick) {
+      try {
+        const durableQueue = require('../services/durableQueue');
+        if (durableQueue.started) await durableQueue.kickOrganicSoon(3000);
+      } catch (err) {
+        console.warn('organic settings: kickOrganicSoon failed:', err.message);
+      }
+    }
     res.json(settings);
   } catch (error) {
     res.status(400).json({ error: error.message });

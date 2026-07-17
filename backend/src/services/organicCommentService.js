@@ -41,8 +41,11 @@ class OrganicCommentService {
     const quiet_hours_end = patch.quiet_hours_end ?? current.quiet_hours_end;
     const max_concurrent = patch.max_concurrent ?? current.max_concurrent;
 
-    if (min_per_day < 1 || max_per_day < min_per_day || max_per_day > 5) {
-      throw new Error('min_per_day/max_per_day must satisfy 1 <= min <= max <= 5');
+    if (min_per_day < 1 || max_per_day < min_per_day || max_per_day > 10) {
+      throw new Error('min_per_day/max_per_day must satisfy 1 <= min <= max <= 10');
+    }
+    if (max_concurrent < 1 || max_concurrent > 10) {
+      throw new Error('max_concurrent must be between 1 and 10');
     }
 
     const result = await pool.query(
@@ -58,7 +61,58 @@ class OrganicCommentService {
        RETURNING *`,
       [enabled, min_per_day, max_per_day, quiet_hours_start, quiet_hours_end, max_concurrent]
     );
-    return result.rows[0];
+    const settings = result.rows[0];
+
+    const cadenceUp =
+      min_per_day > current.min_per_day ||
+      max_per_day > current.max_per_day ||
+      max_concurrent > current.max_concurrent ||
+      patch.reroll_targets === true ||
+      patch.warm === true;
+
+    if (cadenceUp) {
+      await this.applyThroughputBoost(settings, { warm: patch.warm !== false });
+    }
+    return settings;
+  }
+
+  /**
+   * Raise today's targets into the new min/max band and optionally make under-target
+   * accounts due soon so higher cadence kicks in immediately.
+   */
+  async applyThroughputBoost(settings, { warm = true } = {}) {
+    const min = settings.min_per_day || 1;
+    const max = settings.max_per_day || 3;
+    const jobs = await pool.query(
+      `SELECT id, comments_today, daily_target, next_due_at
+       FROM organic_comment_jobs
+       WHERE enabled = true`
+    );
+    for (const job of jobs.rows) {
+      let target;
+      if (warm && job.comments_today < max) {
+        const floor = Math.max(min, job.comments_today + (job.comments_today >= (job.daily_target || 0) ? 1 : 0));
+        const lo = Math.min(floor, max);
+        target = lo + Math.floor(Math.random() * (max - lo + 1));
+      } else {
+        target = Math.max(this.rollDailyTarget(settings), job.comments_today);
+      }
+
+      let nextDue = job.next_due_at;
+      if (warm && job.comments_today < target) {
+        nextDue = new Date(Date.now() + Math.floor(Math.random() * 45 * 60 * 1000));
+      }
+
+      await pool.query(
+        `UPDATE organic_comment_jobs
+         SET daily_target = $2,
+             next_due_at = $3,
+             status = CASE WHEN status = 'error' THEN 'idle' ELSE status END,
+             updated_at = NOW()
+         WHERE id = $1`,
+        [job.id, target, nextDue]
+      );
+    }
   }
 
   async getBrandBanTerms() {
@@ -122,12 +176,15 @@ class OrganicCommentService {
   computeNextDue(settings, commentsToday, warnings = {}) {
     const now = new Date();
     const target = warnings.daily_target || settings.max_per_day || 3;
+    const maxPerDay = settings.max_per_day || 3;
+    // Spread comments across ~16 waking hours; denser when daily cap is higher
+    const wakingHours = 16;
+    const baseGapH = Math.max(0.5, (wakingHours / Math.max(maxPerDay, 1)) * 0.7);
 
-    // Min gap 2–6h, push out of quiet hours
-    let gapMs = (2 + Math.random() * 4) * 60 * 60 * 1000;
+    let gapMs = (baseGapH * 0.5 + Math.random() * baseGapH) * 60 * 60 * 1000;
     if (commentsToday === 0 && !warnings.immediate) {
-      // First comment of day: sometimes later morning/afternoon
-      gapMs = Math.random() * 4 * 60 * 60 * 1000;
+      // First of day: sooner start so the day can actually fill the higher target
+      gapMs = Math.random() * Math.min(1.5, baseGapH) * 60 * 60 * 1000;
     }
 
     let due = new Date(now.getTime() + gapMs);

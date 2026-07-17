@@ -133,9 +133,26 @@ class DurableQueue {
 
   organicDelayMs(overrideMs = null) {
     if (overrideMs != null) return overrideMs;
-    const base = 15 * 60 * 1000;
-    const jitter = Math.random() * 15 * 60 * 1000;
+    // ~6–12 min between ticks (was 15–30) so higher daily targets get picked up
+    const base = 6 * 60 * 1000;
+    const jitter = Math.random() * 6 * 60 * 1000;
     return base + jitter;
+  }
+
+  /** Drop pending organic ticks and schedule one soon (warm-up / cadence bump). */
+  async kickOrganicSoon(delayMs = 5000) {
+    const q = this.queues[ORGANIC_QUEUE];
+    if (!q) throw new Error('Organic queue not initialized');
+    const delayed = await q.getDelayed();
+    const waiting = await q.getWaiting();
+    for (const job of [...delayed, ...waiting]) {
+      if (job.name === 'tick') {
+        try {
+          await job.remove();
+        } catch { /* ignore */ }
+      }
+    }
+    await this.scheduleOrganicTick(delayMs);
   }
 
   auditDelayMs(overrideMs = null) {
