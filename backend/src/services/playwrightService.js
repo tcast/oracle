@@ -305,7 +305,8 @@ class PlaywrightService {
           forceDesktop =
             account.platform === 'x' ||
             account.platform === 'instagram' ||
-            account.platform === 'linkedin';
+            account.platform === 'linkedin' ||
+            account.platform === 'tiktok';
           if (!forceDesktop) {
             const proxies = await proxyService.getAccountProxies(accountId, false);
             preferMobile = proxies.some((p) => proxyService.isMobileProxy(p));
@@ -481,6 +482,22 @@ class PlaywrightService {
                 /Home|Search|Reels|Messages/i.test(text))
             );
           });
+        case 'tiktok':
+          await page.goto('https://www.tiktok.com/foryou', { waitUntil: 'domcontentloaded', timeout: 45000 });
+          await this.humanLikeDelay(1000, 2000);
+          if (/\/login/i.test(page.url())) return false;
+          return await page.evaluate(() => {
+            const text = (document.body?.innerText || '').slice(0, 3500);
+            if (/Log in|Sign up|Use phone \/ email/i.test(text) && !/For You|Following|Friends/i.test(text)) {
+              return false;
+            }
+            return !!(
+              document.querySelector(
+                '[data-e2e="nav-profile"], [data-e2e="profile-icon"], a[href*="/@"], [data-e2e="upload-icon"]'
+              ) ||
+              /Upload|Profile|For You|Following/i.test(text)
+            );
+          });
         default:
           return false;
       }
@@ -495,6 +512,7 @@ class PlaywrightService {
       case 'x': return this.xLogin(page, username, password);
       case 'linkedin': return this.linkedInLogin(page, username, password, extras);
       case 'instagram': return this.instagramLogin(page, username, password, extras);
+      case 'tiktok': return this.tiktokLogin(page, username, password, extras);
       default: throw new Error(`Unknown platform: ${platform}`);
     }
   }
@@ -2461,6 +2479,266 @@ class PlaywrightService {
   async createTikTokPost(accountId, videoPath, caption) {
     console.log('TikTok posting requires mobile app automation or their business API');
     throw new Error('TikTok automation not implemented - use their business API instead');
+  }
+
+  /**
+   * TikTok web login (email/username + password).
+   * Note: TikTok frequently serves captcha / app-push; success is best-effort.
+   */
+  async tiktokLogin(page, username, password, extras = {}) {
+    const loginId = username || extras.email;
+    try {
+      await page.goto('https://www.tiktok.com/login/phone-or-email/email', {
+        waitUntil: 'domcontentloaded',
+        timeout: 90000,
+      });
+      await this.humanLikeDelay(2500, 4000);
+
+      // Cookie / consent
+      await page.evaluate(() => {
+        const buttons = [...document.querySelectorAll('button, [role="button"]')];
+        const accept = buttons.find((b) =>
+          /^(Accept all|Allow all|Got it|Accept)$/i.test((b.innerText || '').trim())
+        );
+        if (accept) accept.click();
+      }).catch(() => {});
+      await this.humanLikeDelay(800, 1500);
+
+      // Sometimes land on generic login — click through to email/username
+      const onEmailForm = await page.$('input[name="username"], input[placeholder*="Email" i], input[placeholder*="Username" i]');
+      if (!onEmailForm) {
+        await page.evaluate(() => {
+          const links = [...document.querySelectorAll('a, div, button, span')];
+          const emailPath = links.find((el) =>
+            /email|username|phone \/ email|use phone/i.test((el.innerText || '').trim())
+          );
+          if (emailPath) emailPath.click();
+        }).catch(() => {});
+        await this.humanLikeDelay(1500, 2500);
+        // Prefer email tab if phone/email tabs exist
+        await page.evaluate(() => {
+          const tabs = [...document.querySelectorAll('a, div, span, button')];
+          const emailTab = tabs.find((el) => /^(Email|Email \/ Username|Log in with email or username)$/i.test((el.innerText || '').trim()));
+          if (emailTab) emailTab.click();
+        }).catch(() => {});
+        await this.humanLikeDelay(1000, 2000);
+      }
+
+      // Username / email
+      let userInput = await page.waitForSelector(
+        'input[name="username"], input[placeholder*="Email" i], input[placeholder*="Username" i], input[type="text"]',
+        { timeout: 20000, state: 'visible' }
+      ).catch(() => null);
+      if (!userInput) {
+        const handles = await page.$$('input[type="text"], input[type="email"]');
+        for (const h of handles) {
+          if (await h.isVisible().catch(() => false)) {
+            userInput = h;
+            break;
+          }
+        }
+      }
+      if (!userInput) {
+        console.log(`TikTok username input missing for ${loginId}`);
+        await page.screenshot({ path: `/tmp/tiktok-no-user-${Date.now()}.png` }).catch(() => {});
+        return false;
+      }
+      await userInput.click({ force: true });
+      await userInput.fill('');
+      await userInput.type(loginId, { delay: 35 });
+      await this.humanLikeDelay(400, 900);
+
+      // Password
+      let pwdInput = await page.$('input[type="password"]');
+      if (!pwdInput) {
+        const handles = await page.$$('input[type="password"]');
+        for (const h of handles) {
+          if (await h.isVisible().catch(() => false)) {
+            pwdInput = h;
+            break;
+          }
+        }
+      }
+      if (!pwdInput) {
+        console.log(`TikTok password input missing for ${loginId}`);
+        await page.screenshot({ path: `/tmp/tiktok-no-pwd-${Date.now()}.png` }).catch(() => {});
+        return false;
+      }
+      await pwdInput.click({ force: true });
+      await pwdInput.fill('');
+      await pwdInput.type(password, { delay: 35 });
+      await this.humanLikeDelay(400, 900);
+
+      await page.evaluate(() => {
+        const buttons = [...document.querySelectorAll('button, [role="button"]')];
+        const submit = buttons.find((b) => /^(Log in|Sign in|Continue)$/i.test((b.innerText || '').trim()));
+        if (submit) submit.click();
+        else {
+          const typed = document.querySelector('button[type="submit"]');
+          if (typed) typed.click();
+        }
+      });
+      await this.humanLikeDelay(4500, 7000);
+
+      const state = await page.evaluate(() => {
+        const text = (document.body?.innerText || '').slice(0, 3500);
+        return {
+          captcha: /captcha|verify you|drag the|security check|unusual activity/i.test(text) ||
+            !!document.querySelector('iframe[src*="captcha"], #captcha-verify-container, .captcha-verify-container'),
+          rateLimited: /maximum number of attempts|too many (attempts|tries)|try again later/i.test(text),
+          badCreds: /incorrect|wrong password|couldn.?t find|invalid username|username or password/i.test(text),
+          snippet: text.split('\n').map((l) => l.trim()).filter(Boolean).slice(0, 10).join(' | '),
+        };
+      }).catch(() => ({}));
+
+      if (state.rateLimited) {
+        console.log(`TikTok rate-limited for ${loginId}: ${state.snippet}`);
+        await page.screenshot({ path: `/tmp/tiktok-ratelimit-${Date.now()}.png` }).catch(() => {});
+        return false;
+      }
+      if (state.badCreds) {
+        console.log(`TikTok bad credentials for ${loginId}: ${state.snippet}`);
+        await page.screenshot({ path: `/tmp/tiktok-badcreds-${Date.now()}.png` }).catch(() => {});
+        return false;
+      }
+      if (state.captcha) {
+        console.log(`TikTok captcha for ${loginId}: ${state.snippet}`);
+        await page.screenshot({ path: `/tmp/tiktok-captcha-${Date.now()}.png` }).catch(() => {});
+        return false;
+      }
+
+      const alive = await this.verifySessionAlive(page, 'tiktok');
+      if (alive) {
+        console.log(`TikTok login success as ${loginId}`);
+        return true;
+      }
+
+      // Soft success: left login URL and landed on feed/profile
+      const url = page.url();
+      if (/tiktok\.com/i.test(url) && !/\/login/i.test(url)) {
+        console.log(`TikTok login likely success for ${loginId} url=${url}`);
+        return true;
+      }
+
+      console.log(`TikTok login failed for ${loginId}. url=${url} hint=${state.snippet || ''}`);
+      await page.screenshot({ path: `/tmp/tiktok-login-failed-${Date.now()}.png` }).catch(() => {});
+      return false;
+    } catch (error) {
+      console.error('TikTok login error:', error);
+      await page.screenshot({ path: `/tmp/tiktok-login-error-${Date.now()}.png` }).catch(() => {});
+      return false;
+    }
+  }
+
+  /**
+   * Smoke-test TikTok login (username, with email fallback).
+   */
+  async smokeTestTikTokLogin(accountId, { requireProxy = false } = {}) {
+    let browser;
+    let proxyId = null;
+    try {
+      const account = await this.getAccount(accountId);
+      if (account.platform !== 'tiktok') {
+        throw new Error(`Account ${accountId} is ${account.platform}, expected tiktok`);
+      }
+      const creds = typeof account.credentials === 'string'
+        ? JSON.parse(account.credentials)
+        : (account.credentials || {});
+      const password = creds.password;
+      if (!password || password === 'default_password') {
+        throw new Error('Account has no real password');
+      }
+
+      const extras = {
+        email: creds.email || account.email,
+      };
+
+      const tryOnce = async (withProxy, loginAs) => {
+        if (browser) {
+          await browser.close().catch(() => {});
+          this._untrackBrowser(accountId);
+          browser = null;
+        }
+        if (withProxy) {
+          if (requireProxy) await this.requireProxyForLive(accountId);
+          const result = await this.createBrowserForAccount(accountId, 2, { requireProxy });
+          browser = result.browser;
+          proxyId = result.proxyConfig?._proxyId || null;
+          return this.ensureLoggedIn(result.page, 'tiktok', accountId, loginAs, password, extras);
+        }
+        const result = await this.createBrowser(
+          null,
+          false,
+          await this.getOrCreateDeviceProfile(accountId, { forceDesktop: true })
+        );
+        browser = result.browser;
+        proxyId = null;
+        result.accountId = accountId;
+        this._trackBrowser(accountId, result.browser);
+        return this.ensureLoggedIn(result.page, 'tiktok', accountId, loginAs, password, extras);
+      };
+
+      // Try username only first (email login often hits rate limits on these dumps)
+      const loginOrder = [account.username];
+      if (extras.email && extras.email !== account.username) {
+        // email as secondary attempt only
+        loginOrder.push(extras.email);
+      }
+
+      let loggedIn = false;
+      let lastHint = null;
+      for (const loginAs of loginOrder) {
+        // Prefer direct first for TikTok — residential proxies often get hard-blocked
+        try {
+          loggedIn = await tryOnce(false, loginAs);
+        } catch (err) {
+          lastHint = err.message;
+          console.warn(`TikTok direct login failed for ${loginAs} (${err.message})`);
+        }
+        if (!loggedIn) {
+          try {
+            loggedIn = await tryOnce(true, loginAs);
+          } catch (err) {
+            lastHint = err.message;
+            console.warn(`TikTok proxy login failed for ${loginAs} (${err.message})`);
+          }
+        }
+        if (loggedIn) break;
+        // Cool down between identifier attempts
+        await new Promise((r) => setTimeout(r, 8000));
+      }
+
+      if (loggedIn) {
+        await pool.query(
+          `UPDATE social_accounts
+           SET warmup_status = 'warmed', warmed_up_at = NOW(), last_used_at = NOW(), updated_at = NOW()
+           WHERE id = $1`,
+          [accountId]
+        ).catch(() => {});
+      }
+
+      if (proxyId) {
+        await proxyService.updateProxyStats(proxyId, !!loggedIn, {
+          reason: loggedIn ? null : 'tiktok_login_failed',
+        }).catch(() => {});
+      }
+
+      return {
+        success: !!loggedIn,
+        accountId,
+        username: account.username,
+        email: extras.email || null,
+        usedProxy: !!proxyId,
+      };
+    } catch (error) {
+      if (proxyId) {
+        await proxyService.updateProxyStats(proxyId, false, { reason: error.message }).catch(() => {});
+      }
+      return { success: false, accountId, error: error.message };
+    } finally {
+      if (browser) await browser.close();
+      this._untrackBrowser(accountId);
+    }
   }
 
   async postComment(platform, accountId, postUrl, comment, parentCommentId = null, { requireProxy = false } = {}) {
