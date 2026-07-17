@@ -1845,12 +1845,44 @@ class PlaywrightService {
     try {
       for (const loginId of loginIds) {
         console.log(`IG login attempt as ${loginId}`);
+        // commit: Instagram often returns soft-block status codes through residential proxies
         await page.goto('https://www.instagram.com/accounts/login/', {
-          waitUntil: 'domcontentloaded',
+          waitUntil: 'commit',
           timeout: 90000,
+        }).catch(async (err) => {
+          console.warn(`IG login goto warning: ${err.message}`);
+          await page.goto('https://www.instagram.com/', {
+            waitUntil: 'domcontentloaded',
+            timeout: 90000,
+          }).catch(() => {});
         });
-        await this.humanLikeDelay(2500, 4500);
+        await this.humanLikeDelay(3000, 5500);
         await this.dismissInstagramOverlays(page);
+
+        // If we're on home marketing, click Log in
+        const needsClick = await page.evaluate(() => {
+          const hasInput = !!document.querySelector('input[name="username"], input[type="password"]');
+          if (hasInput) return false;
+          const text = (document.body?.innerText || '').slice(0, 2000);
+          return /Log in|Sign up/i.test(text);
+        });
+        if (needsClick) {
+          await page.evaluate(() => {
+            const links = [...document.querySelectorAll('a, button')];
+            const login = links.find((el) => /^(Log in|Log In)$/i.test((el.innerText || '').trim()));
+            if (login) login.click();
+          }).catch(() => {});
+          await this.humanLikeDelay(2000, 3500);
+          if (!page.url().includes('/accounts/login')) {
+            await page.goto('https://www.instagram.com/accounts/login/', {
+              waitUntil: 'domcontentloaded',
+              timeout: 90000,
+            }).catch(() => {});
+            await this.humanLikeDelay(2000, 3500);
+          }
+          await this.dismissInstagramOverlays(page);
+        }
+
         await this.simulateHumanBehavior(page);
 
         const userInput = await page.waitForSelector(
@@ -1858,8 +1890,10 @@ class PlaywrightService {
           { timeout: 30000, state: 'visible' }
         ).catch(() => null);
         if (!userInput) {
+          const bodyHint = await page.evaluate(() => (document.body?.innerText || '').slice(0, 500)).catch(() => '');
           await page.screenshot({ path: `/tmp/ig-login-nouser-${username}.png`, fullPage: true }).catch(() => {});
-          lastHint = 'username_input_missing';
+          lastHint = `username_input_missing url=${page.url()} body=${bodyHint.replace(/\s+/g, ' ').slice(0, 180)}`;
+          console.log(`IG no username input: ${lastHint}`);
           continue;
         }
 
@@ -1994,26 +2028,44 @@ class PlaywrightService {
         throw new Error('Account has no real password');
       }
 
-      if (requireProxy) await this.requireProxyForLive(accountId);
-      const result = await this.createBrowserForAccount(accountId, 2, { requireProxy });
-      browser = result.browser;
-      proxyId = result.proxyConfig?._proxyId || null;
-      const page = result.page;
+      const extras = {
+        email: creds.email || account.email,
+        totpSecret: creds.totp_secret || creds.totp || creds.twofa,
+      };
 
-      const loggedIn = await this.ensureLoggedIn(
-        page,
-        'instagram',
-        accountId,
-        account.username,
-        password,
-        {
-          email: creds.email || account.email,
-          totpSecret: creds.totp_secret || creds.totp || creds.twofa,
+      const tryOnce = async (withProxy) => {
+        if (browser) {
+          await browser.close().catch(() => {});
+          this._untrackBrowser(accountId);
+          browser = null;
         }
-      );
+        if (withProxy) {
+          if (requireProxy) await this.requireProxyForLive(accountId);
+          const result = await this.createBrowserForAccount(accountId, 2, { requireProxy });
+          browser = result.browser;
+          proxyId = result.proxyConfig?._proxyId || null;
+          const page = result.page;
+          return this.ensureLoggedIn(page, 'instagram', accountId, account.username, password, extras);
+        }
+        const result = await this.createBrowser(null, false, await this.getOrCreateDeviceProfile(accountId, { forceDesktop: true }));
+        browser = result.browser;
+        proxyId = null;
+        result.accountId = accountId;
+        this._trackBrowser(accountId, result.browser);
+        return this.ensureLoggedIn(result.page, 'instagram', accountId, account.username, password, extras);
+      };
+
+      let loggedIn = false;
+      try {
+        loggedIn = await tryOnce(true);
+      } catch (err) {
+        console.warn(`IG proxy login path failed (${err.message}); retrying direct`);
+      }
+      if (!loggedIn && !requireProxy) {
+        loggedIn = await tryOnce(false);
+      }
 
       if (loggedIn) {
-        await this.persistSession(page, 'instagram', accountId);
         await pool.query(
           `UPDATE social_accounts
            SET warmup_status = 'warmed', warmed_up_at = NOW(), last_used_at = NOW(), updated_at = NOW()
