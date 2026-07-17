@@ -45,16 +45,18 @@ async function importProxies(proxyConfigs) {
              name = $1,
              type = $2,
              password = $3,
-             is_residential = $4,
-             metadata = $5::jsonb,
+             country = $4,
+             is_residential = $5,
+             metadata = $6::jsonb,
              is_active = true,
              updated_at = NOW()
-           WHERE id = $6
+           WHERE id = $7
            RETURNING *`,
           [
             config.name,
             config.type,
             config.password,
+            config.country || null,
             config.is_residential,
             JSON.stringify(config.metadata || {}),
             existing.rows[0].id,

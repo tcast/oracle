@@ -1,7 +1,8 @@
 /**
  * ProxyBase sticky session formatter / URL parser.
- * Format:
+ * Formats:
  *   http://{user}-sticky={id}-time=1w-type={mobile|residential}:{password}@proxy.proxybase.org:1081
+ *   http://{user}-sticky={id}-time=1w-type={mobile|residential}-country=US:{password}@us-west.proxybase.org:6500
  */
 
 const DEFAULT_HOST = 'proxy.proxybase.org';
@@ -22,18 +23,20 @@ function parseProxyUrl(url) {
   const stickyMatch = username.match(/-sticky=([A-Za-z0-9]{10})(?:-|$)/);
   const typeMatch = username.match(/-type=(mobile|residential)(?:-|$)/i);
   const timeMatch = username.match(/-time=([0-9]+[wdhms])(?:-|$)/i);
+  const countryMatch = username.match(/-country=([A-Za-z]{2})(?:-|$)/i);
   const sessionType = (typeMatch?.[1] || 'residential').toLowerCase();
   const stickyId = stickyMatch?.[1] || null;
+  const country = countryMatch?.[1] ? countryMatch[1].toUpperCase() : null;
 
   return {
     name: stickyId
-      ? `ProxyBase ${sessionType} ${stickyId}`
+      ? `ProxyBase ${sessionType}${country ? ` ${country}` : ''} ${stickyId}`
       : `ProxyBase ${username.slice(0, 12)}`,
     type: protocol.toLowerCase() === 'https' ? 'https' : 'http',
     server: `${host}:${port}`,
     username,
     password,
-    country: null,
+    country,
     city: null,
     provider: 'ProxyBase',
     is_residential: sessionType === 'residential' || sessionType === 'mobile',
@@ -42,6 +45,7 @@ function parseProxyUrl(url) {
       sticky_id: stickyId,
       sticky_time: timeMatch?.[1] || null,
       session_type: sessionType,
+      country,
       host,
       port: Number(port),
     },
@@ -51,11 +55,16 @@ function parseProxyUrl(url) {
 function buildStickyUsername(baseUsername, stickyId, {
   time = '1w',
   sessionType = 'residential',
+  country = null,
 } = {}) {
   if (!/^[A-Za-z0-9]{10}$/.test(stickyId)) {
     throw new Error('stickyId must be exactly 10 alphanumeric characters');
   }
-  return `${baseUsername}-sticky=${stickyId}-time=${time}-type=${sessionType}`;
+  let username = `${baseUsername}-sticky=${stickyId}-time=${time}-type=${sessionType}`;
+  if (country) {
+    username += `-country=${String(country).toUpperCase()}`;
+  }
+  return username;
 }
 
 function buildProxyUrl({
@@ -64,10 +73,15 @@ function buildProxyUrl({
   stickyId,
   time = '1w',
   sessionType = 'residential',
+  country = null,
   host = DEFAULT_HOST,
   port = DEFAULT_PORT,
 }) {
-  const username = buildStickyUsername(baseUsername, stickyId, { time, sessionType });
+  const username = buildStickyUsername(baseUsername, stickyId, {
+    time,
+    sessionType,
+    country,
+  });
   return `http://${username}:${password}@${host}:${port}`;
 }
 
