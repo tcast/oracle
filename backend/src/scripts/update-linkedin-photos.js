@@ -8,6 +8,7 @@
  * Usage:
  *   node src/scripts/update-linkedin-photos.js
  *   node src/scripts/update-linkedin-photos.js 277
+ *   node src/scripts/update-linkedin-photos.js 290-329
  */
 require('dotenv').config();
 const fs = require('fs');
@@ -36,14 +37,25 @@ function findPhoto(slug, username) {
 }
 
 async function main() {
-  const onlyId = process.argv[2] ? Number(process.argv[2]) : null;
-  const q = onlyId
-    ? `SELECT id, username, email, credentials->>'profile_url' AS profile_url
-       FROM social_accounts WHERE platform = 'linkedin' AND id = $1`
-    : `SELECT id, username, email, credentials->>'profile_url' AS profile_url
-       FROM social_accounts WHERE platform = 'linkedin' AND status = 'active'
-       ORDER BY id`;
-  const { rows } = await pool.query(q, onlyId ? [onlyId] : []);
+  const arg = process.argv[2] || null;
+  let q;
+  let params = [];
+  if (arg && arg.includes('-')) {
+    const [lo, hi] = arg.split('-').map(Number);
+    q = `SELECT id, username, email, credentials->>'profile_url' AS profile_url
+         FROM social_accounts WHERE platform = 'linkedin' AND id BETWEEN $1 AND $2
+         ORDER BY id`;
+    params = [lo, hi];
+  } else if (arg) {
+    q = `SELECT id, username, email, credentials->>'profile_url' AS profile_url
+         FROM social_accounts WHERE platform = 'linkedin' AND id = $1`;
+    params = [Number(arg)];
+  } else {
+    q = `SELECT id, username, email, credentials->>'profile_url' AS profile_url
+         FROM social_accounts WHERE platform = 'linkedin' AND status = 'active'
+         ORDER BY id`;
+  }
+  const { rows } = await pool.query(q, params);
   if (!rows.length) {
     console.error('No LinkedIn accounts found');
     process.exit(1);
