@@ -302,7 +302,10 @@ class PlaywrightService {
         let forceDesktop = false;
         try {
           const account = await this.getAccount(accountId);
-          forceDesktop = account.platform === 'x' || account.platform === 'instagram';
+          forceDesktop =
+            account.platform === 'x' ||
+            account.platform === 'instagram' ||
+            account.platform === 'linkedin';
           if (!forceDesktop) {
             const proxies = await proxyService.getAccountProxies(accountId, false);
             preferMobile = proxies.some((p) => proxyService.isMobileProxy(p));
@@ -446,10 +449,20 @@ class PlaywrightService {
             return !!document.querySelector('[data-testid="primaryColumn"], [aria-label="Home timeline"]');
           });
         case 'linkedin':
-          await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded', timeout: 15000 });
-          await this.humanLikeDelay(500, 1000);
-          const liUser = await page.$('[data-control-name="nav.settings"]');
-          return !!liUser;
+          await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+          await this.humanLikeDelay(800, 1500);
+          return await page.evaluate(() => {
+            const text = (document.body?.innerText || '').slice(0, 3500);
+            if (/Sign in|Join now|Forgot password/i.test(text) && /Email or phone/i.test(text)) {
+              return false;
+            }
+            return !!(
+              document.querySelector(
+                '[data-control-name="nav.settings"], .feed-identity-module, .global-nav__me, img.global-nav__me-photo, a[href*="/feed/"]'
+              ) ||
+              /Start a post|Messaging|My Network|Notifications/i.test(text)
+            );
+          });
         case 'instagram':
           await page.goto('https://www.instagram.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
           await this.humanLikeDelay(800, 1500);
@@ -476,7 +489,7 @@ class PlaywrightService {
     switch (platform) {
       case 'reddit': return this.redditLogin(page, username, password);
       case 'x': return this.xLogin(page, username, password);
-      case 'linkedin': return this.linkedInLogin(page, username, password);
+      case 'linkedin': return this.linkedInLogin(page, username, password, extras);
       case 'instagram': return this.instagramLogin(page, username, password, extras);
       default: throw new Error(`Unknown platform: ${platform}`);
     }
@@ -1429,44 +1442,229 @@ class PlaywrightService {
     }
   }
 
-  async linkedInLogin(page, email, password) {
+  async linkedInLogin(page, email, password, extras = {}) {
+    const loginId = email || 'unknown';
     try {
-      await page.goto('https://www.linkedin.com/login', { waitUntil: 'domcontentloaded' });
+      await page.goto('https://www.linkedin.com/login', {
+        waitUntil: 'domcontentloaded',
+        timeout: 60000,
+      });
       await this.humanLikeDelay(2000, 4000);
       await this.simulateHumanBehavior(page);
 
-      const emailInput = await page.waitForSelector('#username', { timeout: 15000 });
-      const eBox = await emailInput.boundingBox();
-      if (eBox) {
-        await this.simulateMouseMovement(page, 0, 0, eBox.x + eBox.width / 2, eBox.y + eBox.height / 2);
+      // LinkedIn 2026 UI: dynamic ids, no #username / session_key.
+      // Prefer visible email/password inputs (duplicates exist in DOM).
+      const emailInput = await page.waitForSelector(
+        'input[type="email"][autocomplete*="username"]:visible, input[autocomplete="username webauthn"]:visible, #username, input[name="session_key"]',
+        { timeout: 25000 }
+      ).catch(() => null);
+
+      let emailEl = emailInput;
+      if (!emailEl) {
+        // Fallback: pick first visible email input via evaluate handle
+        const handles = await page.$$('input[type="email"]');
+        for (const h of handles) {
+          if (await h.isVisible().catch(() => false)) {
+            emailEl = h;
+            break;
+          }
+        }
       }
-
-      await this.humanLikeTyping(page, '#username', email);
-      await this.humanLikeDelay(400, 1000);
-
-      const pwdInput = await page.waitForSelector('#password', { timeout: 5000 });
-      const pBox = await pwdInput.boundingBox();
-      if (pBox) {
-        await this.simulateMouseMovement(page, eBox.x + eBox.width / 2, eBox.y + eBox.height / 2, pBox.x + pBox.width / 2, pBox.y + pBox.height / 2);
-      }
-
-      await this.humanLikeTyping(page, '#password', password);
-      await this.humanLikeDelay(300, 800);
-
-      await page.click('button[type="submit"]');
-      await this.humanLikeDelay(3000, 5000);
-
-      const challenge = await page.$('#captcha-internal, input[name="pin"], .challenge-dialog');
-      if (challenge) {
-        console.log('LinkedIn login challenge detected - screenshot captured');
-        await page.screenshot({ path: '/tmp/linkedin-challenge.png' }).catch(() => {});
+      if (!emailEl) {
+        console.log(`LinkedIn email input missing for ${loginId}`);
+        await page.screenshot({ path: `/tmp/linkedin-no-email-${Date.now()}.png` }).catch(() => {});
         return false;
       }
 
-      const loggedIn = await page.$('[data-control-name="nav.settings"], .feed-identity-module');
-      return !!loggedIn;
+      await emailEl.click({ force: true });
+      await emailEl.fill('');
+      await emailEl.type(email, { delay: 35 });
+      await this.humanLikeDelay(400, 1000);
+
+      let pwdEl = await page.$('input[type="password"][autocomplete="current-password"]:visible, #password, input[name="session_password"]');
+      if (!pwdEl) {
+        const handles = await page.$$('input[type="password"]');
+        for (const h of handles) {
+          if (await h.isVisible().catch(() => false)) {
+            pwdEl = h;
+            break;
+          }
+        }
+      }
+      if (!pwdEl) {
+        console.log(`LinkedIn password input missing for ${loginId}`);
+        await page.screenshot({ path: `/tmp/linkedin-no-pwd-${Date.now()}.png` }).catch(() => {});
+        return false;
+      }
+
+      await pwdEl.click({ force: true });
+      await pwdEl.fill('');
+      await pwdEl.type(password, { delay: 35 });
+      await this.humanLikeDelay(300, 800);
+
+      // Click visible Sign in button
+      const submitted = await page.evaluate(() => {
+        const buttons = [...document.querySelectorAll('button, [role="button"]')];
+        const match = buttons.find((b) => {
+          const t = (b.innerText || b.textContent || '').trim();
+          return /^Sign in$/i.test(t) && b.offsetParent !== null;
+        });
+        if (match) {
+          match.click();
+          return true;
+        }
+        const submit = document.querySelector('button[type="submit"]');
+        if (submit) {
+          submit.click();
+          return true;
+        }
+        return false;
+      });
+      if (!submitted) await page.keyboard.press('Enter');
+      await this.humanLikeDelay(3500, 6000);
+
+      // Wrong password / blocked
+      const badCreds = await page.evaluate(() => {
+        const text = (document.body?.innerText || '').slice(0, 2500);
+        return /Wrong email or password|doesn.?t match|incorrect|try again|couldn.?t find a LinkedIn account/i.test(text);
+      }).catch(() => false);
+      if (badCreds) {
+        console.log(`LinkedIn bad credentials for ${loginId}`);
+        await page.screenshot({ path: `/tmp/linkedin-badcreds-${Date.now()}.png` }).catch(() => {});
+        return false;
+      }
+
+      // LinkedIn often defaults to "Check your LinkedIn app" push.
+      // Switch to authenticator TOTP when that option is offered.
+      const switchedToAuthenticator = await page.evaluate(() => {
+        const text = (document.body?.innerText || '').slice(0, 4000);
+        if (!/Check your LinkedIn app|notification to your signed-in devices|tap Yes/i.test(text)) {
+          return false;
+        }
+        const candidates = [...document.querySelectorAll('a, button, [role="button"], span')];
+        const link = candidates.find((el) =>
+          /Verify using authenticator app|Use authenticator app|authenticator app/i.test(
+            (el.innerText || el.textContent || '').trim()
+          )
+        );
+        if (link) {
+          link.click();
+          return true;
+        }
+        return false;
+      }).catch(() => false);
+      if (switchedToAuthenticator) {
+        console.log(`LinkedIn ${loginId}: switched from app-push to authenticator`);
+        await this.humanLikeDelay(2000, 3500);
+      }
+
+      // 2FA / PIN / authenticator challenge
+      const challenge = await page.evaluate(() => {
+        const text = (document.body?.innerText || '').slice(0, 3500);
+        return {
+          pin: !!document.querySelector(
+            'input[name="pin"], input#input__phone_verification_pin, input[id*="pin" i], input[autocomplete="one-time-code"]'
+          ),
+          totp: /authenticator|verification code|enter the code|security code|two.?step|two.?factor|6.?digit|Enter code|Enter the 6-digit/i.test(text),
+          appPush: /Check your LinkedIn app|notification to your signed-in devices/i.test(text),
+          captcha: /quick security check|verify you.?re human/i.test(text) ||
+            !!document.querySelector('#captcha-internal, .captcha, iframe[src*="captcha"], iframe[src*="arkoselabs"], iframe[src*="funcaptcha"]'),
+          challengeDialog: !!document.querySelector('.challenge-dialog'),
+          snippet: text.split('\n').map((l) => l.trim()).filter(Boolean).slice(0, 8).join(' | '),
+        };
+      }).catch(() => ({}));
+
+      if (challenge.captcha && !challenge.totp && !challenge.pin && !challenge.appPush) {
+        console.log(`LinkedIn captcha for ${loginId}: ${challenge.snippet}`);
+        await page.screenshot({ path: `/tmp/linkedin-captcha-${Date.now()}.png` }).catch(() => {});
+        return false;
+      }
+
+      if ((challenge.pin || challenge.totp || challenge.appPush || challenge.challengeDialog) && extras.totpSecret) {
+        // If still on app-push after switch attempt, try the authenticator link once more
+        if (challenge.appPush && !challenge.pin) {
+          await page.evaluate(() => {
+            const candidates = [...document.querySelectorAll('a, button, [role="button"], span')];
+            const link = candidates.find((el) =>
+              /Verify using authenticator app|Use authenticator app|authenticator app/i.test(
+                (el.innerText || el.textContent || '').trim()
+              )
+            );
+            if (link) link.click();
+          }).catch(() => {});
+          await this.humanLikeDelay(2000, 3500);
+        }
+
+        const code = generateTotp(extras.totpSecret);
+        console.log(`LinkedIn 2FA for ${loginId} — submitting TOTP`);
+        let pinInput = await page.waitForSelector(
+          'input[name="pin"], input#input__phone_verification_pin, input[id*="pin" i], input[autocomplete="one-time-code"], input[type="tel"], input[inputmode="numeric"]',
+          { timeout: 15000, state: 'visible' }
+        ).catch(() => null);
+        if (!pinInput) {
+          const handles = await page.$$('input[type="text"], input[type="tel"], input[type="number"], input[inputmode="numeric"]');
+          for (const h of handles) {
+            if (await h.isVisible().catch(() => false)) {
+              pinInput = h;
+              break;
+            }
+          }
+        }
+        if (pinInput) {
+          await pinInput.click({ force: true });
+          await pinInput.fill('');
+          await pinInput.type(code, { delay: 40 });
+          await this.humanLikeDelay(400, 900);
+          await page.evaluate(() => {
+            const buttons = [...document.querySelectorAll('button, [role="button"]')];
+            const match = buttons.find((b) =>
+              /^(Submit|Continue|Next|Verify|Confirm|Sign in)$/i.test((b.innerText || '').trim())
+            );
+            if (match) match.click();
+            else {
+              const submit = document.querySelector('button[type="submit"]');
+              if (submit) submit.click();
+            }
+          });
+          await this.humanLikeDelay(4000, 7000);
+        } else {
+          console.log(`LinkedIn 2FA input missing for ${loginId}`);
+          await page.screenshot({ path: `/tmp/linkedin-2fa-missing-${Date.now()}.png` }).catch(() => {});
+          return false;
+        }
+      } else if (challenge.pin || challenge.totp || challenge.appPush || challenge.challengeDialog) {
+        console.log(`LinkedIn challenge without TOTP secret for ${loginId}: ${challenge.snippet}`);
+        await page.screenshot({ path: `/tmp/linkedin-challenge-${Date.now()}.png` }).catch(() => {});
+        return false;
+      }
+
+      // Dismiss optional "remember me" / app download prompts
+      await page.evaluate(() => {
+        const buttons = [...document.querySelectorAll('button, [role="button"], a')];
+        const skip = buttons.find((b) =>
+          /^(Not now|Skip|Dismiss|No thanks)$/i.test((b.innerText || '').trim())
+        );
+        if (skip) skip.click();
+      }).catch(() => {});
+      await this.humanLikeDelay(1000, 2000);
+
+      const alive = await this.verifySessionAlive(page, 'linkedin');
+      if (alive) {
+        console.log(`LinkedIn login success as ${loginId}`);
+        return true;
+      }
+
+      const url = page.url();
+      if (/linkedin\.com\/(feed|in\/|mynetwork|messaging)/i.test(url)) {
+        return true;
+      }
+
+      console.log(`LinkedIn login failed for ${loginId}. url=${url} hint=${challenge.snippet || ''}`);
+      await page.screenshot({ path: `/tmp/linkedin-login-failed-${Date.now()}.png` }).catch(() => {});
+      return false;
     } catch (error) {
       console.error('LinkedIn login error:', error);
+      await page.screenshot({ path: `/tmp/linkedin-login-error-${Date.now()}.png` }).catch(() => {});
       return false;
     }
   }
@@ -1477,13 +1675,23 @@ class PlaywrightService {
 
     try {
       const account = await this.getAccount(accountId);
+      const creds = typeof account.credentials === 'string'
+        ? JSON.parse(account.credentials)
+        : (account.credentials || {});
       const result = await this.createBrowserForAccount(accountId);
       browser = result.browser;
       context = result.context;
       page = result.page;
       proxyId = result.proxyConfig?._proxyId;
 
-      const loggedIn = await this.ensureLoggedIn(page, 'linkedin', accountId, account.username, account.credentials.password);
+      const loginEmail = account.email || account.username;
+      const password = creds.password || account.credentials?.password;
+      const extras = {
+        totpSecret: creds.totp_secret || creds.totp || creds.twofa,
+        emailPassword: creds.email_password,
+        profileUrl: creds.profile_url,
+      };
+      const loggedIn = await this.ensureLoggedIn(page, 'linkedin', accountId, loginEmail, password, extras);
       if (!loggedIn) throw new Error('LinkedIn login failed');
 
       await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded' });
@@ -1779,7 +1987,7 @@ class PlaywrightService {
 
   async getAccount(accountId) {
     const result = await pool.query(
-      'SELECT id, username, credentials, platform, status, is_simulated FROM social_accounts WHERE id = $1',
+      'SELECT id, username, email, credentials, platform, status, is_simulated FROM social_accounts WHERE id = $1',
       [accountId]
     );
     if (result.rows.length === 0) {
@@ -2101,6 +2309,108 @@ class PlaywrightService {
         accountId,
         username: account.username,
         email: creds.email || account.email || null,
+        usedProxy: !!proxyId,
+      };
+    } catch (error) {
+      if (proxyId) {
+        await proxyService.updateProxyStats(proxyId, false, { reason: error.message }).catch(() => {});
+      }
+      return { success: false, accountId, error: error.message };
+    } finally {
+      if (browser) await browser.close();
+      this._untrackBrowser(accountId);
+    }
+  }
+
+  /**
+   * Smoke-test LinkedIn login (email + password + optional TOTP).
+   */
+  async smokeTestLinkedInLogin(accountId, { requireProxy = false } = {}) {
+    let browser;
+    let proxyId = null;
+    try {
+      const account = await this.getAccount(accountId);
+      if (account.platform !== 'linkedin') {
+        throw new Error(`Account ${accountId} is ${account.platform}, expected linkedin`);
+      }
+      const creds = typeof account.credentials === 'string'
+        ? JSON.parse(account.credentials)
+        : (account.credentials || {});
+      const password = creds.password;
+      if (!password || password === 'default_password') {
+        throw new Error('Account has no real password');
+      }
+
+      const loginEmail = account.email || account.username;
+      const extras = {
+        totpSecret: creds.totp_secret || creds.totp || creds.twofa,
+        emailPassword: creds.email_password,
+        profileUrl: creds.profile_url,
+      };
+
+      const tryOnce = async (withProxy) => {
+        if (browser) {
+          await browser.close().catch(() => {});
+          this._untrackBrowser(accountId);
+          browser = null;
+        }
+        if (withProxy) {
+          if (requireProxy) await this.requireProxyForLive(accountId);
+          const result = await this.createBrowserForAccount(accountId, 2, { requireProxy });
+          browser = result.browser;
+          proxyId = result.proxyConfig?._proxyId || null;
+          return this.ensureLoggedIn(result.page, 'linkedin', accountId, loginEmail, password, extras);
+        }
+        const result = await this.createBrowser(
+          null,
+          false,
+          await this.getOrCreateDeviceProfile(accountId, { forceDesktop: true })
+        );
+        browser = result.browser;
+        proxyId = null;
+        result.accountId = accountId;
+        this._trackBrowser(accountId, result.browser);
+        return this.ensureLoggedIn(result.page, 'linkedin', accountId, loginEmail, password, extras);
+      };
+
+      let loggedIn = false;
+      // LinkedIn frequently serves captcha on residential/mobile proxies for fresh logins.
+      // Prefer direct first when proxy is optional; then retry via sticky proxy for session reuse.
+      if (!requireProxy) {
+        try {
+          loggedIn = await tryOnce(false);
+        } catch (err) {
+          console.warn(`LinkedIn direct login path failed (${err.message}); retrying with proxy`);
+        }
+      }
+      if (!loggedIn) {
+        try {
+          loggedIn = await tryOnce(true);
+        } catch (err) {
+          console.warn(`LinkedIn proxy login path failed (${err.message})`);
+        }
+      }
+
+      if (loggedIn) {
+        await pool.query(
+          `UPDATE social_accounts
+           SET warmup_status = 'warmed', warmed_up_at = NOW(), last_used_at = NOW(), updated_at = NOW()
+           WHERE id = $1`,
+          [accountId]
+        ).catch(() => {});
+      }
+
+      if (proxyId) {
+        await proxyService.updateProxyStats(proxyId, !!loggedIn, {
+          reason: loggedIn ? null : 'linkedin_login_failed',
+        }).catch(() => {});
+      }
+
+      return {
+        success: !!loggedIn,
+        accountId,
+        email: loginEmail,
+        profileUrl: creds.profile_url || null,
         usedProxy: !!proxyId,
       };
     } catch (error) {
