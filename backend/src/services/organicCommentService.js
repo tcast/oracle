@@ -6,6 +6,7 @@ const organicDiscoveryService = require('./organicDiscoveryService');
 const commentingService = require('./commentingService');
 const { scoreAiLikeness, scoreSpamSignals } = require('./campaignReputationService');
 const { generationCompletionOptions } = require('../config/openaiModels');
+const { classifyFailure, cooldownUntil } = require('./failureClassifier');
 
 const BAD_OPENERS = [
   /^great post[!.,\s]/i,
@@ -328,17 +329,67 @@ Write only the comment text.`;
     const result = await pool.query(
       `SELECT sa.*
        FROM social_accounts sa
+       LEFT JOIN organic_comment_jobs j ON j.social_account_id = sa.id
        WHERE sa.platform = 'reddit'
          AND COALESCE(sa.is_simulated, false) = false
          AND sa.status = 'active'
          AND COALESCE(sa.credentials->>'password', '') NOT IN ('', 'default_password')
          AND COALESCE(sa.credentials->>'needs_signup', 'false') != 'true'
+         AND (j.cooldown_until IS NULL OR j.cooldown_until <= NOW())
+         AND COALESCE(j.failure_class, '') NOT IN ('bad_credentials')
          AND EXISTS (
            SELECT 1 FROM social_account_proxies sap
+           JOIN proxies p ON p.id = sap.proxy_id
            WHERE sap.social_account_id = sa.id AND sap.is_active = true
+             AND p.is_active = true
+             AND (p.cooldown_until IS NULL OR p.cooldown_until <= NOW())
          )`
     );
     return result.rows;
+  }
+
+  async applyFailureQuarantine(job, errorMessage) {
+    const failureClass = classifyFailure(errorMessage);
+    const consecutive = (job.consecutive_failures || 0) + 1;
+    const until = cooldownUntil(failureClass, consecutive);
+    // bad_credentials: disable until manually fixed
+    const disable = failureClass === 'bad_credentials';
+
+    await pool.query(
+      `UPDATE organic_comment_jobs
+       SET status = 'error',
+           last_error = $2,
+           failure_class = $3,
+           consecutive_failures = $4,
+           cooldown_until = $5,
+           next_due_at = $5,
+           enabled = CASE WHEN $6 THEN false ELSE enabled END,
+           updated_at = NOW()
+       WHERE id = $1`,
+      [job.id, errorMessage, failureClass, consecutive, until, disable]
+    );
+
+    console.warn(
+      `Account job ${job.social_account_id} quarantined as ${failureClass} ` +
+        `until ${until.toISOString()} (failures=${consecutive})` +
+        (disable ? ' — disabled for bad credentials' : '')
+    );
+
+    return { failureClass, consecutive, until, disable };
+  }
+
+  async clearFailureState(jobId) {
+    await pool.query(
+      `UPDATE organic_comment_jobs
+       SET consecutive_failures = 0,
+           failure_class = NULL,
+           cooldown_until = NULL,
+           last_error = NULL,
+           status = 'idle',
+           updated_at = NOW()
+       WHERE id = $1`,
+      [jobId]
+    );
   }
 
   async getDashboard() {
@@ -392,6 +443,12 @@ Write only the comment text.`;
     if (!job.enabled) {
       return { skipped: true, reason: 'account_disabled' };
     }
+    if (job.cooldown_until && new Date(job.cooldown_until) > new Date()) {
+      return { skipped: true, reason: 'cooldown', until: job.cooldown_until, class: job.failure_class };
+    }
+    if (job.failure_class === 'bad_credentials') {
+      return { skipped: true, reason: 'bad_credentials' };
+    }
     if (job.comments_today >= (job.daily_target || settings.max_per_day)) {
       return { skipped: true, reason: 'daily_cap' };
     }
@@ -415,12 +472,9 @@ Write only the comment text.`;
     const proxies = await proxyService.getAccountProxies(account.id, true);
     if (proxies.length !== 1) {
       const msg = proxies.length === 0
-        ? 'No dedicated proxy assigned'
+        ? 'No dedicated proxy assigned (or proxy in cooldown)'
         : 'Account has multiple active proxies; enforce 1:1';
-      await pool.query(
-        `UPDATE organic_comment_jobs SET status = 'error', last_error = $2, updated_at = NOW() WHERE id = $1`,
-        [job.id, msg]
-      );
+      await this.applyFailureQuarantine(job, msg);
       return { skipped: true, reason: 'proxy', error: msg };
     }
 
@@ -439,7 +493,7 @@ Write only the comment text.`;
       const generated = await this.generateWithGate(account, thread, 3);
       if (!generated?.gate?.ok) {
         const reason = (generated?.gate?.reasons || ['gate_failed']).join(',');
-        // Soft skip: bump due later, do NOT burn daily budget
+        // Soft skip: bump due later, do NOT burn daily budget or quarantine
         const next = this.computeNextDue(settings, job.comments_today, { daily_target: job.daily_target });
         await pool.query(
           `UPDATE organic_comment_jobs
@@ -495,6 +549,9 @@ Write only the comment text.`;
              next_due_at = $3,
              status = 'idle',
              last_error = NULL,
+             consecutive_failures = 0,
+             failure_class = NULL,
+             cooldown_until = NULL,
              updated_at = NOW()
          WHERE id = $1`,
         [job.id, commentsToday, next]
@@ -508,14 +565,21 @@ Write only the comment text.`;
         next_due_at: next,
       };
     } catch (error) {
-      const next = this.computeNextDue(settings, job.comments_today, { daily_target: job.daily_target });
-      await pool.query(
-        `UPDATE organic_comment_jobs
-         SET status = 'error', last_error = $2, next_due_at = $3, updated_at = NOW()
-         WHERE id = $1`,
-        [job.id, error.message, next]
-      );
-      return { skipped: true, reason: 'error', error: error.message };
+      const msg = error.message || String(error);
+      // Soft operational misses: short delay, no long quarantine
+      if (/No commentable threads|gate_failed|duplicate key/i.test(msg)) {
+        const next = this.computeNextDue(settings, job.comments_today, { daily_target: job.daily_target });
+        await pool.query(
+          `UPDATE organic_comment_jobs
+           SET status = 'idle', last_error = $2, next_due_at = $3, updated_at = NOW()
+           WHERE id = $1`,
+          [job.id, msg, next]
+        );
+        return { skipped: true, reason: 'soft_error', error: msg };
+      }
+
+      await this.applyFailureQuarantine(job, msg);
+      return { skipped: true, reason: 'error', error: msg };
     }
   }
 }

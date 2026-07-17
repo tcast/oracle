@@ -292,12 +292,28 @@ class ProxyService {
       FROM proxies p
       JOIN social_account_proxies sap ON p.id = sap.proxy_id
       WHERE sap.social_account_id = $1
-      ${onlyActive ? 'AND sap.is_active = true AND p.is_active = true' : ''}
+      ${onlyActive ? `AND sap.is_active = true AND p.is_active = true
+        AND (p.cooldown_until IS NULL OR p.cooldown_until <= NOW())` : ''}
       ORDER BY sap.priority ASC, sap.last_used_at ASC NULLS FIRST
     `;
 
     const result = await pool.query(query, [accountId]);
     return result.rows;
+  }
+
+  /** ProxyBase sticky mobile pools (and similar) — prefer Android fingerprints. */
+  isMobileProxy(proxy) {
+    if (!proxy) return false;
+    const blob = [
+      proxy.name,
+      proxy.type,
+      proxy.provider,
+      proxy.server,
+      JSON.stringify(proxy.metadata || {}),
+    ]
+      .join(' ')
+      .toLowerCase();
+    return /mobile|android|proxybase|sticky=.*type=mobile|type=mobile/.test(blob);
   }
 
   // Get next proxy for an account (with rotation)
@@ -344,29 +360,59 @@ class ProxyService {
     };
   }
 
-  // Update proxy stats after use
-  async updateProxyStats(proxyId, success) {
-    const column = success ? 'success_count' : 'failure_count';
-    
-    await pool.query(
-      `UPDATE proxies 
-       SET ${column} = ${column} + 1, 
+  // Update proxy stats after use — circuit-breaker on repeated failures
+  async updateProxyStats(proxyId, success, { reason = null } = {}) {
+    if (success) {
+      await pool.query(
+        `UPDATE proxies
+         SET success_count = success_count + 1,
+             consecutive_failures = 0,
+             cooldown_until = NULL,
+             last_used_at = NOW(),
+             updated_at = NOW()
+         WHERE id = $1`,
+        [proxyId]
+      );
+      return;
+    }
+
+    const result = await pool.query(
+      `UPDATE proxies
+       SET failure_count = failure_count + 1,
+           consecutive_failures = COALESCE(consecutive_failures, 0) + 1,
            last_used_at = NOW(),
            updated_at = NOW()
-       WHERE id = $1`,
+       WHERE id = $1
+       RETURNING failure_count, consecutive_failures`,
       [proxyId]
     );
 
-    // Disable proxy if too many failures
-    if (!success) {
-      const result = await pool.query(
-        'SELECT failure_count FROM proxies WHERE id = $1',
-        [proxyId]
+    const row = result.rows[0];
+    if (!row) return;
+
+    const consecutive = row.consecutive_failures || 0;
+    // Tunnel/timeout: cool down after 2 fails; other errors after 3
+    const isProxyPath = reason && /tunnel|timed_out|timeout|proxy|err_/i.test(reason);
+    const tripAt = isProxyPath ? 2 : 3;
+
+    if (consecutive >= tripAt) {
+      const hours = Math.min(24, 4 * consecutive);
+      await pool.query(
+        `UPDATE proxies
+         SET cooldown_until = NOW() + ($2 * INTERVAL '1 hour'),
+             updated_at = NOW()
+         WHERE id = $1`,
+        [proxyId, hours]
       );
-      
-      if (result.rows[0]?.failure_count > 10) {
-        await this.disableProxy(proxyId);
-      }
+      console.warn(
+        `Proxy ${proxyId} circuit open for ${hours}h after ${consecutive} failures` +
+          (reason ? ` (${reason})` : '')
+      );
+    }
+
+    if (row.failure_count > 15) {
+      await this.disableProxy(proxyId);
+      console.warn(`Proxy ${proxyId} disabled after ${row.failure_count} total failures`);
     }
   }
 

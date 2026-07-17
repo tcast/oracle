@@ -41,6 +41,8 @@ class OrganicCommentScheduler {
       job = await organicCommentService.refreshDayState(job, settings);
       if (!job.enabled) continue;
       if (job.status === 'running') continue;
+      if (job.cooldown_until && new Date(job.cooldown_until) > new Date()) continue;
+      if (job.failure_class === 'bad_credentials') continue;
       if (job.comments_today >= (job.daily_target || settings.max_per_day)) continue;
       if (job.next_due_at && new Date(job.next_due_at) > new Date()) continue;
       if (organicCommentService.inQuietHours(settings)) continue;

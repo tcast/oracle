@@ -2,36 +2,10 @@ const { chromium } = require('playwright-extra');
 const stealth = require('puppeteer-extra-plugin-stealth')();
 const pool = require('./db');
 const proxyService = require('./proxyService');
+const { buildStickyProfile } = require('./deviceProfiles');
+const { classifyFailure } = require('./failureClassifier');
 
 chromium.use(stealth);
-
-const USER_AGENTS = [
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15',
-];
-
-const VIEWPORTS = [
-  { width: 1280, height: 720 },
-  { width: 1366, height: 768 },
-  { width: 1440, height: 900 },
-  { width: 1536, height: 864 },
-  { width: 1920, height: 1080 },
-  { width: 1280, height: 800 },
-  { width: 1440, height: 960 },
-];
-
-const SCREEN_PROFILES = [
-  { width: 1280, height: 720, availWidth: 1280, availHeight: 700, colorDepth: 24, pixelDepth: 24 },
-  { width: 1366, height: 768, availWidth: 1366, availHeight: 748, colorDepth: 24, pixelDepth: 24 },
-  { width: 1440, height: 900, availWidth: 1440, availHeight: 880, colorDepth: 24, pixelDepth: 24 },
-  { width: 1536, height: 864, availWidth: 1536, availHeight: 844, colorDepth: 24, pixelDepth: 24 },
-  { width: 1920, height: 1080, availWidth: 1920, availHeight: 1060, colorDepth: 24, pixelDepth: 24 },
-];
 
 class PlaywrightService {
   constructor() {
@@ -54,6 +28,33 @@ class PlaywrightService {
   async variableDelay(baseMs = 1000) {
     const jitter = Math.floor(baseMs * (0.2 + Math.random() * 0.6));
     await new Promise(resolve => setTimeout(resolve, jitter));
+  }
+
+  /**
+   * Sticky fingerprint per account. Prefer Android when the assigned proxy is mobile.
+   */
+  async getOrCreateDeviceProfile(accountId, { preferMobile = false } = {}) {
+    const existing = await pool.query(
+      'SELECT device_profile FROM social_accounts WHERE id = $1',
+      [accountId]
+    );
+    let profile = existing.rows[0]?.device_profile;
+    if (typeof profile === 'string') {
+      try { profile = JSON.parse(profile); } catch { profile = null; }
+    }
+    if (profile && profile.userAgent && profile.viewport) {
+      return profile;
+    }
+
+    profile = buildStickyProfile({ preferMobile });
+    await pool.query(
+      'UPDATE social_accounts SET device_profile = $2 WHERE id = $1',
+      [accountId, JSON.stringify(profile)]
+    );
+    console.log(
+      `Assigned device profile ${profile.label} (${profile.platform}) to account ${accountId}`
+    );
+    return profile;
   }
 
   async simulateMouseMovement(page, fromX, fromY, toX, toY) {
@@ -107,16 +108,24 @@ class PlaywrightService {
     await this.humanLikeDelay(100, 300);
   }
 
-  async createBrowser(proxyConfig = null, retryWithoutProxy = true) {
-    const userAgent = this.pickRandom(USER_AGENTS);
-    const viewport = this.pickRandom(VIEWPORTS);
-    const screen = this.pickRandom(SCREEN_PROFILES);
-    const isWindows = userAgent.includes('Windows');
-    const isMac = userAgent.includes('Macintosh');
-    const timezone = this.pickRandom([
-      'America/New_York', 'America/Chicago', 'America/Denver',
-      'America/Los_Angeles', 'Europe/London', 'Europe/Berlin',
+  async createBrowser(proxyConfig = null, retryWithoutProxy = true, deviceProfile = null) {
+    const profile = deviceProfile || buildStickyProfile({ preferMobile: false });
+    const userAgent = profile.userAgent;
+    const viewport = profile.viewport;
+    const screen = profile.screen || {
+      width: viewport.width,
+      height: viewport.height,
+      availWidth: viewport.width,
+      availHeight: viewport.height,
+      colorDepth: 24,
+      pixelDepth: 24,
+    };
+    const isMobile = !!profile.isMobile;
+    const hasTouch = !!profile.hasTouch;
+    const timezone = profile.timezoneId || this.pickRandom([
+      'America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles',
     ]);
+    const isMac = /Macintosh|Mac OS X/i.test(userAgent);
 
     const args = [
       '--disable-blink-features=AutomationControlled',
@@ -154,25 +163,35 @@ class PlaywrightService {
       const context = await browser.newContext({
         viewport,
         userAgent,
-        locale: 'en-US',
+        locale: profile.locale || 'en-US',
         timezoneId: timezone,
         permissions: [],
         colorScheme: 'light',
-        deviceScaleFactor: 1,
-        isMobile: false,
-        hasTouch: false,
+        deviceScaleFactor: profile.deviceScaleFactor || 1,
+        isMobile,
+        hasTouch,
         geolocation: { latitude: 40.7128, longitude: -74.0060 },
       });
 
-      await context.addInitScript(() => {
+      const fp = {
+        maxTouchPoints: profile.maxTouchPoints ?? (hasTouch ? 5 : 0),
+        hardwareConcurrency: profile.hardwareConcurrency || 8,
+        deviceMemory: profile.deviceMemory || 8,
+        webglVendor: profile.webglVendor || 'Intel Inc.',
+        webglRenderer: profile.webglRenderer || 'Intel Iris OpenGL Engine',
+        screen,
+        isMobile,
+      };
+
+      await context.addInitScript((fp) => {
         Object.defineProperty(navigator, 'webdriver', { get: () => false });
 
         Object.defineProperty(navigator, 'plugins', {
-          get: () => [
+          get: () => (fp.isMobile ? [] : [
             { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
             { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
             { name: 'Native Client', filename: 'internal-nacl-plugin' },
-          ],
+          ]),
         });
 
         Object.defineProperty(navigator, 'languages', {
@@ -180,16 +199,29 @@ class PlaywrightService {
         });
 
         Object.defineProperty(navigator, 'hardwareConcurrency', {
-          get: () => Math.floor(Math.random() * 4) + 4,
+          get: () => fp.hardwareConcurrency,
         });
 
         Object.defineProperty(navigator, 'deviceMemory', {
-          get: () => Math.floor(Math.random() * 4) + 4,
+          get: () => fp.deviceMemory,
         });
 
         Object.defineProperty(navigator, 'maxTouchPoints', {
-          get: () => 0,
+          get: () => fp.maxTouchPoints,
         });
+
+        if (fp.isMobile) {
+          Object.defineProperty(navigator, 'platform', { get: () => 'Linux armv8l' });
+        }
+
+        try {
+          Object.defineProperty(window.screen, 'width', { get: () => fp.screen.width });
+          Object.defineProperty(window.screen, 'height', { get: () => fp.screen.height });
+          Object.defineProperty(window.screen, 'availWidth', { get: () => fp.screen.availWidth });
+          Object.defineProperty(window.screen, 'availHeight', { get: () => fp.screen.availHeight });
+          Object.defineProperty(window.screen, 'colorDepth', { get: () => fp.screen.colorDepth });
+          Object.defineProperty(window.screen, 'pixelDepth', { get: () => fp.screen.pixelDepth });
+        } catch (_) { /* ignore */ }
 
         if (window.chrome && window.chrome.runtime) {
           Object.defineProperty(window.chrome, 'runtime', {
@@ -197,42 +229,14 @@ class PlaywrightService {
           });
         }
 
-        const originalGetContext = HTMLCanvasElement.prototype.getContext;
-        HTMLCanvasElement.prototype.getContext = function (...args) {
-          const ctx = originalGetContext.apply(this, args);
-          if (ctx && args[0] === '2d') {
-            const originalFillText = ctx.fillText;
-            ctx.fillText = function (...fillArgs) {
-              const noise = () => Math.random() * 0.05;
-              const imageData = ctx.getImageData(0, 0, this.width, this.height);
-              for (let i = 0; i < imageData.data.length; i += 4) {
-                imageData.data[i] += noise();
-                imageData.data[i + 1] += noise();
-                imageData.data[i + 2] += noise();
-              }
-              ctx.putImageData(imageData, 0, 0);
-              return originalFillText.apply(this, fillArgs);
-            };
-          }
-          return ctx;
-        };
-
         const getParameter = WebGLRenderingContext.prototype.getParameter;
         if (getParameter) {
           WebGLRenderingContext.prototype.getParameter = function (param) {
-            if (param === 37445) return 'Intel Inc.';
-            if (param === 37446) return 'Intel Iris OpenGL Engine';
+            if (param === 37445) return fp.webglVendor;
+            if (param === 37446) return fp.webglRenderer;
             return getParameter.apply(this, arguments);
           };
         }
-
-        const sites = ['https://www.google.com/', 'https://www.youtube.com/', 'https://www.facebook.com/', 'https://www.amazon.com/'];
-        const numVisited = Math.floor(Math.random() * 3) + 1;
-        const visited = [];
-        for (let i = 0; i < numVisited; i++) {
-          visited.push(sites[Math.floor(Math.random() * sites.length)]);
-        }
-        Object.defineProperty(navigator, 'webdriver', { get: () => false });
 
         const blockWebRTC = () => {
           if (window.RTCPeerConnection) window.RTCPeerConnection = undefined;
@@ -242,31 +246,22 @@ class PlaywrightService {
           if (navigator.mediaDevices) navigator.mediaDevices.getUserMedia = undefined;
         };
         blockWebRTC();
-      });
+      }, fp);
 
       Object.defineProperty(context, '_userAgent', { value: userAgent });
       Object.defineProperty(context, '_viewport', { value: viewport });
+      Object.defineProperty(context, '_deviceProfile', { value: profile });
 
       const page = await context.newPage();
       page.setDefaultTimeout(45000);
 
       await page.setViewportSize(viewport);
 
-      try {
-        if (typeof navigator !== 'undefined' && navigator.webdriver === undefined) {
-          await page.evaluate(() => {
-            Object.defineProperty(navigator, 'webdriver', { get: () => false });
-          });
-        }
-      } catch (_) {
-        // navigator override already handled by addInitScript or stealth plugin
-      }
-
-      return { browser, context, page, proxyConfig };
+      return { browser, context, page, proxyConfig, deviceProfile: profile };
     } catch (error) {
       if (proxyConfig && retryWithoutProxy) {
         console.warn('Browser launch failed with proxy, retrying without proxy:', error.message);
-        return this.createBrowser(null, false);
+        return this.createBrowser(null, false, deviceProfile);
       }
       throw error;
     }
@@ -289,7 +284,15 @@ class PlaywrightService {
           console.log(`Using proxy for account ${accountId} (attempt ${attempt + 1}):`, proxyConfig.server);
         }
 
-        const result = await this.createBrowser(proxyConfig, false);
+        // Prefer Android fingerprints for mobile ProxyBase pools
+        let preferMobile = false;
+        try {
+          const proxies = await proxyService.getAccountProxies(accountId, false);
+          preferMobile = proxies.some((p) => proxyService.isMobileProxy(p));
+        } catch (_) { /* ignore */ }
+
+        const deviceProfile = await this.getOrCreateDeviceProfile(accountId, { preferMobile });
+        const result = await this.createBrowser(proxyConfig, false, deviceProfile);
         result.proxyConfig = proxyConfig;
         result.accountId = accountId;
 
@@ -313,7 +316,8 @@ class PlaywrightService {
 
     console.log(`All proxy attempts failed for account ${accountId}, trying direct connection`);
     try {
-      const result = await this.createBrowser(null, false);
+      const deviceProfile = await this.getOrCreateDeviceProfile(accountId, { preferMobile: false });
+      const result = await this.createBrowser(null, false, deviceProfile);
       result.proxyConfig = null;
       result.accountId = accountId;
       this._trackBrowser(accountId, result.browser);
@@ -522,15 +526,50 @@ class PlaywrightService {
       }
 
       const errText = await page.evaluate(() => {
-        const el = document.querySelector('.AnimatedForm__errorMessage, [slot="error"], faceplate-banner');
-        return el ? el.textContent?.trim() : '';
+        const parts = [];
+        const selectors = [
+          '.AnimatedForm__errorMessage',
+          '[slot="error"]',
+          'faceplate-banner',
+          '[role="alert"]',
+          '.login-error',
+        ];
+        for (const sel of selectors) {
+          document.querySelectorAll(sel).forEach((el) => {
+            const t = (el.textContent || '').trim();
+            if (t) parts.push(t);
+          });
+        }
+        const body = (document.body?.innerText || '').slice(0, 2500);
+        if (/blocked by network security/i.test(body)) {
+          parts.push('Your request has been blocked by network security');
+        }
+        if (/incorrect username or password/i.test(body)) {
+          parts.push('Incorrect username or password');
+        }
+        if (/disable any extensions|different web browser/i.test(body)) {
+          parts.push('Please disable any extensions or try using a different web browser');
+        }
+        return [...new Set(parts)].join(' | ');
       }).catch(() => '');
       if (errText) console.error('Reddit login error message:', errText);
       await page.screenshot({ path: `/tmp/reddit-login-failed-${username}.png`, fullPage: true }).catch(() => {});
       console.log(`Reddit login failed for ${username}. final_url=${url}`);
+
+      const classed = classifyFailure(errText || `Login failed url=${url}`);
+      if (classed === 'security_block') {
+        throw new Error(`Login failed: network_security_block — ${errText || url}`);
+      }
+      if (classed === 'bad_credentials') {
+        throw new Error(`Login failed: bad_credentials — Incorrect username or password`);
+      }
       return false;
     } catch (error) {
       console.error('Reddit login error:', error);
+      // Re-throw classified login failures so callers can quarantine
+      if (/Login failed:|Username input not found|net::ERR_/i.test(error.message || '')) {
+        throw error;
+      }
       return false;
     }
   }
@@ -1180,6 +1219,7 @@ class PlaywrightService {
   async postComment(platform, accountId, postUrl, comment, parentCommentId = null, { requireProxy = false } = {}) {
     let browser, context, page, proxyId;
     let operationSuccess = false;
+    let lastErrorMsg = null;
 
     try {
       if (!postUrl || !String(postUrl).startsWith('http')) {
@@ -1219,14 +1259,20 @@ class PlaywrightService {
       operationSuccess = true;
       return platformCommentId;
     } catch (error) {
+      lastErrorMsg = error.message || String(error);
       console.error('Error in postComment:', error);
       throw error;
     } finally {
       if (browser) await browser.close();
       this._untrackBrowser(accountId);
       if (proxyId) {
-        try { await proxyService.updateProxyStats(proxyId, operationSuccess); }
-        catch (statsError) { console.error('Error updating proxy stats:', statsError); }
+        try {
+          await proxyService.updateProxyStats(proxyId, operationSuccess, {
+            reason: lastErrorMsg,
+          });
+        } catch (statsError) {
+          console.error('Error updating proxy stats:', statsError);
+        }
       }
     }
   }

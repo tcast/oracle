@@ -133,9 +133,9 @@ class DurableQueue {
 
   organicDelayMs(overrideMs = null) {
     if (overrideMs != null) return overrideMs;
-    // ~6–12 min between ticks (was 15–30) so higher daily targets get picked up
-    const base = 6 * 60 * 1000;
-    const jitter = Math.random() * 6 * 60 * 1000;
+    // ~8–16 min between ticks — slightly calmer than the 6–12 warm-up burst
+    const base = 8 * 60 * 1000;
+    const jitter = Math.random() * 8 * 60 * 1000;
     return base + jitter;
   }
 
