@@ -2036,6 +2036,390 @@ class PlaywrightService {
     }
   }
 
+  /**
+   * Update LinkedIn intro (headline/industry), About, and current experience
+   * for an HR/Talent persona (InsightHire advocacy).
+   */
+  async updateLinkedInHiringPersona(accountId, persona, { requireProxy = false } = {}) {
+    const steps = [];
+    let browser;
+    try {
+      const account = await this.getAccount(accountId);
+      if (account.platform !== 'linkedin') {
+        throw new Error(`Account ${accountId} is ${account.platform}, expected linkedin`);
+      }
+      const creds = typeof account.credentials === 'string'
+        ? JSON.parse(account.credentials)
+        : (account.credentials || {});
+      const password = creds.password;
+      const loginEmail = account.email || account.username;
+      const extras = {
+        totpSecret: creds.totp_secret || creds.totp || creds.twofa,
+        emailPassword: creds.email_password,
+        profileUrl: creds.profile_url,
+      };
+
+      const openBrowser = async (withProxy) => {
+        if (browser) {
+          await browser.close().catch(() => {});
+          this._untrackBrowser(accountId);
+          browser = null;
+        }
+        if (withProxy) {
+          const result = await this.createBrowserForAccount(accountId, 2, { requireProxy });
+          browser = result.browser;
+          return result.page;
+        }
+        const result = await this.createBrowser(
+          null,
+          false,
+          await this.getOrCreateDeviceProfile(accountId, { forceDesktop: true })
+        );
+        browser = result.browser;
+        result.accountId = accountId;
+        this._trackBrowser(accountId, result.browser);
+        return result.page;
+      };
+
+      let page = await openBrowser(false);
+      let loggedIn = false;
+      const restored = await this.restoreSession(page, 'linkedin', accountId);
+      if (restored) {
+        await page.goto('https://www.linkedin.com/in/me/', {
+          waitUntil: 'domcontentloaded',
+          timeout: 60000,
+        });
+        await this.humanLikeDelay(2000, 3500);
+        if (!/authwall|\/login|\/signup|\/uas\//i.test(page.url())) loggedIn = true;
+      }
+      if (!loggedIn) {
+        loggedIn = await this.performLogin(page, 'linkedin', loginEmail, password, extras);
+        if (!loggedIn && !requireProxy) {
+          page = await openBrowser(true);
+          loggedIn = await this.performLogin(page, 'linkedin', loginEmail, password, extras);
+        }
+        if (!loggedIn) throw new Error('LinkedIn login failed');
+        await this.persistSession(page, 'linkedin', accountId);
+        await page.goto('https://www.linkedin.com/in/me/', {
+          waitUntil: 'domcontentloaded',
+          timeout: 60000,
+        });
+        await this.humanLikeDelay(2000, 3500);
+      }
+      if (/authwall|\/login/i.test(page.url())) {
+        throw new Error(`Authwall: ${page.url()}`);
+      }
+
+      const clickSave = async () => {
+        const clicked = await page.evaluate(() => {
+          const buttons = [...document.querySelectorAll('button, [role="button"]')];
+          const order = [/^Save$/i, /^Save changes$/i, /^Done$/i, /^Continue$/i];
+          for (const re of order) {
+            const b = buttons.find((x) => {
+              if (!re.test((x.innerText || '').trim()) || x.disabled) return false;
+              const r = x.getBoundingClientRect();
+              return r.width > 0 && r.height > 0;
+            });
+            if (b) {
+              b.click();
+              return (b.innerText || '').trim();
+            }
+          }
+          return null;
+        });
+        if (clicked) await this.humanLikeDelay(2500, 4000);
+        return clicked;
+      };
+
+      const fillContentEditable = async (text) => {
+        const handle = await page.$('div[role="textbox"][contenteditable="true"]');
+        if (!handle) return false;
+        await handle.click({ force: true });
+        await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A');
+        await page.keyboard.press('Backspace');
+        await handle.type(text, { delay: 12 });
+        return true;
+      };
+
+      // --- Intro: headline + industry ---
+      await page.goto('https://www.linkedin.com/in/me/edit/intro/', {
+        waitUntil: 'domcontentloaded',
+        timeout: 60000,
+      });
+      await this.humanLikeDelay(2500, 4000);
+
+      const headlineOk = await fillContentEditable(persona.headline);
+      if (headlineOk) steps.push('headline');
+      else console.warn(`LinkedIn #${accountId}: headline field missing`);
+
+      // Industry typeahead
+      const industryInput = await page.$('input[aria-label="Industry*"], input[aria-label*="Industry" i]');
+      if (industryInput) {
+        await industryInput.click({ force: true });
+        await industryInput.fill('');
+        await industryInput.type('Staffing and Recruiting', { delay: 25 });
+        await this.humanLikeDelay(1200, 2000);
+        await page.keyboard.press('ArrowDown');
+        await page.keyboard.press('Enter');
+        steps.push('industry');
+        await this.humanLikeDelay(800, 1500);
+      }
+
+      // Prefer adding a new current position from intro dropdown if present
+      const addedPositionFromIntro = await page.evaluate(() => {
+        const select = [...document.querySelectorAll('select')].find((s) =>
+          /Position/i.test(s.labels?.[0]?.innerText || '')
+        );
+        if (!select) return false;
+        const opt = [...select.options].find((o) => /add new position/i.test(o.textContent || ''));
+        if (!opt) return false;
+        select.value = opt.value;
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      }).catch(() => false);
+
+      const savedIntro = await clickSave();
+      if (savedIntro) steps.push(`intro:${savedIntro}`);
+      await page.screenshot({ path: `/tmp/linkedin-persona-intro-${accountId}.png` }).catch(() => {});
+
+      // If intro "Add new position" opened a modal, fill it; otherwise use experience form
+      await this.humanLikeDelay(1500, 2500);
+      const onPositionForm = await page.evaluate(() =>
+        /Title|Company name|Employment type|Add experience|Add position/i.test(
+          (document.body?.innerText || '').slice(0, 2000)
+        ) && !!document.querySelector('input, textarea, div[contenteditable="true"]')
+      );
+
+      const fillPositionForm = async () => {
+        // Title
+        let titleInput = await page.$('input[aria-label*="Title" i], input[id*="title" i]');
+        if (!titleInput) {
+          titleInput = await page.evaluateHandle(() => {
+            const labeled = [...document.querySelectorAll('input')].find((i) =>
+              /Title/i.test(i.labels?.[0]?.innerText || i.getAttribute('aria-label') || '')
+            );
+            return labeled || null;
+          });
+          if (titleInput && titleInput.asElement) titleInput = titleInput.asElement();
+          else titleInput = null;
+        }
+        if (titleInput) {
+          await titleInput.click({ force: true });
+          await titleInput.fill('');
+          await titleInput.type(persona.title, { delay: 20 });
+        }
+
+        // Company typeahead
+        let companyInput = await page.$('input[aria-label*="Company" i], input[id*="company" i]');
+        if (!companyInput) {
+          companyInput = await page.evaluateHandle(() => {
+            const labeled = [...document.querySelectorAll('input')].find((i) =>
+              /Company/i.test(i.labels?.[0]?.innerText || i.getAttribute('aria-label') || '')
+            );
+            return labeled || null;
+          });
+          if (companyInput && companyInput.asElement) companyInput = companyInput.asElement();
+          else companyInput = null;
+        }
+        if (companyInput) {
+          await companyInput.click({ force: true });
+          await companyInput.fill('');
+          await companyInput.type(persona.company, { delay: 20 });
+          await this.humanLikeDelay(1200, 2000);
+          // Pick first suggestion or confirm typed company
+          await page.keyboard.press('ArrowDown').catch(() => {});
+          await page.keyboard.press('Enter').catch(() => {});
+        }
+
+        // Mark as current role if checkbox exists
+        await page.evaluate(() => {
+          const boxes = [...document.querySelectorAll('input[type="checkbox"]')];
+          const current = boxes.find((c) =>
+            /I am currently working|currently work/i.test(
+              `${c.labels?.[0]?.innerText || ''} ${c.parentElement?.innerText || ''}`
+            )
+          );
+          if (current && !current.checked) current.click();
+        }).catch(() => {});
+
+        // Start date rough defaults (year/month selects)
+        await page.evaluate(() => {
+          const selects = [...document.querySelectorAll('select')];
+          const year = selects.find((s) => /Year/i.test(s.getAttribute('aria-label') || s.labels?.[0]?.innerText || ''));
+          const month = selects.find((s) => /Month/i.test(s.getAttribute('aria-label') || s.labels?.[0]?.innerText || ''));
+          if (year) {
+            const opt = [...year.options].find((o) => o.textContent.trim() === '2024') ||
+              [...year.options].find((o) => /^\d{4}$/.test(o.textContent.trim()));
+            if (opt) {
+              year.value = opt.value;
+              year.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+          }
+          if (month) {
+            const opt = [...month.options].find((o) => /Jan|February|Mar/i.test(o.textContent)) || month.options[1];
+            if (opt) {
+              month.value = opt.value;
+              month.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+          }
+        }).catch(() => {});
+
+        const saved = await clickSave();
+        return !!saved;
+      };
+
+      if (onPositionForm || addedPositionFromIntro) {
+        const ok = await fillPositionForm();
+        if (ok) steps.push('experience');
+      } else {
+        // Dedicated experience add URL patterns LinkedIn uses
+        await page.goto('https://www.linkedin.com/in/me/', {
+          waitUntil: 'domcontentloaded',
+          timeout: 60000,
+        });
+        await this.humanLikeDelay(1500, 2500);
+        const openedExp = await page.evaluate(() => {
+          const links = [...document.querySelectorAll('a, button')];
+          const add = links.find((e) =>
+            /add (a )?position|add experience|add employment/i.test(
+              `${e.getAttribute('aria-label') || ''} ${e.innerText || ''}`
+            ) || /\/edit\/forms\/position/i.test(e.getAttribute('href') || '')
+          );
+          if (add) {
+            add.click();
+            return true;
+          }
+          return false;
+        });
+        if (openedExp) {
+          await this.humanLikeDelay(2500, 4000);
+          const ok = await fillPositionForm();
+          if (ok) steps.push('experience');
+        } else {
+          // Try known path
+          const profilePath = page.url().split('?')[0].replace(/\/?$/, '');
+          await page.goto(`${profilePath}/edit/forms/position/new/`, {
+            waitUntil: 'domcontentloaded',
+            timeout: 45000,
+          }).catch(() => {});
+          await this.humanLikeDelay(2500, 4000);
+          if (await page.$('input, div[contenteditable="true"]')) {
+            const ok = await fillPositionForm();
+            if (ok) steps.push('experience');
+          } else {
+            console.warn(`LinkedIn #${accountId}: experience form not found`);
+          }
+        }
+      }
+      await page.screenshot({ path: `/tmp/linkedin-persona-exp-${accountId}.png` }).catch(() => {});
+
+      // --- About / Summary ---
+      await page.goto('https://www.linkedin.com/in/me/', {
+        waitUntil: 'domcontentloaded',
+        timeout: 60000,
+      });
+      await this.humanLikeDelay(2000, 3500);
+      const openedAbout = await page.evaluate(() => {
+        const el = [...document.querySelectorAll('a, button')].find((e) => {
+          const label = `${e.getAttribute('aria-label') || ''} ${e.innerText || ''}`;
+          const href = e.getAttribute('href') || '';
+          return /add a summary|edit about|edit summary|add about/i.test(label) ||
+            /\/edit\/forms\/summary/i.test(href) ||
+            /\/edit\/forms\/about/i.test(href);
+        });
+        if (el) {
+          el.click();
+          return true;
+        }
+        return false;
+      });
+      if (!openedAbout) {
+        const base = page.url().split('?')[0].replace(/\/?$/, '');
+        await page.goto(`${base}/edit/forms/summary/new/?profileFormEntryPoint=GUIDANCE_CARD`, {
+          waitUntil: 'domcontentloaded',
+          timeout: 45000,
+        }).catch(() => {});
+      }
+      await this.humanLikeDelay(2500, 4000);
+
+      // About is usually textarea or contenteditable
+      let aboutFilled = false;
+      const aboutArea = await page.$('textarea, div[role="textbox"][contenteditable="true"], .ql-editor');
+      if (aboutArea) {
+        const tag = await aboutArea.evaluate((el) => el.tagName);
+        await aboutArea.click({ force: true });
+        if (tag === 'TEXTAREA') {
+          await aboutArea.fill('');
+          await aboutArea.type(persona.about, { delay: 8 });
+        } else {
+          await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A');
+          await page.keyboard.press('Backspace');
+          await aboutArea.type(persona.about, { delay: 8 });
+        }
+        aboutFilled = true;
+      }
+      if (aboutFilled) {
+        const saved = await clickSave();
+        if (saved) steps.push('about');
+      } else {
+        console.warn(`LinkedIn #${accountId}: about field missing`);
+      }
+      await page.screenshot({ path: `/tmp/linkedin-persona-about-${accountId}.png` }).catch(() => {});
+
+      // Store persona on account credentials for later organic posting
+      const nextCreds = {
+        ...creds,
+        hiring_persona: {
+          headline: persona.headline,
+          title: persona.title,
+          company: persona.company,
+          about: persona.about,
+          product: 'InsightHire',
+          updated_at: new Date().toISOString(),
+        },
+      };
+      await pool.query(
+        `UPDATE social_accounts
+         SET credentials = $2::jsonb, updated_at = NOW()
+         WHERE id = $1`,
+        [accountId, JSON.stringify(nextCreds)]
+      );
+
+      await this.persistSession(page, 'linkedin', accountId);
+      await page.goto('https://www.linkedin.com/in/me/', {
+        waitUntil: 'domcontentloaded',
+        timeout: 60000,
+      });
+      await this.humanLikeDelay(2000, 3500);
+      await page.screenshot({ path: `/tmp/linkedin-persona-done-${accountId}.png` }).catch(() => {});
+
+      const snapshot = await page.evaluate(() => {
+        const text = (document.body?.innerText || '').slice(0, 2500);
+        return {
+          url: location.href,
+          hasHeadlineHint: /Talent|Recruit|People Ops|HR Director|Sourcer|Hiring/i.test(text),
+          snippet: text.split('\n').map((l) => l.trim()).filter(Boolean).slice(0, 12).join(' | '),
+        };
+      }).catch(() => ({}));
+
+      const success = steps.includes('headline') || steps.includes('about') || snapshot.hasHeadlineHint;
+      return {
+        success,
+        accountId,
+        name: persona.name,
+        steps,
+        profileUrl: creds.profile_url || snapshot.url,
+        snippet: snapshot.snippet || null,
+      };
+    } catch (error) {
+      console.error(`LinkedIn persona update failed for ${accountId}:`, error.message);
+      return { success: false, accountId, name: persona?.name, steps, error: error.message };
+    } finally {
+      if (browser) await browser.close();
+      this._untrackBrowser(accountId);
+    }
+  }
+
   async linkedInPostComment(page, postUrl, comment, parentCommentId = null) {
     try {
       const targetUrl = parentCommentId
