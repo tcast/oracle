@@ -1028,11 +1028,11 @@ class PlaywrightService {
     try {
       const targetUrl = parentCommentId || postUrl;
 
-      await page.goto(targetUrl, { waitUntil: 'domcontentloaded' });
+      await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
       await this.humanLikeDelay(1500, 3000);
       await this.simulateHumanBehavior(page);
 
-      const replyBtn = await page.waitForSelector('[data-testid="reply"]', { timeout: 10000 });
+      const replyBtn = await page.waitForSelector('[data-testid="reply"]', { timeout: 15000 });
       await replyBtn.click();
       await this.humanLikeDelay(1000, 2000);
 
@@ -1045,7 +1045,10 @@ class PlaywrightService {
       await this.humanLikeTyping(page, '[data-testid="tweetTextarea_0"]', comment);
       await this.humanLikeDelay(500, 1500);
 
-      const submitBtn = await page.waitForSelector('[data-testid="tweetButton"]', { timeout: 10000 });
+      const submitBtn = await page.waitForSelector(
+        '[data-testid="tweetButton"], [data-testid="tweetButtonInline"]',
+        { timeout: 10000 }
+      );
       await submitBtn.click();
       await this.humanLikeDelay(2000, 4000);
 
@@ -1053,6 +1056,215 @@ class PlaywrightService {
     } catch (error) {
       console.error('Error posting X comment:', error);
       return false;
+    }
+  }
+
+  /**
+   * Visit an X profile and follow if not already following.
+   * Returns { followed, alreadyFollowing, profileUrl }
+   */
+  async xFollowUser(page, targetUsername) {
+    const handle = String(targetUsername || '').replace(/^@/, '');
+    const profileUrl = `https://x.com/${encodeURIComponent(handle)}`;
+    await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
+    await this.humanLikeDelay(2500, 4500);
+    await this.simulateHumanBehavior(page);
+
+    const state = await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+      const labels = buttons.map((b) => (b.innerText || b.getAttribute('aria-label') || '').trim());
+      const following = labels.some((t) => /^Following$/i.test(t) || /Following @/i.test(t));
+      const pending = labels.some((t) => /^Pending$/i.test(t));
+      return { following, pending, labels: labels.filter((t) => /follow/i.test(t)).slice(0, 8) };
+    });
+
+    if (state.following || state.pending) {
+      return {
+        followed: false,
+        alreadyFollowing: true,
+        pending: !!state.pending,
+        profileUrl,
+      };
+    }
+
+    const clicked = await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+      for (const b of buttons) {
+        const label = (b.innerText || b.getAttribute('aria-label') || '').trim();
+        if (/^Follow$/i.test(label) || /^Follow @/i.test(label)) {
+          const rect = b.getBoundingClientRect();
+          if (rect.width > 8 && rect.height > 8) {
+            b.click();
+            return label;
+          }
+        }
+      }
+      // data-testid fallback
+      const byTest = document.querySelector('[data-testid*="follow"]:not([data-testid*="unfollow"])');
+      if (byTest) {
+        byTest.click();
+        return byTest.getAttribute('data-testid');
+      }
+      return null;
+    });
+
+    await this.humanLikeDelay(1500, 3000);
+
+    if (!clicked) {
+      await page.screenshot({ path: `/tmp/x-follow-miss-${handle}.png`, fullPage: true }).catch(() => {});
+      throw new Error(`Follow button not found on @${handle}`);
+    }
+
+    return {
+      followed: true,
+      alreadyFollowing: false,
+      profileUrl,
+      button: clicked,
+    };
+  }
+
+  /**
+   * Grab recent status URLs from a profile page (must already be on profile or will navigate).
+   */
+  async xFindRecentPosts(page, targetUsername, { limit = 5 } = {}) {
+    const handle = String(targetUsername || '').replace(/^@/, '');
+    const url = page.url();
+    if (!url.includes(`x.com/${handle}`) && !url.includes(`twitter.com/${handle}`)) {
+      await page.goto(`https://x.com/${encodeURIComponent(handle)}`, {
+        waitUntil: 'domcontentloaded',
+        timeout: 90000,
+      });
+      await this.humanLikeDelay(2000, 4000);
+    }
+
+    await this.randomScroll(page).catch(() => {});
+    await this.humanLikeDelay(800, 1500);
+
+    const posts = await page.evaluate((max, handle) => {
+      const seen = new Set();
+      const out = [];
+      const anchors = Array.from(document.querySelectorAll('a[href*="/status/"]'));
+      for (const a of anchors) {
+        const href = a.href || '';
+        const m = href.match(/(?:x|twitter)\.com\/([^/]+)\/status\/(\d+)/i);
+        if (!m) continue;
+        if (handle && m[1].toLowerCase() !== handle.toLowerCase()) continue;
+        const id = m[2];
+        if (seen.has(id)) continue;
+        seen.add(id);
+        out.push({
+          id,
+          url: `https://x.com/${m[1]}/status/${id}`,
+          username: m[1],
+        });
+        if (out.length >= max) break;
+      }
+      return out;
+    }, limit, handle);
+
+    return posts;
+  }
+
+  /**
+   * End-to-end smoke: login → follow target → comment on one of their posts.
+   */
+  async smokeTestXEngagement(accountId, {
+    targetUsername = 'NASA',
+    comment = null,
+    requireProxy = true,
+  } = {}) {
+    let browser;
+    let proxyId = null;
+    const steps = [];
+
+    try {
+      const account = await this.getAccount(accountId);
+      if (account.platform !== 'x') {
+        throw new Error(`Account ${accountId} is ${account.platform}, expected x`);
+      }
+      const password = account.credentials?.password;
+      if (!password || password === 'default_password') {
+        throw new Error('Account has no real password');
+      }
+
+      if (requireProxy) await this.requireProxyForLive(accountId);
+      const result = await this.createBrowserForAccount(accountId, 2, { requireProxy });
+      browser = result.browser;
+      proxyId = result.proxyConfig?._proxyId || null;
+      const page = result.page;
+
+      const loggedIn = await this.ensureLoggedIn(page, 'x', accountId, account.username, password);
+      steps.push({ step: 'login', ok: !!loggedIn });
+      if (!loggedIn) {
+        await page.screenshot({ path: `/tmp/x-smoke-login-${account.username}.png`, fullPage: true }).catch(() => {});
+        throw new Error('X login failed');
+      }
+      await this.persistSession(page, 'x', accountId);
+
+      const follow = await this.xFollowUser(page, targetUsername);
+      steps.push({ step: 'follow', ok: true, ...follow });
+
+      const posts = await this.xFindRecentPosts(page, targetUsername, { limit: 5 });
+      steps.push({ step: 'find_posts', ok: posts.length > 0, count: posts.length, sample: posts[0]?.url || null });
+      if (!posts.length) {
+        throw new Error(`No recent posts found for @${targetUsername}`);
+      }
+
+      const replyText =
+        comment ||
+        this.pickRandom([
+          'interesting take',
+          'hadnt seen this yet',
+          'wild',
+          'makes sense',
+          'good update',
+        ]);
+
+      const targetPost = posts[0];
+      const commented = await this.xPostComment(page, targetPost.url, replyText);
+      steps.push({
+        step: 'comment',
+        ok: !!commented,
+        postUrl: targetPost.url,
+        comment: replyText,
+      });
+      if (!commented) {
+        await page.screenshot({ path: `/tmp/x-smoke-comment-${account.username}.png`, fullPage: true }).catch(() => {});
+        throw new Error('X comment failed');
+      }
+
+      await this.persistSession(page, 'x', accountId);
+      await pool.query(
+        `UPDATE social_accounts
+         SET warmup_status = 'warmed', warmed_up_at = NOW(), last_used_at = NOW(), updated_at = NOW()
+         WHERE id = $1`,
+        [accountId]
+      ).catch(() => {});
+
+      if (proxyId) {
+        await proxyService.updateProxyStats(proxyId, true).catch(() => {});
+      }
+
+      return {
+        success: true,
+        accountId,
+        username: account.username,
+        targetUsername: String(targetUsername).replace(/^@/, ''),
+        steps,
+      };
+    } catch (error) {
+      if (proxyId) {
+        await proxyService.updateProxyStats(proxyId, false, { reason: error.message }).catch(() => {});
+      }
+      return {
+        success: false,
+        accountId,
+        error: error.message,
+        steps,
+      };
+    } finally {
+      if (browser) await browser.close();
+      this._untrackBrowser(accountId);
     }
   }
 
