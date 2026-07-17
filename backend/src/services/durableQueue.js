@@ -2,6 +2,7 @@ const { Queue, Worker } = require('bullmq');
 
 const ORGANIC_QUEUE = 'organic-comments';
 const AUDIT_QUEUE = 'account-stats-audit';
+const X_FOLLOW_QUEUE = 'x-follows';
 
 function redisConnection() {
   return {
@@ -25,9 +26,11 @@ class DurableQueue {
 
     this.queues[ORGANIC_QUEUE] = new Queue(ORGANIC_QUEUE, { connection: this.connection });
     this.queues[AUDIT_QUEUE] = new Queue(AUDIT_QUEUE, { connection: this.connection });
+    this.queues[X_FOLLOW_QUEUE] = new Queue(X_FOLLOW_QUEUE, { connection: this.connection });
 
     const organicCommentScheduler = require('./organicCommentScheduler');
     const accountStatsScheduler = require('./accountStatsScheduler');
+    const xFollowScheduler = require('./xFollowScheduler');
 
     this.workers[ORGANIC_QUEUE] = new Worker(
       ORGANIC_QUEUE,
@@ -52,6 +55,19 @@ class DurableQueue {
         connection: this.connection,
         concurrency: 1,
         lockDuration: 2 * 60 * 60 * 1000,
+      }
+    );
+
+    this.workers[X_FOLLOW_QUEUE] = new Worker(
+      X_FOLLOW_QUEUE,
+      async (job) => {
+        if (job.name !== 'tick') return { skipped: true, reason: 'unknown_job' };
+        return xFollowScheduler.tick();
+      },
+      {
+        connection: this.connection,
+        concurrency: 1,
+        lockDuration: 30 * 60 * 1000,
       }
     );
 
@@ -97,8 +113,30 @@ class DurableQueue {
       }
     });
 
+    this.workers[X_FOLLOW_QUEUE].on('completed', async () => {
+      try {
+        if ((await this.pendingCount(X_FOLLOW_QUEUE)) === 0) {
+          await this.scheduleXFollowTick();
+        }
+      } catch (err) {
+        console.error('Failed to schedule next X follow tick:', err.message);
+      }
+    });
+
+    this.workers[X_FOLLOW_QUEUE].on('failed', async (_job, err) => {
+      console.error('X follow tick job failed:', err?.message || err);
+      try {
+        if ((await this.pendingCount(X_FOLLOW_QUEUE)) === 0) {
+          await this.scheduleXFollowTick(60 * 1000);
+        }
+      } catch (e) {
+        console.error('Failed to reschedule X follow after failure:', e.message);
+      }
+    });
+
     await this.ensureOrganicLoop();
     await this.ensureAuditLoop();
+    await this.ensureXFollowLoop();
 
     this.started = true;
     console.log(
@@ -219,6 +257,55 @@ class DurableQueue {
     await this.scheduleAuditTick(20000);
   }
 
+  xFollowDelayMs(overrideMs = null) {
+    if (overrideMs != null) return overrideMs;
+    // ~10–20 min between ticks — calmer than organic comments
+    const base = 10 * 60 * 1000;
+    const jitter = Math.random() * 10 * 60 * 1000;
+    return base + jitter;
+  }
+
+  async kickXFollowSoon(delayMs = 5000) {
+    const q = this.queues[X_FOLLOW_QUEUE];
+    if (!q) throw new Error('X follow queue not initialized');
+    const delayed = await q.getDelayed();
+    const waiting = await q.getWaiting();
+    for (const job of [...delayed, ...waiting]) {
+      if (job.name === 'tick') {
+        try {
+          await job.remove();
+        } catch { /* ignore */ }
+      }
+    }
+    await this.scheduleXFollowTick(delayMs);
+  }
+
+  async scheduleXFollowTick(overrideMs = null) {
+    const q = this.queues[X_FOLLOW_QUEUE];
+    if (!q) throw new Error('X follow queue not initialized');
+    const delay = this.xFollowDelayMs(overrideMs);
+    await q.add(
+      'tick',
+      { scheduledAt: new Date().toISOString() },
+      {
+        delay,
+        removeOnComplete: 100,
+        removeOnFail: 50,
+        attempts: 1,
+      }
+    );
+    console.log(`X follow tick scheduled in ${Math.round(delay / 1000)}s`);
+  }
+
+  async ensureXFollowLoop() {
+    const pending = await this.pendingCount(X_FOLLOW_QUEUE);
+    if (pending > 0) {
+      console.log(`X follow queue already has ${pending} pending job(s) — skipping seed`);
+      return;
+    }
+    await this.scheduleXFollowTick(8000);
+  }
+
   async getStatus() {
     if (!this.started) {
       return { started: false, redis: null, queues: {} };
@@ -237,12 +324,20 @@ class DurableQueue {
       'completed',
       'failed'
     );
+    const xFollow = await this.queues[X_FOLLOW_QUEUE].getJobCounts(
+      'delayed',
+      'waiting',
+      'active',
+      'completed',
+      'failed'
+    );
     return {
       started: true,
       redis: `${this.connection.host}:${this.connection.port}`,
       queues: {
         [ORGANIC_QUEUE]: organic,
         [AUDIT_QUEUE]: audit,
+        [X_FOLLOW_QUEUE]: xFollow,
       },
     };
   }

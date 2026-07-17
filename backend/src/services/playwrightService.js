@@ -279,9 +279,23 @@ class PlaywrightService {
     }
   }
 
-  async createBrowserForAccount(accountId, maxRetries = 2, { requireProxy = false } = {}) {
+  async createBrowserForAccount(accountId, maxRetries = 2, { requireProxy = false, skipProxy = false } = {}) {
     let lastError;
     let attempt = 0;
+
+    if (skipProxy) {
+      console.log(`Skipping proxy for account ${accountId} (direct connection)`);
+      const forceDesktop = true;
+      const deviceProfile = await this.getOrCreateDeviceProfile(accountId, {
+        preferMobile: false,
+        forceDesktop,
+      });
+      const result = await this.createBrowser(null, false, deviceProfile);
+      result.proxyConfig = null;
+      result.accountId = accountId;
+      this._trackBrowser(accountId, result.browser);
+      return result;
+    }
 
     while (attempt < maxRetries) {
       try {
@@ -1036,13 +1050,27 @@ class PlaywrightService {
         const hasHome = !!document.querySelector(
           '[data-testid="SideNav_AccountSwitcher_Button"], [data-testid="AppTabBar_Home_Link"], [aria-label="Home timeline"]'
         );
-        const wrong = /Wrong password|Incorrect|Couldn.t find your account|Try again|suspended|locked/i.test(text);
+        const rateLimited = /temporarily limited your login|try again later/i.test(text);
+        const wrong =
+          !rateLimited &&
+          /Wrong password|Incorrect(?:\s+password)?|Couldn.t find your account|suspended|locked/i.test(text);
         const stillPassword = !!document.querySelector('input[type="password"]');
-        return { url, hasHome, wrong, stillPassword, snippet: text.split('\n').map((l) => l.trim()).filter(Boolean).slice(0, 12).join(' | ') };
+        return {
+          url,
+          hasHome,
+          wrong,
+          rateLimited,
+          stillPassword,
+          snippet: text.split('\n').map((l) => l.trim()).filter(Boolean).slice(0, 12).join(' | '),
+        };
       }).catch(() => ({}));
       console.log(`X login post-submit for ${username}:`, JSON.stringify(postSubmit));
       await page.screenshot({ path: `/tmp/x-login-postsubmit-${username}.png`, fullPage: true }).catch(() => {});
 
+      if (postSubmit.rateLimited) {
+        console.log(`X login rate-limited for ${username}`);
+        throw new Error('X temporarily limited login — try again later');
+      }
       if (postSubmit.wrong) {
         console.log(`X login bad credentials for ${username}`);
         return false;
@@ -1359,6 +1387,90 @@ class PlaywrightService {
     }, limit, handle);
 
     return posts;
+  }
+
+  /**
+   * Login (or reuse session) and follow a single X handle.
+   */
+  async followXUser(accountId, targetUsername, { requireProxy = true } = {}) {
+    const account = await this.getAccount(accountId);
+    if (account.platform !== 'x') {
+      throw new Error(`Account ${accountId} is ${account.platform}, expected x`);
+    }
+    const password = account.credentials?.password;
+    if (!password || password === 'default_password') {
+      throw new Error('Account has no real password');
+    }
+
+    // Prefer proxy; if X rate-limits login on the proxy IP, retry direct once
+    // to refresh cookies, then follow. Later ticks can reuse the session via proxy.
+    const modes = requireProxy
+      ? [{ requireProxy: true, skipProxy: false }, { requireProxy: false, skipProxy: true }]
+      : [{ requireProxy: false, skipProxy: true }];
+
+    let lastError;
+    for (const mode of modes) {
+      let browser;
+      try {
+        if (mode.requireProxy) await this.requireProxyForLive(accountId);
+        const result = await this.createBrowserForAccount(accountId, 2, mode);
+        browser = result.browser;
+        const page = result.page;
+
+        const loggedIn = await this.ensureLoggedIn(page, 'x', accountId, account.username, password);
+        if (!loggedIn) {
+          await page.screenshot({ path: `/tmp/x-follow-login-${account.username}.png`, fullPage: true }).catch(() => {});
+          throw new Error('X login failed');
+        }
+
+        try {
+          await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 60000 });
+          await this.humanLikeDelay(2000, 4000);
+          await this.simulateHumanBehavior(page);
+          await this.randomScroll(page).catch(() => {});
+        } catch {
+          /* continue */
+        }
+
+        const follow = await this.xFollowUser(page, targetUsername);
+        await this.persistSession(page, 'x', accountId);
+        await pool.query(
+          `UPDATE social_accounts
+           SET last_used_at = NOW(), updated_at = NOW(),
+               warmup_status = 'warmed', warmed_up_at = COALESCE(warmed_up_at, NOW())
+           WHERE id = $1`,
+          [accountId]
+        ).catch(() => {});
+
+        return {
+          success: true,
+          accountId,
+          username: account.username,
+          usedProxy: !mode.skipProxy,
+          ...follow,
+        };
+      } catch (err) {
+        lastError = err;
+        const msg = String(err.message || err);
+        const canRetryDirect =
+          !mode.skipProxy &&
+          (/login failed|temporarily limited|challenge|security/i.test(msg));
+        console.warn(
+          `X follow via ${mode.skipProxy ? 'direct' : 'proxy'} failed for #${accountId}: ${msg}` +
+            (canRetryDirect ? ' — retrying direct' : '')
+        );
+        if (!canRetryDirect) break;
+      } finally {
+        if (browser) {
+          try {
+            await browser.close();
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    }
+    throw lastError || new Error('X follow failed');
   }
 
   /**

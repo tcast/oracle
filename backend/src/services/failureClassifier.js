@@ -18,6 +18,9 @@ function classifyFailure(message = '') {
   if (/err_tunnel|err_timed_out|err_proxy|tunnel_connection|proxy|net::err_/i.test(msg)) {
     return 'proxy_error';
   }
+  if (/temporarily limited|try again later/i.test(msg)) {
+    return 'challenge';
+  }
   if (/login failed/i.test(msg)) {
     return 'login_failed';
   }
