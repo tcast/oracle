@@ -944,23 +944,38 @@ class PlaywrightService {
       await passwordInput.type(password, { delay: 40 });
       await this.humanLikeDelay(500, 1500);
 
+      // After password: ONLY Log in / Sign in — never Continue (resets to username)
       const loginClicked = await page.evaluate(() => {
         const buttons = [...document.querySelectorAll('button, [role="button"]')];
-        for (const label of ['Log in', 'Sign in', 'Next', 'Continue']) {
+        for (const label of ['Log in', 'Sign in']) {
           const match = buttons.find((b) => (b.innerText || '').trim() === label);
           if (match) {
             match.click();
             return label;
           }
         }
-        const submit = document.querySelector('button[type="submit"]');
+        const byTest = document.querySelector('[data-testid="LoginForm_Login_Button"]');
+        if (byTest) {
+          byTest.click();
+          return 'LoginForm_Login_Button';
+        }
+        const submit = document.querySelector('form button[type="submit"], button[type="submit"]');
         if (submit) {
-          submit.click();
-          return 'submit';
+          const t = (submit.innerText || '').trim();
+          if (!/continue with|google|apple|phone/i.test(t)) {
+            submit.click();
+            return t || 'submit';
+          }
         }
         return null;
       });
-      if (!loginClicked) await page.keyboard.press('Enter');
+      if (!loginClicked) {
+        console.log('X login: no Log in button — pressing Enter in password field');
+        await passwordInput.focus().catch(() => {});
+        await page.keyboard.press('Enter');
+      } else {
+        console.log(`X login: clicked ${loginClicked}`);
+      }
       await this.humanLikeDelay(5000, 8000);
 
       // Capture immediate post-submit state before navigating away
