@@ -532,6 +532,7 @@ class PlaywrightService {
   }
 
   async ensureLoggedIn(page, platform, accountId, username, password, extras = {}) {
+    const allowLogin = extras.allowLogin !== false;
     const sessionRestored = await this.restoreSession(page, platform, accountId);
     if (sessionRestored) {
       const alive = await this.verifySessionAlive(page, platform);
@@ -539,7 +540,11 @@ class PlaywrightService {
         console.log(`Reused existing session for ${platform}/${username}`);
         return true;
       }
-      console.log(`Session expired for ${platform}/${username}, re-logging in`);
+      console.log(`Session expired for ${platform}/${username}${allowLogin ? ', re-logging in' : ' — login disabled'}`);
+    }
+
+    if (!allowLogin) {
+      throw new Error(`no_live_session for ${platform}/${username} — refusing password login`);
     }
 
     const loginSuccess = await this.performLogin(page, platform, username, password, extras);
@@ -1397,7 +1402,7 @@ class PlaywrightService {
   /**
    * Login (or reuse session) and follow a single X handle.
    */
-  async followXUser(accountId, targetUsername, { requireProxy = true } = {}) {
+  async followXUser(accountId, targetUsername, { requireProxy = true, allowLogin = false } = {}) {
     const account = await this.getAccount(accountId);
     if (account.platform !== 'x') {
       throw new Error(`Account ${accountId} is ${account.platform}, expected x`);
@@ -1407,8 +1412,8 @@ class PlaywrightService {
       throw new Error('Account has no real password');
     }
 
-    // Prefer proxy; if X rate-limits login on the proxy IP, retry direct once
-    // to refresh cookies, then follow. Later ticks can reuse the session via proxy.
+    // Prefer proxy; only fall back to direct for proxy/network failures.
+    // Follows default allowLogin=false — dead sessions must not password-submit.
     const modes = requireProxy
       ? [{ requireProxy: true, skipProxy: false }, { requireProxy: false, skipProxy: true }]
       : [{ requireProxy: false, skipProxy: true }];
@@ -1422,7 +1427,9 @@ class PlaywrightService {
         browser = result.browser;
         const page = result.page;
 
-        const loggedIn = await this.ensureLoggedIn(page, 'x', accountId, account.username, password);
+        const loggedIn = await this.ensureLoggedIn(page, 'x', accountId, account.username, password, {
+          allowLogin,
+        });
         if (!loggedIn) {
           await page.screenshot({ path: `/tmp/x-follow-login-${account.username}.png`, fullPage: true }).catch(() => {});
           throw new Error('X login failed');

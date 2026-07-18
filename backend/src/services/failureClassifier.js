@@ -26,6 +26,9 @@ function classifyFailure(message = '') {
   ) {
     return 'challenge';
   }
+  if (/no_live_session/i.test(msg)) {
+    return 'login_failed';
+  }
   if (/login failed/i.test(msg)) {
     return 'login_failed';
   }

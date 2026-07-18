@@ -166,6 +166,29 @@ class XFollowService {
     return result.rows[0];
   }
 
+  /** Max age of a persisted X session before we refuse password re-login for follows. */
+  static SESSION_MAX_AGE_HOURS = 72;
+
+  async getLiveSession(accountId) {
+    const result = await pool.query(
+      `SELECT updated_at, created_at,
+              CASE WHEN cookies IS NULL THEN 0 ELSE jsonb_array_length(cookies) END AS cookie_count
+       FROM browser_sessions
+       WHERE account_id = $1 AND platform = 'x'
+       ORDER BY updated_at DESC
+       LIMIT 1`,
+      [accountId]
+    );
+    return result.rows[0] || null;
+  }
+
+  sessionIsFresh(session, maxAgeHours = XFollowService.SESSION_MAX_AGE_HOURS) {
+    if (!session || !session.updated_at) return false;
+    if ((session.cookie_count || 0) < 1) return false;
+    const ageMs = Date.now() - new Date(session.updated_at).getTime();
+    return ageMs <= maxAgeHours * 60 * 60 * 1000;
+  }
+
   async listEligibleAccounts() {
     const result = await pool.query(
       `SELECT sa.*
@@ -184,9 +207,43 @@ class XFollowService {
              AND p.is_active = true
              AND (p.cooldown_until IS NULL OR p.cooldown_until <= NOW())
          )
+         -- Require a recent persisted session; never enroll dead cookies into follow ticks
+         AND EXISTS (
+           SELECT 1 FROM browser_sessions bs
+           WHERE bs.account_id = sa.id AND bs.platform = 'x'
+             AND bs.cookies IS NOT NULL
+             AND jsonb_array_length(bs.cookies) > 0
+             AND bs.updated_at > NOW() - INTERVAL '${XFollowService.SESSION_MAX_AGE_HOURS} hours'
+         )
        ORDER BY sa.id`
     );
     return result.rows;
+  }
+
+  /**
+   * If many accounts are failing login/rate-limit, kill the campaign so the
+   * durable queue cannot keep walking the army into password submits.
+   */
+  async pauseCampaignIfLoginCascade(threshold = 3) {
+    const result = await pool.query(
+      `SELECT COUNT(DISTINCT social_account_id)::int AS n
+       FROM x_follow_jobs
+       WHERE failure_class IN ('login_failed', 'challenge')
+         AND updated_at > NOW() - INTERVAL '24 hours'
+         AND consecutive_failures >= 1`
+    );
+    const n = result.rows[0]?.n || 0;
+    if (n < threshold) return { paused: false, n };
+
+    await pool.query(
+      `UPDATE x_follow_settings
+       SET enabled = false, updated_at = NOW()
+       WHERE id = 1 AND enabled = true`
+    );
+    console.error(
+      `X follow campaign auto-paused: ${n} account(s) hit login/challenge failures in 24h`
+    );
+    return { paused: true, n };
   }
 
   /**
@@ -367,12 +424,27 @@ class XFollowService {
       return { skipped: true, reason: 'proxy', error: msg };
     }
 
+    // Session gate: follows must reuse a live cookie jar. Dead sessions must
+    // NOT fall through to ensureLoggedIn → password submit (that is what
+    // rate-limited the whole army when Jul-9 sessions were expired).
+    const session = await this.getLiveSession(account.id);
+    if (!this.sessionIsFresh(session)) {
+      const age = session?.updated_at
+        ? `${Math.round((Date.now() - new Date(session.updated_at).getTime()) / 3600000)}h old`
+        : 'missing';
+      const msg = `no_live_session (${age}) — refusing password login for follow`;
+      await this.applyFailureQuarantine(job, msg);
+      await this.pauseCampaignIfLoginCascade(3);
+      return { skipped: true, reason: 'no_live_session', error: msg };
+    }
+
     try {
       let followResult = { followed: false, alreadyFollowing: false, profileUrl: `https://x.com/${target.handle}` };
 
       if (!dryRun) {
         followResult = await playwrightService.followXUser(account.id, target.handle, {
           requireProxy: true,
+          allowLogin: false,
         });
       } else {
         followResult = { followed: true, alreadyFollowing: false, profileUrl: `https://x.com/${target.handle}`, dryRun: true };
@@ -430,6 +502,9 @@ class XFollowService {
         ? `X temporarily limited login: ${msg}`
         : msg;
       await this.applyFailureQuarantine(job, quarantineMsg);
+      if (/temporarily limited|try again later|rate.?limit|login failed|no_live_session/i.test(msg)) {
+        await this.pauseCampaignIfLoginCascade(3);
+      }
       await pool.query(
         `INSERT INTO x_follows
            (social_account_id, proxy_id, handle, category, status, profile_url, error)
