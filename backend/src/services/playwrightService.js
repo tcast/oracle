@@ -523,7 +523,7 @@ class PlaywrightService {
   async performLogin(page, platform, username, password, extras = {}) {
     switch (platform) {
       case 'reddit': return this.redditLogin(page, username, password);
-      case 'x': return this.xLogin(page, username, password);
+      case 'x': return this.xLogin(page, username, password, extras);
       case 'linkedin': return this.linkedInLogin(page, username, password, extras);
       case 'instagram': return this.instagramLogin(page, username, password, extras);
       case 'tiktok': return this.tiktokLogin(page, username, password, extras);
@@ -541,6 +541,8 @@ class PlaywrightService {
         return true;
       }
       console.log(`Session expired for ${platform}/${username}${allowLogin ? ', re-logging in' : ' — login disabled'}`);
+      // Dead marketplace cookies (e.g. AccsMarket MsaArtifacts) poison password login if left in context.
+      await page.context().clearCookies().catch(() => {});
     }
 
     if (!allowLogin) {
@@ -896,10 +898,24 @@ class PlaywrightService {
     return false;
   }
 
-  async xLogin(page, username, password) {
+  async xLogin(page, username, password, extras = {}) {
     try {
       // Prefer the dedicated login flow — mobile landing only shows "Sign in"
-      await page.goto('https://x.com/i/flow/login', { waitUntil: 'domcontentloaded', timeout: 90000 });
+      let navigated = false;
+      for (let navAttempt = 0; navAttempt < 3 && !navigated; navAttempt++) {
+        try {
+          await page.goto('https://x.com/i/flow/login', { waitUntil: 'domcontentloaded', timeout: 90000 });
+          if (/chrome-error:|chromewebdata/i.test(page.url())) {
+            throw new Error(`chrome-error navigation (${page.url()})`);
+          }
+          navigated = true;
+        } catch (navErr) {
+          const msg = navErr.message || String(navErr);
+          console.warn(`X login navigation attempt ${navAttempt + 1} failed: ${msg}`);
+          if (navAttempt >= 2) throw navErr;
+          await this.humanLikeDelay(2000, 4000);
+        }
+      }
       await this.humanLikeDelay(2500, 4500);
       await this.dismissXConsent(page);
 
@@ -1016,23 +1032,32 @@ class PlaywrightService {
 
       // After password: ONLY Log in / Sign in — never Continue (resets to username)
       const loginClicked = await page.evaluate(() => {
-        const buttons = [...document.querySelectorAll('button, [role="button"]')];
-        for (const label of ['Log in', 'Sign in']) {
-          const match = buttons.find((b) => (b.innerText || '').trim() === label);
+        const buttons = [...document.querySelectorAll('button, [role="button"], div[role="button"]')];
+        for (const label of ['Log in', 'Sign in', 'Log In']) {
+          const match = buttons.find((b) => {
+            const t = (b.innerText || b.getAttribute('aria-label') || '').trim();
+            return t === label || new RegExp(`^${label}$`, 'i').test(t);
+          });
           if (match) {
             match.click();
-            return label;
+            return (match.innerText || label).trim();
           }
         }
-        const byTest = document.querySelector('[data-testid="LoginForm_Login_Button"]');
+        const byTest = document.querySelector(
+          '[data-testid="LoginForm_Login_Button"], [data-testid="LoginForm_Login_Button"] span, button[data-testid*="Login"]'
+        );
         if (byTest) {
-          byTest.click();
+          const el = byTest.closest('button, [role="button"]') || byTest;
+          el.click();
           return 'LoginForm_Login_Button';
         }
-        const submit = document.querySelector('form button[type="submit"], button[type="submit"]');
+        // jf/onboarding: primary blue button next to password often has no exact text match
+        const submit = document.querySelector(
+          'form button[type="submit"], button[type="submit"], [data-testid="ocfEnterTextNextButton"]'
+        );
         if (submit) {
-          const t = (submit.innerText || '').trim();
-          if (!/continue with|google|apple|phone/i.test(t)) {
+          const t = (submit.innerText || submit.getAttribute('aria-label') || '').trim();
+          if (!/continue with|google|apple|phone|sign up/i.test(t)) {
             submit.click();
             return t || 'submit';
           }
@@ -1081,6 +1106,12 @@ class PlaywrightService {
         return false;
       }
 
+      // 2FA / authenticator challenge (common on AccsMarket accounts with totp_secret)
+      const totpHandled = await this.handleXTotpChallenge(page, username, extras);
+      if (totpHandled === 'rate_limited') {
+        throw new Error('X temporarily limited login — try again later');
+      }
+
       const loggedIn = await page.$(
         '[data-testid="SideNav_AccountSwitcher_Button"], [data-testid="AppTabBar_Home_Link"], a[href="/home"], [data-testid="BottomBar_Home_Link"]'
       );
@@ -1127,8 +1158,115 @@ class PlaywrightService {
     }
   }
 
+  /**
+   * Submit authenticator TOTP when X shows a 2FA / verification-code step.
+   * Returns true if a code was submitted, false if no challenge, 'rate_limited' if limited.
+   */
+  async handleXTotpChallenge(page, username, extras = {}) {
+    const challenge = await page.evaluate(() => {
+      const text = (document.body?.innerText || '').slice(0, 4000);
+      const hasCodeInput = !!(
+        document.querySelector(
+          'input[data-testid="ocfEnterTextTextInput"], input[name="text"], input[autocomplete="one-time-code"], input[inputmode="numeric"]'
+        )
+      );
+      return {
+        totp:
+          hasCodeInput &&
+          /verification code|authentication code|authenticator|Enter (the )?code|confirmation code|two.?factor|2fa|6.?digit|Check your.{0,20}app/i.test(
+            text
+          ),
+        rateLimited: /temporarily limited your login|try again later/i.test(text),
+        snippet: text
+          .split('\n')
+          .map((l) => l.trim())
+          .filter(Boolean)
+          .slice(0, 12)
+          .join(' | '),
+      };
+    }).catch(() => ({}));
+
+    if (challenge.rateLimited) return 'rate_limited';
+    if (!challenge.totp) return false;
+
+    if (!extras.totpSecret) {
+      console.log(`X 2FA challenge for ${username} but no totpSecret: ${challenge.snippet}`);
+      await page.screenshot({ path: `/tmp/x-login-2fa-missing-${username}.png`, fullPage: true }).catch(() => {});
+      return false;
+    }
+
+    const code = generateTotp(extras.totpSecret);
+    console.log(`X 2FA for ${username} — submitting TOTP`);
+    let codeInput = await page.waitForSelector(
+      [
+        'input[data-testid="ocfEnterTextTextInput"]',
+        'input[autocomplete="one-time-code"]',
+        'input[inputmode="numeric"]',
+        'input[name="text"]',
+        'input[type="tel"]',
+        'input[type="text"]',
+      ].join(', '),
+      { timeout: 12000, state: 'visible' }
+    ).catch(() => null);
+
+    if (!codeInput) {
+      console.log(`X 2FA input missing for ${username}`);
+      await page.screenshot({ path: `/tmp/x-login-2fa-noinput-${username}.png`, fullPage: true }).catch(() => {});
+      return false;
+    }
+
+    await codeInput.click({ force: true }).catch(() => {});
+    await codeInput.fill('');
+    await codeInput.type(code, { delay: 40 });
+    await this.humanLikeDelay(500, 1000);
+
+    const nextClicked = await page.evaluate(() => {
+      const buttons = [...document.querySelectorAll('button, [role="button"]')];
+      for (const label of ['Next', 'Verify', 'Confirm', 'Continue', 'Submit', 'Log in', 'Sign in']) {
+        const match = buttons.find((b) => (b.innerText || '').trim() === label);
+        if (match) {
+          match.click();
+          return label;
+        }
+      }
+      const submit = document.querySelector('button[type="submit"]');
+      if (submit) {
+        submit.click();
+        return 'submit';
+      }
+      return null;
+    });
+    if (!nextClicked) await page.keyboard.press('Enter');
+    else console.log(`X 2FA: clicked ${nextClicked}`);
+
+    await this.humanLikeDelay(4000, 7000);
+    await this.dismissXConsent(page);
+
+    const after = await page.evaluate(() => {
+      const text = (document.body?.innerText || '').slice(0, 2500);
+      return {
+        rateLimited: /temporarily limited your login|try again later/i.test(text),
+        wrongCode: /incorrect.?code|wrong.?code|try again|invalid.?code/i.test(text),
+        hasHome: !!document.querySelector(
+          '[data-testid="SideNav_AccountSwitcher_Button"], [data-testid="AppTabBar_Home_Link"], [aria-label="Home timeline"]'
+        ),
+        snippet: text
+          .split('\n')
+          .map((l) => l.trim())
+          .filter(Boolean)
+          .slice(0, 10)
+          .join(' | '),
+      };
+    }).catch(() => ({}));
+    console.log(`X 2FA post-submit for ${username}:`, JSON.stringify(after));
+    await page.screenshot({ path: `/tmp/x-login-2fa-post-${username}.png`, fullPage: true }).catch(() => {});
+
+    if (after.rateLimited) return 'rate_limited';
+    return true;
+  }
+
   /** Test login for one account; persists session on success. */
-  async testAccountLogin(accountId) {
+  async testAccountLogin(accountId, { requireProxy = false } = {}) {
     let browser;
     try {
       const account = await this.getAccount(accountId);
@@ -1137,7 +1275,13 @@ class PlaywrightService {
         throw new Error('Account has no real password');
       }
 
-      const result = await this.createBrowserForAccount(accountId, 2, { requireProxy: false });
+      const creds = account.credentials || {};
+      const extras = {
+        totpSecret: creds.totp_secret || creds.totp || creds.twofa,
+      };
+
+      if (requireProxy) await this.requireProxyForLive(accountId);
+      const result = await this.createBrowserForAccount(accountId, 2, { requireProxy });
       browser = result.browser;
       const page = result.page;
 
@@ -1146,7 +1290,8 @@ class PlaywrightService {
         account.platform,
         accountId,
         account.username,
-        password
+        password,
+        extras
       );
 
       if (loggedIn) {
@@ -1199,7 +1344,9 @@ class PlaywrightService {
       page = result.page;
       proxyId = result.proxyConfig?._proxyId;
 
-      const loggedIn = await this.ensureLoggedIn(page, 'x', accountId, account.username, account.credentials.password);
+      const loggedIn = await this.ensureLoggedIn(page, 'x', accountId, account.username, account.credentials.password, {
+        totpSecret: account.credentials?.totp_secret || account.credentials?.totp || account.credentials?.twofa,
+      });
       if (!loggedIn) throw new Error('X login failed');
 
       await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded' });
@@ -1429,6 +1576,7 @@ class PlaywrightService {
 
         const loggedIn = await this.ensureLoggedIn(page, 'x', accountId, account.username, password, {
           allowLogin,
+          totpSecret: account.credentials?.totp_secret || account.credentials?.totp || account.credentials?.twofa,
         });
         if (!loggedIn) {
           await page.screenshot({ path: `/tmp/x-follow-login-${account.username}.png`, fullPage: true }).catch(() => {});
@@ -1517,7 +1665,10 @@ class PlaywrightService {
       proxyId = result.proxyConfig?._proxyId || null;
       const page = result.page;
 
-      const loggedIn = await this.ensureLoggedIn(page, 'x', accountId, account.username, password);
+      const creds = account.credentials || {};
+      const loggedIn = await this.ensureLoggedIn(page, 'x', accountId, account.username, password, {
+        totpSecret: creds.totp_secret || creds.totp || creds.twofa,
+      });
       steps.push({ step: 'login', ok: !!loggedIn });
       if (!loggedIn) {
         await page.screenshot({ path: `/tmp/x-smoke-login-${account.username}.png`, fullPage: true }).catch(() => {});
