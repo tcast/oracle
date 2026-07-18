@@ -3,6 +3,7 @@ const { Queue, Worker } = require('bullmq');
 const ORGANIC_QUEUE = 'organic-comments';
 const AUDIT_QUEUE = 'account-stats-audit';
 const X_FOLLOW_QUEUE = 'x-follows';
+const SOCIAL_WARM_QUEUE = 'social-warm';
 
 function redisConnection() {
   return {
@@ -27,10 +28,12 @@ class DurableQueue {
     this.queues[ORGANIC_QUEUE] = new Queue(ORGANIC_QUEUE, { connection: this.connection });
     this.queues[AUDIT_QUEUE] = new Queue(AUDIT_QUEUE, { connection: this.connection });
     this.queues[X_FOLLOW_QUEUE] = new Queue(X_FOLLOW_QUEUE, { connection: this.connection });
+    this.queues[SOCIAL_WARM_QUEUE] = new Queue(SOCIAL_WARM_QUEUE, { connection: this.connection });
 
     const organicCommentScheduler = require('./organicCommentScheduler');
     const accountStatsScheduler = require('./accountStatsScheduler');
     const xFollowScheduler = require('./xFollowScheduler');
+    const socialWarmScheduler = require('./socialWarmScheduler');
 
     this.workers[ORGANIC_QUEUE] = new Worker(
       ORGANIC_QUEUE,
@@ -63,6 +66,19 @@ class DurableQueue {
       async (job) => {
         if (job.name !== 'tick') return { skipped: true, reason: 'unknown_job' };
         return xFollowScheduler.tick();
+      },
+      {
+        connection: this.connection,
+        concurrency: 1,
+        lockDuration: 30 * 60 * 1000,
+      }
+    );
+
+    this.workers[SOCIAL_WARM_QUEUE] = new Worker(
+      SOCIAL_WARM_QUEUE,
+      async (job) => {
+        if (job.name !== 'tick') return { skipped: true, reason: 'unknown_job' };
+        return socialWarmScheduler.tick();
       },
       {
         connection: this.connection,
@@ -134,9 +150,31 @@ class DurableQueue {
       }
     });
 
+    this.workers[SOCIAL_WARM_QUEUE].on('completed', async () => {
+      try {
+        if ((await this.pendingCount(SOCIAL_WARM_QUEUE)) === 0) {
+          await this.scheduleSocialWarmTick();
+        }
+      } catch (err) {
+        console.error('Failed to schedule next social-warm tick:', err.message);
+      }
+    });
+
+    this.workers[SOCIAL_WARM_QUEUE].on('failed', async (_job, err) => {
+      console.error('Social warm tick job failed:', err?.message || err);
+      try {
+        if ((await this.pendingCount(SOCIAL_WARM_QUEUE)) === 0) {
+          await this.scheduleSocialWarmTick(60 * 1000);
+        }
+      } catch (e) {
+        console.error('Failed to reschedule social-warm after failure:', e.message);
+      }
+    });
+
     await this.ensureOrganicLoop();
     await this.ensureAuditLoop();
     await this.ensureXFollowLoop();
+    await this.ensureSocialWarmLoop();
 
     this.started = true;
     console.log(
@@ -306,6 +344,47 @@ class DurableQueue {
     await this.scheduleXFollowTick(8000);
   }
 
+  socialWarmDelayMs(overrideMs = null) {
+    if (overrideMs != null) return overrideMs;
+    const base = 12 * 60 * 1000;
+    const jitter = Math.random() * 10 * 60 * 1000;
+    return base + jitter;
+  }
+
+  async kickSocialWarmSoon(delayMs = 5000) {
+    const q = this.queues[SOCIAL_WARM_QUEUE];
+    if (!q) throw new Error('Social warm queue not initialized');
+    const delayed = await q.getDelayed();
+    const waiting = await q.getWaiting();
+    for (const job of [...delayed, ...waiting]) {
+      if (job.name === 'tick') {
+        try { await job.remove(); } catch { /* ignore */ }
+      }
+    }
+    await this.scheduleSocialWarmTick(delayMs);
+  }
+
+  async scheduleSocialWarmTick(overrideMs = null) {
+    const q = this.queues[SOCIAL_WARM_QUEUE];
+    if (!q) throw new Error('Social warm queue not initialized');
+    const delay = this.socialWarmDelayMs(overrideMs);
+    await q.add(
+      'tick',
+      { scheduledAt: new Date().toISOString() },
+      { delay, removeOnComplete: 100, removeOnFail: 50, attempts: 1 }
+    );
+    console.log(`Social warm tick scheduled in ${Math.round(delay / 1000)}s`);
+  }
+
+  async ensureSocialWarmLoop() {
+    const pending = await this.pendingCount(SOCIAL_WARM_QUEUE);
+    if (pending > 0) {
+      console.log(`Social warm queue already has ${pending} pending job(s) — skipping seed`);
+      return;
+    }
+    await this.scheduleSocialWarmTick(10000);
+  }
+
   async getStatus() {
     if (!this.started) {
       return { started: false, redis: null, queues: {} };
@@ -331,6 +410,13 @@ class DurableQueue {
       'completed',
       'failed'
     );
+    const socialWarm = await this.queues[SOCIAL_WARM_QUEUE].getJobCounts(
+      'delayed',
+      'waiting',
+      'active',
+      'completed',
+      'failed'
+    );
     return {
       started: true,
       redis: `${this.connection.host}:${this.connection.port}`,
@@ -338,6 +424,7 @@ class DurableQueue {
         [ORGANIC_QUEUE]: organic,
         [AUDIT_QUEUE]: audit,
         [X_FOLLOW_QUEUE]: xFollow,
+        [SOCIAL_WARM_QUEUE]: socialWarm,
       },
     };
   }

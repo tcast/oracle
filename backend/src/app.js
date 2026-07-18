@@ -24,6 +24,7 @@ const taskQueue = require('./services/taskQueue');
 const durableQueue = require('./services/durableQueue');
 const organicCommentsRouter = require('./routes/organicComments');
 const xFollowsRouter = require('./routes/xFollows');
+const socialWarmRouter = require('./routes/socialWarm');
 const accountStatsRouter = require('./routes/accountStats');
 const commentingService = require('./services/commentingService');
 const playwrightService = require('./services/playwrightService');
@@ -636,7 +637,13 @@ app.delete('/api/campaigns/:id/accounts/:accountId', authMiddleware, async (req,
 
 app.post('/api/campaigns/:id/accounts/:accountId/warmup', authMiddleware, async (req, res) => {
   try {
-    const result = await playwrightService.warmUpAccount(parseInt(req.params.accountId), 'reddit');
+    const accountId = parseInt(req.params.accountId, 10);
+    const account = await pool.query(
+      'SELECT platform FROM social_accounts WHERE id = $1',
+      [accountId]
+    );
+    if (!account.rows[0]) return res.status(404).json({ error: 'Account not found' });
+    const result = await playwrightService.warmUpAccount(accountId, account.rows[0].platform);
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1156,6 +1163,7 @@ app.use('/api/health', healthRouter);
 app.use('/api/proxies', proxyRouter);
 app.use('/api/organic-comments', organicCommentsRouter);
 app.use('/api/x-follows', xFollowsRouter);
+app.use('/api/social-warm', socialWarmRouter);
 app.use('/api/account-stats', accountStatsRouter);
 app.use('/api/email-accounts', emailAccountsRouter);
 app.use('/api/campaign-builder', campaignBuilderRouter);

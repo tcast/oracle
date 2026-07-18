@@ -2998,37 +2998,52 @@ class PlaywrightService {
     }
   }
 
-  /** Lightweight warm-up: browse home + a subreddit without posting. */
-  async warmUpAccount(accountId, platform = 'reddit') {
+  /** Lightweight warm-up: login + browse without posting. Platform from account if omitted. */
+  async warmUpAccount(accountId, platform = null) {
     let browser;
     try {
       const account = await this.getAccount(accountId);
-      const result = await this.createBrowserForAccount(accountId);
+      platform = platform || account.platform;
+      const creds = typeof account.credentials === 'string'
+        ? JSON.parse(account.credentials)
+        : (account.credentials || {});
+      const password = creds.password || account.credentials?.password;
+      const extras = {
+        email: creds.email || account.email,
+        totpSecret: creds.totp_secret || creds.totp || creds.twofa,
+      };
+
+      // TikTok: prefer direct; others use assigned proxy when available
+      const skipProxy = platform === 'tiktok';
+      const result = await this.createBrowserForAccount(accountId, 2, {
+        requireProxy: platform !== 'tiktok',
+        skipProxy,
+      }).catch(async () =>
+        this.createBrowserForAccount(accountId, 2, { requireProxy: false, skipProxy: true })
+      );
       browser = result.browser;
       const page = result.page;
 
+      const loginAs =
+        platform === 'linkedin'
+          ? (creds.email || account.email || account.username)
+          : account.username;
+
       const loggedIn = await this.ensureLoggedIn(
-        page, platform, accountId, account.username, account.credentials.password
+        page, platform, accountId, loginAs, password, extras
       );
       if (!loggedIn) throw new Error('Warm-up login failed');
 
-      if (platform === 'reddit') {
-        await page.goto('https://www.reddit.com/', { waitUntil: 'domcontentloaded' });
-        await this.humanLikeDelay(2000, 4000);
-        await this.simulateHumanBehavior(page);
-        await page.goto('https://www.reddit.com/r/popular/', { waitUntil: 'domcontentloaded' });
-        await this.humanLikeDelay(2000, 5000);
-        await this.simulateHumanBehavior(page);
-      }
+      await this.browseWarmFeed(page, platform);
 
       await this.persistSession(page, platform, accountId);
       await pool.query(
         `UPDATE social_accounts
-         SET warmup_status = 'warmed', warmed_up_at = NOW(), updated_at = NOW()
+         SET warmup_status = 'warmed', warmed_up_at = NOW(), last_used_at = NOW(), updated_at = NOW()
          WHERE id = $1`,
         [accountId]
       );
-      return { success: true, accountId, warmup_status: 'warmed' };
+      return { success: true, accountId, platform, warmup_status: 'warmed' };
     } catch (error) {
       await pool.query(
         `UPDATE social_accounts SET warmup_status = 'failed', updated_at = NOW() WHERE id = $1`,
@@ -3037,6 +3052,281 @@ class PlaywrightService {
       throw error;
     } finally {
       if (browser) await browser.close();
+      this._untrackBrowser(accountId);
+    }
+  }
+
+  async browseWarmFeed(page, platform) {
+    if (platform === 'reddit') {
+      await page.goto('https://www.reddit.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await this.humanLikeDelay(2000, 4000);
+      await this.simulateHumanBehavior(page);
+      await page.goto('https://www.reddit.com/r/popular/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await this.humanLikeDelay(2000, 5000);
+      await this.simulateHumanBehavior(page);
+      return;
+    }
+    if (platform === 'instagram') {
+      await page.goto('https://www.instagram.com/', { waitUntil: 'domcontentloaded', timeout: 90000 });
+      await this.humanLikeDelay(2500, 4500);
+      await this.dismissInstagramOverlays(page).catch(() => {});
+      await this.simulateHumanBehavior(page);
+      await this.randomScroll(page).catch(() => {});
+      await page.goto('https://www.instagram.com/explore/', { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
+      await this.humanLikeDelay(2000, 4000);
+      await this.simulateHumanBehavior(page);
+      return;
+    }
+    if (platform === 'tiktok') {
+      await page.goto('https://www.tiktok.com/foryou', { waitUntil: 'domcontentloaded', timeout: 90000 });
+      await this.humanLikeDelay(3000, 5000);
+      for (let i = 0; i < 3; i++) {
+        await this.humanLikeDelay(2500, 5000);
+        await page.keyboard.press('ArrowDown').catch(() => {});
+        await this.simulateHumanBehavior(page);
+      }
+      return;
+    }
+    if (platform === 'x') {
+      await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 90000 });
+      await this.humanLikeDelay(2500, 4500);
+      await this.simulateHumanBehavior(page);
+      await this.randomScroll(page).catch(() => {});
+      return;
+    }
+    // linkedin / default — just sit on feed
+    const home =
+      platform === 'linkedin' ? 'https://www.linkedin.com/feed/' : 'https://www.google.com/';
+    await page.goto(home, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
+    await this.humanLikeDelay(2000, 4000);
+    await this.simulateHumanBehavior(page);
+  }
+
+  async instagramFollowUser(page, targetUsername) {
+    const handle = String(targetUsername || '').replace(/^@/, '');
+    const profileUrl = `https://www.instagram.com/${encodeURIComponent(handle)}/`;
+    await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
+    await this.humanLikeDelay(2500, 4500);
+    await this.dismissInstagramOverlays(page).catch(() => {});
+    await this.simulateHumanBehavior(page);
+
+    const state = await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+      const labels = buttons.map((b) => (b.innerText || b.getAttribute('aria-label') || '').trim());
+      const following = labels.some((t) => /^(Following|Requested)$/i.test(t));
+      return { following, followLabels: labels.filter((t) => /follow/i.test(t)).slice(0, 8) };
+    });
+    if (state.following) {
+      return { followed: false, alreadyFollowing: true, profileUrl };
+    }
+
+    const clicked = await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+      for (const b of buttons) {
+        const label = (b.innerText || b.getAttribute('aria-label') || '').trim();
+        if (/^Follow$/i.test(label) || /^Follow back$/i.test(label)) {
+          const rect = b.getBoundingClientRect();
+          if (rect.width > 8 && rect.height > 8) {
+            b.click();
+            return label;
+          }
+        }
+      }
+      return null;
+    });
+    await this.humanLikeDelay(1500, 3000);
+    if (!clicked) {
+      await page.screenshot({ path: `/tmp/ig-follow-miss-${handle}.png`, fullPage: true }).catch(() => {});
+      throw new Error(`IG Follow button not found on @${handle}`);
+    }
+    return { followed: true, alreadyFollowing: false, profileUrl, button: clicked };
+  }
+
+  async instagramLikeOnProfile(page, targetUsername) {
+    const handle = String(targetUsername || '').replace(/^@/, '');
+    if (!page.url().includes(`instagram.com/${handle}`)) {
+      await page.goto(`https://www.instagram.com/${encodeURIComponent(handle)}/`, {
+        waitUntil: 'domcontentloaded',
+        timeout: 90000,
+      });
+      await this.humanLikeDelay(2000, 4000);
+    }
+    await this.dismissInstagramOverlays(page).catch(() => {});
+
+    const opened = await page.evaluate(() => {
+      const links = Array.from(document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]'));
+      for (const a of links) {
+        const rect = a.getBoundingClientRect();
+        if (rect.width > 40 && rect.height > 40) {
+          a.click();
+          return a.getAttribute('href');
+        }
+      }
+      return null;
+    });
+    if (!opened) return { liked: false, reason: 'no_posts' };
+    await this.humanLikeDelay(2000, 4000);
+
+    const liked = await page.evaluate(() => {
+      const likeBtn =
+        document.querySelector('svg[aria-label="Like"]')?.closest('button, [role="button"]') ||
+        document.querySelector('button[aria-label="Like"], [aria-label="Like"]');
+      if (likeBtn) {
+        likeBtn.click();
+        return true;
+      }
+      // already liked
+      if (document.querySelector('svg[aria-label="Unlike"]')) return 'already';
+      return false;
+    });
+    await this.humanLikeDelay(1000, 2000);
+    await page.keyboard.press('Escape').catch(() => {});
+    return {
+      liked: liked === true || liked === 'already',
+      alreadyLiked: liked === 'already',
+      postPath: opened,
+    };
+  }
+
+  async tiktokFollowUser(page, targetUsername) {
+    const handle = String(targetUsername || '').replace(/^@/, '');
+    const profileUrl = `https://www.tiktok.com/@${encodeURIComponent(handle)}`;
+    await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
+    await this.humanLikeDelay(3000, 5000);
+    await this.simulateHumanBehavior(page);
+
+    const state = await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+      const labels = buttons.map((b) => (b.innerText || b.getAttribute('aria-label') || '').trim());
+      const following = labels.some((t) => /^(Following|Friends|Requested)$/i.test(t));
+      return { following };
+    });
+    if (state.following) {
+      return { followed: false, alreadyFollowing: true, profileUrl };
+    }
+
+    const clicked = await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+      for (const b of buttons) {
+        const label = (b.innerText || b.getAttribute('aria-label') || '').trim();
+        if (/^Follow$/i.test(label)) {
+          const rect = b.getBoundingClientRect();
+          if (rect.width > 8 && rect.height > 8) {
+            b.click();
+            return label;
+          }
+        }
+      }
+      return null;
+    });
+    await this.humanLikeDelay(1500, 3000);
+    if (!clicked) {
+      await page.screenshot({ path: `/tmp/tt-follow-miss-${handle}.png`, fullPage: true }).catch(() => {});
+      throw new Error(`TikTok Follow button not found on @${handle}`);
+    }
+    return { followed: true, alreadyFollowing: false, profileUrl, button: clicked };
+  }
+
+  async tiktokLikeOnFeed(page) {
+    await page.goto('https://www.tiktok.com/foryou', { waitUntil: 'domcontentloaded', timeout: 90000 });
+    await this.humanLikeDelay(3000, 5000);
+    await page.keyboard.press('ArrowDown').catch(() => {});
+    await this.humanLikeDelay(2000, 4000);
+    const liked = await page.evaluate(() => {
+      const btn =
+        document.querySelector('[data-e2e="like-icon"]') ||
+        document.querySelector('button[aria-label*="like" i], [aria-label*="Like"]');
+      if (!btn) return false;
+      btn.click();
+      return true;
+    });
+    await this.humanLikeDelay(1000, 2000);
+    return { liked: !!liked };
+  }
+
+  /**
+   * One warm engagement cycle: browse → follow target → optional like.
+   */
+  async runSocialWarmAction(accountId, { handle, doFollow = true, doLike = true } = {}) {
+    let browser;
+    const account = await this.getAccount(accountId);
+    const platform = account.platform;
+    if (!['instagram', 'tiktok'].includes(platform)) {
+      throw new Error(`runSocialWarmAction unsupported platform: ${platform}`);
+    }
+    const creds = typeof account.credentials === 'string'
+      ? JSON.parse(account.credentials)
+      : (account.credentials || {});
+    const password = creds.password;
+    if (!password || password === 'default_password') {
+      throw new Error('Account has no real password');
+    }
+    const extras = {
+      email: creds.email || account.email,
+      totpSecret: creds.totp_secret || creds.totp || creds.twofa,
+    };
+
+    try {
+      const skipProxy = platform === 'tiktok';
+      let result;
+      try {
+        result = await this.createBrowserForAccount(accountId, 2, {
+          requireProxy: !skipProxy,
+          skipProxy,
+        });
+      } catch {
+        result = await this.createBrowserForAccount(accountId, 2, {
+          requireProxy: false,
+          skipProxy: true,
+        });
+      }
+      browser = result.browser;
+      const page = result.page;
+
+      const loggedIn = await this.ensureLoggedIn(
+        page, platform, accountId, account.username, password, extras
+      );
+      if (!loggedIn) throw new Error(`${platform} login failed`);
+
+      await this.browseWarmFeed(page, platform);
+
+      const out = {
+        success: true,
+        accountId,
+        platform,
+        handle: handle || null,
+        browsed: true,
+        follow: null,
+        like: null,
+      };
+
+      if (doFollow && handle) {
+        out.follow =
+          platform === 'instagram'
+            ? await this.instagramFollowUser(page, handle)
+            : await this.tiktokFollowUser(page, handle);
+      }
+
+      if (doLike) {
+        if (platform === 'instagram' && handle) {
+          out.like = await this.instagramLikeOnProfile(page, handle);
+        } else if (platform === 'tiktok') {
+          out.like = await this.tiktokLikeOnFeed(page);
+        }
+      }
+
+      await this.persistSession(page, platform, accountId);
+      await pool.query(
+        `UPDATE social_accounts
+         SET warmup_status = 'warmed', warmed_up_at = COALESCE(warmed_up_at, NOW()),
+             last_used_at = NOW(), updated_at = NOW()
+         WHERE id = $1`,
+        [accountId]
+      ).catch(() => {});
+
+      return out;
+    } finally {
+      if (browser) await browser.close().catch(() => {});
       this._untrackBrowser(accountId);
     }
   }
