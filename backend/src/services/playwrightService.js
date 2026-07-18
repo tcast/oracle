@@ -3106,25 +3106,37 @@ class PlaywrightService {
     const handle = String(targetUsername || '').replace(/^@/, '');
     const profileUrl = `https://www.instagram.com/${encodeURIComponent(handle)}/`;
     await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
-    await this.humanLikeDelay(2500, 4500);
+    await this.humanLikeDelay(3000, 5000);
     await this.dismissInstagramOverlays(page).catch(() => {});
     await this.simulateHumanBehavior(page);
 
-    const state = await page.evaluate(() => {
-      const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+    // EN + common locales (ID/ES/PT/FR/DE)
+    const followRe = /^(Follow|Follow back|Ikuti|Seguir|Suivre|Folgen|フォローする)$/i;
+    const followingRe = /^(Following|Requested|Mengikuti|Siguiendo|Abonné|Gefolgt|フォロー中)$/i;
+
+    const state = await page.evaluate(({ followReSource, followingReSource }) => {
+      const followRe = new RegExp(followReSource, 'i');
+      const followingRe = new RegExp(followingReSource, 'i');
+      const buttons = Array.from(document.querySelectorAll('button, [role="button"], div[role="button"]'));
       const labels = buttons.map((b) => (b.innerText || b.getAttribute('aria-label') || '').trim());
-      const following = labels.some((t) => /^(Following|Requested)$/i.test(t));
-      return { following, followLabels: labels.filter((t) => /follow/i.test(t)).slice(0, 8) };
-    });
+      const following = labels.some((t) => followingRe.test(t.split('\n')[0]));
+      return {
+        following,
+        followLabels: labels.filter((t) => /follow|ikuti|seguir|suivre|folgen|フォロー/i.test(t)).slice(0, 10),
+        header: (document.body?.innerText || '').slice(0, 200),
+      };
+    }, { followReSource: followRe.source, followingReSource: followingRe.source });
+
     if (state.following) {
       return { followed: false, alreadyFollowing: true, profileUrl };
     }
 
-    const clicked = await page.evaluate(() => {
-      const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+    const clicked = await page.evaluate(({ followReSource }) => {
+      const followRe = new RegExp(followReSource, 'i');
+      const buttons = Array.from(document.querySelectorAll('button, [role="button"], div[role="button"]'));
       for (const b of buttons) {
-        const label = (b.innerText || b.getAttribute('aria-label') || '').trim();
-        if (/^Follow$/i.test(label) || /^Follow back$/i.test(label)) {
+        const label = (b.innerText || b.getAttribute('aria-label') || '').trim().split('\n')[0];
+        if (followRe.test(label)) {
           const rect = b.getBoundingClientRect();
           if (rect.width > 8 && rect.height > 8) {
             b.click();
@@ -3133,11 +3145,13 @@ class PlaywrightService {
         }
       }
       return null;
-    });
+    }, { followReSource: followRe.source });
     await this.humanLikeDelay(1500, 3000);
     if (!clicked) {
       await page.screenshot({ path: `/tmp/ig-follow-miss-${handle}.png`, fullPage: true }).catch(() => {});
-      throw new Error(`IG Follow button not found on @${handle}`);
+      throw new Error(
+        `IG Follow button not found on @${handle} (saw: ${(state.followLabels || []).join(', ') || 'none'})`
+      );
     }
     return { followed: true, alreadyFollowing: false, profileUrl, button: clicked };
   }
