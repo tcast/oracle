@@ -12,13 +12,18 @@ function classifyFailure(message = '') {
   ) {
     return 'security_block';
   }
-  if (/incorrect username or password|wrong password|invalid username|invalid password|bad_credentials/i.test(msg)) {
+  if (
+    /incorrect username or password|wrong password|invalid username|invalid password|bad_credentials/i.test(msg) ||
+    /login information you entered is incorrect|password was incorrect|sorry, your password/i.test(msg)
+  ) {
     return 'bad_credentials';
   }
   if (/err_tunnel|err_timed_out|err_proxy|tunnel_connection|proxy|net::err_/i.test(msg)) {
     return 'proxy_error';
   }
-  if (/temporarily limited|try again later/i.test(msg)) {
+  if (
+    /temporarily limited|try again later|maximum number of attempts|too many (attempts|tries)|rate.?limit/i.test(msg)
+  ) {
     return 'challenge';
   }
   if (/login failed/i.test(msg)) {

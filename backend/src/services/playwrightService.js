@@ -1113,6 +1113,11 @@ class PlaywrightService {
     } catch (error) {
       console.error('X login error:', error);
       await page.screenshot({ path: `/tmp/x-login-error-${username}.png`, fullPage: true }).catch(() => {});
+      // Re-throw rate-limits / classified failures so callers quarantine correctly
+      // instead of collapsing everything into generic "X login failed".
+      if (/temporarily limited|try again later|rate.?limit|bad_credentials/i.test(error.message || '')) {
+        throw error;
+      }
       return false;
     }
   }
@@ -1452,9 +1457,13 @@ class PlaywrightService {
       } catch (err) {
         lastError = err;
         const msg = String(err.message || err);
+        // Only fall back to direct for proxy/network failures.
+        // Rate-limits and auth failures must not double-hit login.
+        const rateLimited = /temporarily limited|try again later|rate.?limit/i.test(msg);
         const canRetryDirect =
           !mode.skipProxy &&
-          (/login failed|temporarily limited|challenge|security/i.test(msg));
+          !rateLimited &&
+          /proxy|err_tunnel|err_timed_out|err_proxy|tunnel_connection|net::err_/i.test(msg);
         console.warn(
           `X follow via ${mode.skipProxy ? 'direct' : 'proxy'} failed for #${accountId}: ${msg}` +
             (canRetryDirect ? ' — retrying direct' : '')
@@ -2706,12 +2715,12 @@ class PlaywrightService {
       if (state.rateLimited) {
         console.log(`TikTok rate-limited for ${loginId}: ${state.snippet}`);
         await page.screenshot({ path: `/tmp/tiktok-ratelimit-${Date.now()}.png` }).catch(() => {});
-        return false;
+        throw new Error('TikTok temporarily limited login — try again later');
       }
       if (state.badCreds) {
         console.log(`TikTok bad credentials for ${loginId}: ${state.snippet}`);
         await page.screenshot({ path: `/tmp/tiktok-badcreds-${Date.now()}.png` }).catch(() => {});
-        return false;
+        throw new Error('TikTok login failed: bad_credentials — Incorrect username or password');
       }
       if (state.captcha) {
         console.log(`TikTok captcha for ${loginId}: ${state.snippet}`);
@@ -2738,6 +2747,9 @@ class PlaywrightService {
     } catch (error) {
       console.error('TikTok login error:', error);
       await page.screenshot({ path: `/tmp/tiktok-login-error-${Date.now()}.png` }).catch(() => {});
+      if (/temporarily limited|try again later|rate.?limit|bad_credentials|maximum number of attempts/i.test(error.message || '')) {
+        throw error;
+      }
       return false;
     }
   }
@@ -3585,10 +3597,16 @@ class PlaywrightService {
       }
 
       console.log(`IG login exhausted for ${username}. last=${lastHint}`);
+      if (/incorrect|password was incorrect|login information you entered is incorrect|bad_credentials/i.test(lastHint || '')) {
+        throw new Error(`Instagram login failed: bad_credentials — ${lastHint}`);
+      }
       return false;
     } catch (error) {
       console.error('IG login error:', error);
       await page.screenshot({ path: `/tmp/ig-login-error-${username}.png`, fullPage: true }).catch(() => {});
+      if (/bad_credentials|temporarily limited|try again later|rate.?limit/i.test(error.message || '')) {
+        throw error;
+      }
       return false;
     }
   }
