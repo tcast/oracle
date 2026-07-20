@@ -110,9 +110,10 @@ class EmailInboxService {
         secure: cfg.secure,
         auth: cfg.auth,
         logger: false,
-        greetingTimeout: 20000,
-        socketTimeout: 60000,
+        greetingTimeout: 15000,
+        socketTimeout: 30000,
       });
+      client.on('error', () => {});
 
       try {
         await client.connect();
@@ -132,6 +133,11 @@ class EmailInboxService {
       } catch (err) {
         lastErr = err;
         console.warn(`IMAP ${host} failed for ${account.email}: ${err.message}`);
+        try {
+          client.close();
+        } catch (_) {
+          /* ignore */
+        }
       }
     }
 
@@ -171,42 +177,71 @@ class EmailInboxService {
       await page.goto('https://login.live.com/', { waitUntil: 'domcontentloaded' });
       await page.waitForSelector('input[type="email"], input[name="loginfmt"]', { timeout: 20000 });
       await page.fill('input[type="email"], input[name="loginfmt"]', account.email);
-      await page.click('input[type="submit"], button[type="submit"]');
-      await page.waitForTimeout(1500);
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {}),
+        page.click('input[type="submit"], button[type="submit"]'),
+      ]);
+      await page.waitForTimeout(1000);
 
       await page.waitForSelector('input[type="password"], input[name="passwd"]', { timeout: 20000 });
       await page.fill('input[type="password"], input[name="passwd"]', account.password);
-      await page.click('input[type="submit"], button[type="submit"]');
-      await page.waitForTimeout(2500);
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {}),
+        page.click('input[type="submit"], button[type="submit"]'),
+      ]);
+      await page.waitForTimeout(2000);
 
-      // Stay signed in / skip prompts
-      const kmSI = await page.$('input[type="submit"][value*="Yes"], button:has-text("Yes"), input#idSIButton9');
-      if (kmSI) {
-        await kmSI.click().catch(() => {});
-        await page.waitForTimeout(1500);
+      // Stay signed in / skip prompts (safe after navigation settles)
+      for (let i = 0; i < 3; i++) {
+        const url = page.url();
+        if (/outlook\.live\.com|outlook\.office/i.test(url)) break;
+        const challenge = await page.evaluate(() => {
+          const text = (document.body?.innerText || '').slice(0, 400);
+          return {
+            text,
+            hasPasswordError: /incorrect|wrong password|doesn't exist|too many times/i.test(text),
+            hasProtect: /help us protect|verify your identity|approve/i.test(text),
+          };
+        }).catch(() => ({ text: '', hasPasswordError: false, hasProtect: false }));
+
+        if (challenge.hasPasswordError) {
+          throw new Error(`Outlook web login failed: ${challenge.text.slice(0, 160)}`);
+        }
+        if (challenge.hasProtect) {
+          throw new Error(
+            `Outlook web login blocked by identity challenge: ${challenge.text.slice(0, 160)}`
+          );
+        }
+
+        const clicked = await page.evaluate(() => {
+          const btn =
+            document.querySelector('input#idSIButton9') ||
+            document.querySelector('input[type="submit"][value*="Yes"]') ||
+            [...document.querySelectorAll('button')].find((b) =>
+              /^(Yes|Next|Continue)$/i.test((b.innerText || '').trim())
+            );
+          if (btn) {
+            btn.click();
+            return true;
+          }
+          return false;
+        }).catch(() => false);
+        if (clicked) await page.waitForTimeout(2000);
+        else break;
       }
 
-      const bodyText = await page.evaluate(() => (document.body?.innerText || '').slice(0, 500));
-      if (/incorrect|wrong password|doesn't exist|too many times|help us protect/i.test(bodyText)) {
-        throw new Error(`Outlook web login failed: ${bodyText.slice(0, 160)}`);
+      if (!/outlook\.live\.com|outlook\.office/i.test(page.url())) {
+        await page.goto('https://outlook.live.com/mail/0/', {
+          waitUntil: 'domcontentloaded',
+          timeout: 60000,
+        });
       }
-
-      await page.goto('https://outlook.live.com/mail/0/', {
-        waitUntil: 'domcontentloaded',
-        timeout: 60000,
-      });
       await page.waitForTimeout(4000);
-
-      // Dismiss any leftover consent
-      const yesBtn = await page.$('input[type="submit"][value*="Yes"], button:has-text("Yes")');
-      if (yesBtn) await yesBtn.click().catch(() => {});
-
-      await page.waitForTimeout(3000);
 
       const rows = await page.evaluate((max) => {
         const items = [];
         const nodes = document.querySelectorAll(
-          '[role="option"], [role="row"], [aria-label*="Unread"], [aria-label*="Read"], div[class*="jGG6V"]'
+          '[role="option"], [role="row"], [aria-label*="Unread"], [aria-label*="Read"]'
         );
         for (const n of nodes) {
           const label = n.getAttribute('aria-label') || n.innerText || '';
@@ -214,9 +249,11 @@ class EmailInboxService {
           items.push(label.replace(/\s+/g, ' ').trim().slice(0, 500));
           if (items.length >= max) break;
         }
-        // Fallback: scan visible list text blocks
         if (!items.length) {
-          const text = (document.body?.innerText || '').split('\n').map((s) => s.trim()).filter(Boolean);
+          const text = (document.body?.innerText || '')
+            .split('\n')
+            .map((s) => s.trim())
+            .filter(Boolean);
           for (const line of text) {
             if (line.length > 20 && line.length < 300) items.push(line);
             if (items.length >= max) break;
