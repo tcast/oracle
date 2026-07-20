@@ -279,7 +279,7 @@ class PlaywrightService {
     }
   }
 
-  async createBrowserForAccount(accountId, maxRetries = 2, { requireProxy = false, skipProxy = false } = {}) {
+  async createBrowserForAccount(accountId, maxRetries = 2, { requireProxy = false, skipProxy = false, forceDesktop: forceDesktopOpt = false } = {}) {
     let lastError;
     let attempt = 0;
 
@@ -313,10 +313,11 @@ class PlaywrightService {
         // Prefer Android for mobile ProxyBase pools — except X, whose mobile web
         // aggressively pushes the app and breaks login/automation.
         let preferMobile = false;
-        let forceDesktop = false;
+        let forceDesktop = !!forceDesktopOpt;
         try {
           const account = await this.getAccount(accountId);
           forceDesktop =
+            forceDesktop ||
             account.platform === 'x' ||
             account.platform === 'instagram' ||
             account.platform === 'linkedin' ||

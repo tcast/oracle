@@ -6,7 +6,10 @@ const { generatePassword } = require('../utils/passwordGenerator');
 const { classifyFailure, cooldownUntil } = require('./failureClassifier');
 
 const BOUGHT_SOURCES = ['excel_import', 'bulk_import'];
-const FORGOT_URL = 'https://www.reddit.com/account/forgotpassword/';
+// www /account/forgotpassword/ is network-security blocked on many residential/mobile
+// proxies; old.reddit password recovery still renders the form.
+const FORGOT_URL = 'https://old.reddit.com/password/';
+const FORGOT_URL_FALLBACK = 'https://www.reddit.com/account/forgotpassword/';
 
 function parseCreds(raw) {
   if (!raw) return {};
@@ -390,13 +393,28 @@ class RedditPasswordResetService {
   }
 
   async triggerForgotPassword(page, emailOrUsername) {
-    await page.goto(FORGOT_URL, { waitUntil: 'domcontentloaded', timeout: 90000 });
-    await playwrightService.humanLikeDelay(2000, 3500);
-    await this.dismissCookieBanners(page);
+    const tryUrl = async (url) => {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 90000 });
+      await playwrightService.humanLikeDelay(2000, 3500);
+      await this.dismissCookieBanners(page);
+      const body = (await page.locator('body').innerText().catch(() => '')).slice(0, 400);
+      if (/blocked by network security/i.test(body)) {
+        throw new Error(`Reddit network-security block on ${url}`);
+      }
+      return body;
+    };
+
+    let landingSnippet = '';
+    try {
+      landingSnippet = await tryUrl(FORGOT_URL);
+    } catch (err) {
+      console.warn(`Forgot via ${FORGOT_URL} failed (${err.message}); trying fallback`);
+      landingSnippet = await tryUrl(FORGOT_URL_FALLBACK);
+    }
 
     const input = page
       .locator(
-        'faceplate-text-input input, input[name="email"], input[name="username"], input[type="email"], input[type="text"]'
+        'faceplate-text-input[name="identifier"] input, faceplate-text-input#auth-password-recovery-input input, input[name="identifier"], input[name="email"], input[name="username"], input[type="email"], input[type="text"]'
       )
       .first();
     await input.waitFor({ state: 'visible', timeout: 25000 });
@@ -406,8 +424,9 @@ class RedditPasswordResetService {
     await playwrightService.humanLikeDelay(600, 1200);
 
     const submit =
-      (await page.$('button[type="submit"]')) ||
+      (await page.$('button:has-text("Reset password")')) ||
       (await page.$('button:has-text("Reset")')) ||
+      (await page.$('button[type="submit"]')) ||
       (await page.$('button:has-text("Email")')) ||
       (await page.$('button:has-text("Continue")'));
     if (!submit) throw new Error('Forgot-password submit button not found');
@@ -420,7 +439,12 @@ class RedditPasswordResetService {
     if (looksBlocked) {
       throw new Error(`Reddit forgot-password blocked: ${body.slice(0, 180)}`);
     }
-    return { confirmationSnippet: body.slice(0, 240), looksOk, url: page.url() };
+    return {
+      confirmationSnippet: body.slice(0, 240),
+      looksOk,
+      landingSnippet: landingSnippet.slice(0, 120),
+      url: page.url(),
+    };
   }
 
   async completePasswordReset(page, resetLink, newPassword) {
@@ -541,6 +565,7 @@ class RedditPasswordResetService {
     try {
       const result = await playwrightService.createBrowserForAccount(account.id, 2, {
         requireProxy: true,
+        forceDesktop: true,
       });
       browser = result.browser;
       const page = result.page;
