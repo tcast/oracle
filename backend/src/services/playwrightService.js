@@ -2315,6 +2315,16 @@ class PlaywrightService {
       const success =
         !/authwall|\/login/i.test(photoInfo.url || '') &&
         !!(photoInfo.src && /media\.licdn\.com/i.test(photoInfo.src));
+
+      if (success) {
+        try {
+          const { updateEnrichment } = require('./profileEnrichment');
+          await updateEnrichment(accountId, { photo: true }, { source: 'linkedin_photo' });
+        } catch (enrichErr) {
+          console.warn(`LinkedIn #${accountId}: enrichment update failed:`, enrichErr.message);
+        }
+      }
+
       return {
         success,
         accountId,
@@ -2700,6 +2710,23 @@ class PlaywrightService {
       }).catch(() => ({}));
 
       const success = steps.includes('headline') || steps.includes('about') || snapshot.hasHeadlineHint;
+      if (success) {
+        try {
+          const { updateEnrichment } = require('./profileEnrichment');
+          await updateEnrichment(
+            accountId,
+            {
+              headline: steps.includes('headline') || steps.includes('industry') || !!snapshot.hasHeadlineHint,
+              about: steps.includes('about'),
+              experience: steps.includes('experience'),
+              category: 'hr_talent',
+            },
+            { source: 'linkedin_hiring_persona' }
+          );
+        } catch (enrichErr) {
+          console.warn(`LinkedIn #${accountId}: enrichment update failed:`, enrichErr.message);
+        }
+      }
       return {
         success,
         accountId,

@@ -11,6 +11,12 @@ const TABS = [
 
 const fmt = (n) => (n == null ? '—' : Number(n).toLocaleString());
 
+const BUILT_OUT_BADGE = {
+  full: 'badge-success',
+  partial: 'badge-warning',
+  none: 'badge-neutral',
+};
+
 const SocialAccounts = () => {
   const [tab, setTab] = useState(() => {
     const q = new URLSearchParams(window.location.search).get('tab');
@@ -19,8 +25,19 @@ const SocialAccounts = () => {
   const [accounts, setAccounts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [filters, setFilters] = useState({ search: '', platform: '', status: '' });
-  const [filterOptions, setFilterOptions] = useState({ platforms: [], statuses: [] });
+  const [filters, setFilters] = useState({
+    search: '',
+    platform: '',
+    status: '',
+    built_out: '',
+    category: '',
+  });
+  const [filterOptions, setFilterOptions] = useState({
+    platforms: [],
+    statuses: [],
+    built_out_options: ['full', 'partial', 'none'],
+    categories: [],
+  });
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [auditSettings, setAuditSettings] = useState(null);
   const [auditing, setAuditing] = useState(false);
@@ -40,7 +57,12 @@ const SocialAccounts = () => {
     try {
       const response = await api.get('/api/social-accounts/filters');
       if (response.status !== 200) throw new Error('Failed to fetch filter options');
-      setFilterOptions(response.data);
+      setFilterOptions({
+        platforms: response.data.platforms || [],
+        statuses: response.data.statuses || [],
+        built_out_options: response.data.built_out_options || ['full', 'partial', 'none'],
+        categories: response.data.categories || [],
+      });
     } catch (err) {
       console.error('Error fetching filter options:', err);
     }
@@ -62,6 +84,8 @@ const SocialAccounts = () => {
       if (filters.search) queryParams.append('search', filters.search);
       if (filters.platform) queryParams.append('platform', filters.platform);
       if (filters.status) queryParams.append('status', filters.status);
+      if (filters.built_out) queryParams.append('built_out', filters.built_out);
+      if (filters.category) queryParams.append('category', filters.category);
       const response = await api.get(`/api/social-accounts?${queryParams}`);
       if (response.status !== 200) throw new Error('Failed to fetch accounts');
       setAccounts(response.data);
@@ -93,6 +117,22 @@ const SocialAccounts = () => {
     fetchAccounts();
     setShowCreateForm(false);
   };
+
+  const clearFilters = () =>
+    setFilters({ search: '', platform: '', status: '', built_out: '', category: '' });
+
+  const builtOutLabel = (account) =>
+    account.profile_enrichment?.built_out_label ||
+    (account.built_out === 'full'
+      ? 'Built out'
+      : account.built_out === 'partial'
+        ? 'Partial'
+        : 'None');
+
+  const categoryDisplay = (account) =>
+    account.job_category_label ||
+    account.profile_enrichment?.category_label ||
+    '—';
 
   return (
     <div className="space-y-6">
@@ -175,7 +215,7 @@ const SocialAccounts = () => {
               </div>
             </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-3 sm:gap-4">
               <div>
                 <label className="label">Search</label>
                 <input
@@ -200,8 +240,36 @@ const SocialAccounts = () => {
                   {filterOptions.statuses.map((s) => <option key={s} value={s}>{s}</option>)}
                 </select>
               </div>
+              <div>
+                <label className="label">Build-out</label>
+                <select
+                  className="input-field"
+                  value={filters.built_out}
+                  onChange={(e) => setFilters({ ...filters, built_out: e.target.value })}
+                >
+                  <option value="">All</option>
+                  {(filterOptions.built_out_options || []).map((b) => (
+                    <option key={b} value={b}>
+                      {b === 'full' ? 'Built out' : b === 'partial' ? 'Partial' : 'None'}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="label">Job category</label>
+                <select
+                  className="input-field"
+                  value={filters.category}
+                  onChange={(e) => setFilters({ ...filters, category: e.target.value })}
+                >
+                  <option value="">All</option>
+                  {(filterOptions.categories || []).map((c) => (
+                    <option key={c} value={c}>{c}</option>
+                  ))}
+                </select>
+              </div>
               <div className="flex items-end">
-                <button onClick={() => setFilters({ search: '', platform: '', status: '' })} className="btn-secondary w-full">
+                <button onClick={clearFilters} className="btn-secondary w-full">
                   Clear Filters
                 </button>
               </div>
@@ -225,6 +293,8 @@ const SocialAccounts = () => {
                     <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Platform</th>
                     <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Username</th>
                     <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Status</th>
+                    <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Build-out</th>
+                    <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">Job category</th>
                     <th className="px-4 py-3 text-right text-xs font-semibold text-gray-500 uppercase tracking-wider">Karma</th>
                     <th className="px-4 py-3 text-right text-xs font-semibold text-gray-500 uppercase tracking-wider">Posts</th>
                     <th className="px-4 py-3 text-right text-xs font-semibold text-gray-500 uppercase tracking-wider">Comments</th>
@@ -236,48 +306,71 @@ const SocialAccounts = () => {
                 <tbody className="divide-y divide-gray-50">
                   {!loading && accounts.length === 0 && (
                     <tr>
-                      <td colSpan={9} className="px-4 py-10 text-center text-sm text-gray-500">No accounts found</td>
+                      <td colSpan={11} className="px-4 py-10 text-center text-sm text-gray-500">No accounts found</td>
                     </tr>
                   )}
-                  {accounts.map((account) => (
-                    <tr key={account.id} className="hover:bg-gray-50/50 transition-colors">
-                      <td className="px-4 py-3 whitespace-nowrap text-sm font-medium text-gray-900">{account.platform}</td>
-                      <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-700">
-                        {account.platform === 'reddit' ? (
-                          <a
-                            href={`https://www.reddit.com/user/${account.username}/`}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="text-whisper-700 hover:underline"
+                  {accounts.map((account) => {
+                    const built = account.built_out || account.profile_enrichment?.built_out || 'none';
+                    const enrich = account.profile_enrichment || {};
+                    const detail = [
+                      enrich.photo ? 'photo' : null,
+                      enrich.banner ? 'banner' : null,
+                      enrich.headline ? 'headline' : null,
+                      enrich.about ? 'about' : null,
+                    ]
+                      .filter(Boolean)
+                      .join(', ');
+                    return (
+                      <tr key={account.id} className="hover:bg-gray-50/50 transition-colors">
+                        <td className="px-4 py-3 whitespace-nowrap text-sm font-medium text-gray-900">{account.platform}</td>
+                        <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-700">
+                          {account.platform === 'reddit' ? (
+                            <a
+                              href={`https://www.reddit.com/user/${account.username}/`}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="text-whisper-700 hover:underline"
+                            >
+                              {account.username}
+                            </a>
+                          ) : (
+                            account.username
+                          )}
+                        </td>
+                        <td className="px-4 py-3 whitespace-nowrap">
+                          <span className={`badge ${account.status === 'active' ? 'badge-success' : 'badge-neutral'}`}>
+                            {account.status}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 whitespace-nowrap">
+                          <span
+                            className={`badge ${BUILT_OUT_BADGE[built] || 'badge-neutral'}`}
+                            title={detail || 'No enrichment'}
                           >
-                            {account.username}
-                          </a>
-                        ) : (
-                          account.username
-                        )}
-                      </td>
-                      <td className="px-4 py-3 whitespace-nowrap">
-                        <span className={`badge ${account.status === 'active' ? 'badge-success' : 'badge-neutral'}`}>
-                          {account.status}
-                        </span>
-                      </td>
-                      <td className="px-4 py-3 whitespace-nowrap text-sm text-right text-gray-900 font-medium">{fmt(account.total_karma)}</td>
-                      <td className="px-4 py-3 whitespace-nowrap text-sm text-right text-gray-700">{fmt(account.post_count)}</td>
-                      <td className="px-4 py-3 whitespace-nowrap text-sm text-right text-gray-700">{fmt(account.comment_count)}</td>
-                      <td className="px-4 py-3 whitespace-nowrap text-sm text-right text-emerald-700">{fmt(account.likes_count)}</td>
-                      <td className="px-4 py-3 whitespace-nowrap text-sm text-right text-rose-700">{fmt(account.dislikes_count)}</td>
-                      <td className="px-4 py-3 whitespace-nowrap text-xs text-gray-500">
-                        {account.stats_audited_at
-                          ? new Date(account.stats_audited_at).toLocaleString()
-                          : '—'}
-                        {account.stats_audit_error && (
-                          <div className="text-red-600 truncate max-w-[180px]" title={account.stats_audit_error}>
-                            {account.stats_audit_error}
-                          </div>
-                        )}
-                      </td>
-                    </tr>
-                  ))}
+                            {builtOutLabel(account)}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-700">
+                          {categoryDisplay(account)}
+                        </td>
+                        <td className="px-4 py-3 whitespace-nowrap text-sm text-right text-gray-900 font-medium">{fmt(account.total_karma)}</td>
+                        <td className="px-4 py-3 whitespace-nowrap text-sm text-right text-gray-700">{fmt(account.post_count)}</td>
+                        <td className="px-4 py-3 whitespace-nowrap text-sm text-right text-gray-700">{fmt(account.comment_count)}</td>
+                        <td className="px-4 py-3 whitespace-nowrap text-sm text-right text-emerald-700">{fmt(account.likes_count)}</td>
+                        <td className="px-4 py-3 whitespace-nowrap text-sm text-right text-rose-700">{fmt(account.dislikes_count)}</td>
+                        <td className="px-4 py-3 whitespace-nowrap text-xs text-gray-500">
+                          {account.stats_audited_at
+                            ? new Date(account.stats_audited_at).toLocaleString()
+                            : '—'}
+                          {account.stats_audit_error && (
+                            <div className="text-red-600 truncate max-w-[180px]" title={account.stats_audit_error}>
+                              {account.stats_audit_error}
+                            </div>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

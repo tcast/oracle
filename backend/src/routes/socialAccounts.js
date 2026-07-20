@@ -3,13 +3,14 @@ const router = express.Router();
 const { authMiddleware } = require('../middleware/auth');
 const pool = require('../services/db');
 const accountCreationService = require('../services/accountCreationService');
+const { formatForApi } = require('../services/profileEnrichment');
 
 router.use(authMiddleware);
 
 // The frontend expects this route without the 'social-accounts' prefix
 router.get('/', async (req, res) => {
   try {
-    const { search, platform, status } = req.query;
+    const { search, platform, status, built_out, category } = req.query;
     
     // Build the WHERE clause dynamically
     const conditions = ['1=1']; // Always true condition to start with
@@ -34,6 +35,18 @@ router.get('/', async (req, res) => {
       paramCount++;
     }
 
+    if (built_out) {
+      conditions.push(`profile_enrichment->>'built_out' = $${paramCount}`);
+      params.push(built_out);
+      paramCount++;
+    }
+
+    if (category) {
+      conditions.push(`profile_enrichment->>'category' = $${paramCount}`);
+      params.push(category);
+      paramCount++;
+    }
+
     const query = `
       SELECT 
         id,
@@ -42,6 +55,7 @@ router.get('/', async (req, res) => {
         email,
         status,
         persona_traits,
+        profile_enrichment,
         total_karma,
         post_karma,
         comment_karma,
@@ -63,13 +77,24 @@ router.get('/', async (req, res) => {
     const result = await pool.query(query, params);
 
     // Format the response
-    const accounts = result.rows.map(account => ({
-      ...account,
-      // Ensure persona_traits is parsed JSON if it's a string
-      persona_traits: typeof account.persona_traits === 'string' 
+    const accounts = result.rows.map(account => {
+      const persona_traits = typeof account.persona_traits === 'string'
         ? JSON.parse(account.persona_traits)
-        : account.persona_traits
-    }));
+        : account.persona_traits;
+      const profile_enrichment = formatForApi(
+        typeof account.profile_enrichment === 'string'
+          ? JSON.parse(account.profile_enrichment)
+          : account.profile_enrichment
+      );
+      return {
+        ...account,
+        persona_traits,
+        profile_enrichment,
+        built_out: profile_enrichment.built_out,
+        job_category: profile_enrichment.category,
+        job_category_label: profile_enrichment.category_label,
+      };
+    });
 
     res.json(accounts);
   } catch (err) {
@@ -89,9 +114,19 @@ router.get('/filters', async (req, res) => {
       'SELECT DISTINCT status FROM social_accounts ORDER BY status'
     );
 
+    const categories = await pool.query(
+      `SELECT DISTINCT profile_enrichment->>'category' AS category
+       FROM social_accounts
+       WHERE profile_enrichment->>'category' IS NOT NULL
+         AND profile_enrichment->>'category' <> ''
+       ORDER BY category`
+    );
+
     res.json({
       platforms: platforms.rows.map(row => row.platform),
-      statuses: statuses.rows.map(row => row.status)
+      statuses: statuses.rows.map(row => row.status),
+      built_out_options: ['full', 'partial', 'none'],
+      categories: categories.rows.map(row => row.category),
     });
   } catch (err) {
     console.error('Error fetching filter options:', err);
