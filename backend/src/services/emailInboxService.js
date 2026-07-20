@@ -539,6 +539,7 @@ class EmailInboxService {
     const { messages } = await this.fetchRecentMessagesWithFallback(account, {
       limit,
       searchQuery,
+      timeoutMs: searchQuery ? 120000 : 90000,
     });
     return this.pickLatestFromMessages(messages, {
       fromIncludes,

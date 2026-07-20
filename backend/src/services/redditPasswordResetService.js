@@ -586,8 +586,8 @@ class RedditPasswordResetService {
 
       // Phase 2: read reset link from seller Hotmail via Outlook web
       const verified = await emailInboxService.pollForVerification(inboxAccount, {
-        timeoutMs: 180000,
-        intervalMs: 20000,
+        timeoutMs: 240000,
+        intervalMs: 25000,
         fromIncludes: 'reddit',
         subjectIncludes: 'password',
         afterDate: triggeredAt,
