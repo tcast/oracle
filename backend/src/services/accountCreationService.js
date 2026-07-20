@@ -192,8 +192,8 @@ class AccountCreationService {
       return proxy_id;
     }
 
-    // Prefer BrightData isp_proxy3 (even if shared with non-Reddit) over free isp_proxy4.
-    // Reddit has been network-blocking the newer isp_proxy4 pool.
+    // Prefer ProxyBase for Reddit *signup* (BrightData ISP currently network-blocked on /register),
+    // then BrightData isp_proxy3, then other US proxies. Never two Reddit accounts on same proxy.
     const pick = await pool.query(
       `SELECT p.id FROM proxies p
        WHERE p.is_active = true
@@ -205,7 +205,11 @@ class AccountCreationService {
            WHERE sap.proxy_id = p.id AND sap.is_active = true AND sa.platform = 'reddit'
          )
        ORDER BY
-         CASE WHEN p.provider ILIKE '%brightdata%' THEN 0 ELSE 1 END,
+         CASE
+           WHEN p.provider ILIKE '%proxybase%' THEN 0
+           WHEN p.provider ILIKE '%brightdata%' THEN 1
+           ELSE 2
+         END,
          CASE
            WHEN COALESCE(p.metadata->>'zone', '') = 'isp_proxy3' THEN 0
            WHEN COALESCE(p.metadata->>'zone', '') = 'isp_proxy4' THEN 2
