@@ -3101,12 +3101,21 @@ class PlaywrightService {
       if (browser) await browser.close();
       this._untrackBrowser(accountId);
       if (proxyId) {
-        try {
-          await proxyService.updateProxyStats(proxyId, operationSuccess, {
-            reason: lastErrorMsg,
-          });
-        } catch (statsError) {
-          console.error('Error updating proxy stats:', statsError);
+        // Only burn proxy on infra/security — UI/login-credential flakes must not
+        // circuit-open sticky IPs (that starves hundreds of accounts).
+        const burnProxy =
+          operationSuccess ||
+          /tunnel|timed_out|timeout|proxy|err_|ECONNREFUSED|ENOTFOUND|socket|network.security|blocked by network|Username input not found/i.test(
+            lastErrorMsg || ''
+          );
+        if (burnProxy) {
+          try {
+            await proxyService.updateProxyStats(proxyId, operationSuccess, {
+              reason: lastErrorMsg,
+            });
+          } catch (statsError) {
+            console.error('Error updating proxy stats:', statsError);
+          }
         }
       }
     }

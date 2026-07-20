@@ -6,12 +6,15 @@ class RedditPasswordResetScheduler {
   }
 
   async tick() {
+    // Reclaim even when disabled — pilot crashes left jobs stuck in running.
+    const reclaimed = await redditPasswordResetService.reclaimStaleRunningJobs(40);
+
     const settings = await redditPasswordResetService.getSettings();
     if (!settings.enabled) {
-      return { skipped: true, reason: 'disabled' };
+      return { skipped: true, reason: 'disabled', reclaimed: reclaimed.length };
     }
     if (redditPasswordResetService.inQuietHours(settings)) {
-      return { skipped: true, reason: 'quiet_hours' };
+      return { skipped: true, reason: 'quiet_hours', reclaimed: reclaimed.length };
     }
 
     const maxConcurrent = Math.min(settings.max_concurrent || 1, 1); // hard-cap 1 for safety

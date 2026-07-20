@@ -324,6 +324,32 @@ class RedditPasswordResetService {
     );
   }
 
+  /**
+   * Recover jobs left status=running after crash/OOM during Outlook poll.
+   * Without this, already_running skips them forever (even after schedule re-enable).
+   */
+  async reclaimStaleRunningJobs(staleMinutes = 40) {
+    const result = await pool.query(
+      `UPDATE reddit_password_reset_jobs
+       SET status = 'idle',
+           last_error = COALESCE(last_error, 'reclaimed_stale_running'),
+           cooldown_until = NOW() + INTERVAL '2 hours',
+           next_due_at = NOW() + INTERVAL '2 hours',
+           updated_at = NOW()
+       WHERE status = 'running'
+         AND updated_at < NOW() - ($1::int * INTERVAL '1 minute')
+       RETURNING id, social_account_id`,
+      [staleMinutes]
+    );
+    if (result.rows.length) {
+      console.warn(
+        `Reclaimed ${result.rows.length} stale password-reset running job(s):`,
+        result.rows.map((r) => r.social_account_id)
+      );
+    }
+    return result.rows;
+  }
+
   async markSuccess(job, settings) {
     const rotateDays = settings.rotate_every_days || 30;
     const next = new Date(Date.now() + rotateDays * 24 * 60 * 60 * 1000);
@@ -705,7 +731,8 @@ class RedditPasswordResetService {
     } catch (err) {
       const failureClass = await this.markFailure(job, err);
       await this.logAction(account.id, proxyId, 'failed', {}, err.message);
-      if (proxyId) {
+      // Only burn proxy on infra/security — not "mail not found" (inbox scrape issue)
+      if (proxyId && /tunnel|timed_out|timeout|proxy|err_|network.security|blocked by network/i.test(err.message || '')) {
         await proxyService
           .updateProxyStats(proxyId, false, { reason: err.message })
           .catch(() => {});
@@ -720,6 +747,15 @@ class RedditPasswordResetService {
     } finally {
       if (browser) await browser.close().catch(() => {});
       playwrightService._untrackBrowser?.(account.id);
+      // If markSuccess/markFailure never ran (kill -9 / OOM), do not leave forever-running.
+      await pool.query(
+        `UPDATE reddit_password_reset_jobs
+         SET status = 'idle',
+             last_error = COALESCE(last_error, 'run_interrupted'),
+             updated_at = NOW()
+         WHERE id = $1 AND status = 'running'`,
+        [job.id]
+      ).catch(() => {});
     }
   }
 

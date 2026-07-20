@@ -18,9 +18,13 @@ class OrganicCommentScheduler {
   }
 
   async tick() {
+    // Always reclaim first — even when disabled — so crash leftovers do not
+    // permanently occupy status=running slots.
+    const reclaimed = await organicCommentService.reclaimStaleRunningJobs(25);
+
     const settings = await organicCommentService.getSettings();
     if (!settings.enabled) {
-      return { skipped: true, reason: 'disabled' };
+      return { skipped: true, reason: 'disabled', reclaimed: reclaimed.length };
     }
 
     const maxConcurrent = settings.max_concurrent || 2;

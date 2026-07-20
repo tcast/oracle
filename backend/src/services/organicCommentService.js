@@ -393,6 +393,30 @@ Write only the comment text.`;
     );
   }
 
+  /**
+   * Recover jobs left status=running after crash/OOM/worker stall.
+   * Without this, tick() skips them forever and capacity silently dies.
+   */
+  async reclaimStaleRunningJobs(staleMinutes = 25) {
+    const result = await pool.query(
+      `UPDATE organic_comment_jobs
+       SET status = 'idle',
+           last_error = COALESCE(last_error, 'reclaimed_stale_running'),
+           updated_at = NOW()
+       WHERE status = 'running'
+         AND updated_at < NOW() - ($1::int * INTERVAL '1 minute')
+       RETURNING id, social_account_id, updated_at`,
+      [staleMinutes]
+    );
+    if (result.rows.length) {
+      console.warn(
+        `Reclaimed ${result.rows.length} stale organic running job(s):`,
+        result.rows.map((r) => r.social_account_id)
+      );
+    }
+    return result.rows;
+  }
+
   async getDashboard() {
     const settings = await this.getSettings();
     const mapping = await proxyService.getProxyMappingStatus();
@@ -470,12 +494,14 @@ Write only the comment text.`;
       [job.id]
     );
 
+    let settled = false;
     const proxies = await proxyService.getAccountProxies(account.id, true);
     if (proxies.length !== 1) {
       const msg = proxies.length === 0
         ? 'No dedicated proxy assigned (or proxy in cooldown)'
         : 'Account has multiple active proxies; enforce 1:1';
       await this.applyFailureQuarantine(job, msg);
+      settled = true;
       return { skipped: true, reason: 'proxy', error: msg };
     }
 
@@ -502,6 +528,7 @@ Write only the comment text.`;
            WHERE id = $1`,
           [job.id, `gate_failed:${reason}`, next]
         );
+        settled = true;
         return { skipped: true, reason: 'gate_failed', details: generated?.gate, thread };
       }
 
@@ -557,6 +584,7 @@ Write only the comment text.`;
          WHERE id = $1`,
         [job.id, commentsToday, next]
       );
+      settled = true;
 
       return {
         success: true,
@@ -576,11 +604,26 @@ Write only the comment text.`;
            WHERE id = $1`,
           [job.id, msg, next]
         );
+        settled = true;
         return { skipped: true, reason: 'soft_error', error: msg };
       }
 
       await this.applyFailureQuarantine(job, msg);
+      settled = true;
       return { skipped: true, reason: 'error', error: msg };
+    } finally {
+      // Crash/hang mid-run is handled by reclaimStaleRunningJobs; this covers
+      // unexpected early returns that forgot to settle status.
+      if (!settled) {
+        await pool.query(
+          `UPDATE organic_comment_jobs
+           SET status = 'idle',
+               last_error = COALESCE(last_error, 'run_interrupted'),
+               updated_at = NOW()
+           WHERE id = $1 AND status = 'running'`,
+          [job.id]
+        ).catch(() => {});
+      }
     }
   }
 }
