@@ -558,22 +558,28 @@ class RedditPasswordResetService {
 
     await this.markRunning(job.id);
     let browser;
+    let trigger = null;
     const proxyId = info.proxyId;
     const triggeredAt = new Date();
     const newPassword = generatePassword(16);
 
     try {
-      const result = await playwrightService.createBrowserForAccount(account.id, 2, {
-        requireProxy: true,
-        forceDesktop: true,
-      });
-      browser = result.browser;
-      const page = result.page;
+      // Phase 1: trigger forgot-password (close browser before Outlook — two Chromiums OOM the box)
+      {
+        const result = await playwrightService.createBrowserForAccount(account.id, 2, {
+          requireProxy: true,
+          forceDesktop: true,
+        });
+        browser = result.browser;
+        const page = result.page;
+        const triggerEmail = account.email || creds.email || account.username;
+        trigger = await this.triggerForgotPassword(page, triggerEmail);
+        await browser.close().catch(() => {});
+        playwrightService._untrackBrowser?.(account.id);
+        browser = null;
+      }
 
-      const triggerEmail = account.email || creds.email || account.username;
-      const trigger = await this.triggerForgotPassword(page, triggerEmail);
-
-      // Poll inbox for reset link (Outlook web fallback for Hotmail)
+      // Phase 2: read reset link from seller Hotmail via Outlook web
       const verified = await emailInboxService.pollForVerification(inboxAccount, {
         timeoutMs: 180000,
         intervalMs: 20000,
@@ -587,17 +593,22 @@ class RedditPasswordResetService {
 
       let resetLink = verified.link;
       if (!resetLink && verified.links?.length) {
-        resetLink = verified.links.find((u) => /reddit\.com/i.test(u)) || verified.links[0];
+        resetLink =
+          verified.links.find((u) => /reddit\.com.*(password|reset|change|account)/i.test(u)) ||
+          verified.links.find((u) => /reddit\.com/i.test(u)) ||
+          verified.links[0];
       }
       if (!resetLink) {
-        // Broader retry without subject filter (some subjects omit "password")
         const retry = await emailInboxService.getLatestVerification(inboxAccount, {
           limit: 15,
           fromIncludes: 'reddit',
-          afterDate: triggeredAt,
+          searchQuery: 'from:reddit password',
           linkIncludes: 'reddit.com',
         });
-        resetLink = retry.link || retry.links?.find((u) => /reddit\.com/i.test(u));
+        resetLink =
+          retry.link ||
+          retry.links?.find((u) => /reddit\.com.*(password|reset|change|account)/i.test(u)) ||
+          retry.links?.find((u) => /reddit\.com/i.test(u));
       }
       if (!resetLink) {
         throw new Error(
@@ -605,64 +616,69 @@ class RedditPasswordResetService {
         );
       }
 
-      const completed = await this.completePasswordReset(page, resetLink, newPassword);
-      await this.persistNewPassword(account.id, creds, newPassword);
+      // Phase 3: open reset link + set password + verify login
+      {
+        const result = await playwrightService.createBrowserForAccount(account.id, 2, {
+          requireProxy: true,
+          forceDesktop: true,
+        });
+        browser = result.browser;
+        const page = result.page;
 
-      // Verify login with the new password
-      let loginOk = false;
-      try {
-        loginOk = !!(await playwrightService.ensureLoggedIn(
-          page,
-          'reddit',
-          account.id,
-          account.username,
-          newPassword
-        ));
-      } catch (loginErr) {
-        console.warn(
-          `Password rotated for ${account.username} but login verify failed: ${loginErr.message}`
-        );
-      }
+        const completed = await this.completePasswordReset(page, resetLink, newPassword);
+        await this.persistNewPassword(account.id, creds, newPassword);
 
-      await this.markSuccess(job, settings);
-      await this.logAction(
-        account.id,
-        proxyId,
-        loginOk ? 'rotated_verified' : 'rotated',
-        {
-          trigger,
-          resetLinkHost: (() => {
-            try {
-              return new URL(resetLink).host;
-            } catch {
-              return null;
-            }
-          })(),
-          completed,
-          loginOk,
+        let loginOk = false;
+        try {
+          loginOk = !!(await playwrightService.ensureLoggedIn(
+            page,
+            'reddit',
+            account.id,
+            account.username,
+            newPassword
+          ));
+        } catch (loginErr) {
+          console.warn(
+            `Password rotated for ${account.username} but login verify failed: ${loginErr.message}`
+          );
         }
-      );
 
-      if (proxyId) await proxyService.updateProxyStats(proxyId, true).catch(() => {});
+        await this.markSuccess(job, settings);
+        await this.logAction(
+          account.id,
+          proxyId,
+          loginOk ? 'rotated_verified' : 'rotated',
+          {
+            trigger,
+            resetLinkHost: (() => {
+              try {
+                return new URL(resetLink).host;
+              } catch {
+                return null;
+              }
+            })(),
+            completed,
+            loginOk,
+          }
+        );
 
-      return {
-        success: true,
-        accountId: account.id,
-        username: account.username,
-        loginOk,
-        passwordRotatedAt: new Date().toISOString(),
-      };
+        if (proxyId) await proxyService.updateProxyStats(proxyId, true).catch(() => {});
+
+        return {
+          success: true,
+          accountId: account.id,
+          username: account.username,
+          loginOk,
+          passwordRotatedAt: new Date().toISOString(),
+        };
+      }
     } catch (err) {
       const failureClass = await this.markFailure(job, err);
       await this.logAction(account.id, proxyId, 'failed', {}, err.message);
       if (proxyId) {
-        const isProxyPath = /proxy|ECONNREFUSED|tunnel|TIMEOUT|net::/i.test(err.message || '');
         await proxyService
           .updateProxyStats(proxyId, false, { reason: err.message })
           .catch(() => {});
-        if (isProxyPath) {
-          /* updateProxyStats already handles cooldown escalation */
-        }
       }
       return {
         success: false,
