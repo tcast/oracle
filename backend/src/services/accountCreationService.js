@@ -541,16 +541,46 @@ class AccountCreationService {
         'input[name="code"], input[autocomplete="one-time-code"], input[placeholder*="code" i]'
       );
       if (codeInput && emailAccount) {
-        console.log('Reddit asking for email verification code…');
+        const pageHint = await page
+          .evaluate(() => (document.body?.innerText || '').slice(0, 400))
+          .catch(() => '');
+        console.log(
+          `Reddit asking for email verification code… email=${emailAccount.email} hint=${pageHint.replace(/\s+/g, ' ').slice(0, 180)}`
+        );
         const verifyStartedAt = new Date();
-        const verified = await emailInboxService.pollForVerification(emailAccount, {
-          timeoutMs: 240000,
-          intervalMs: 4000,
-          limit: 40,
-          fromIncludes: 'reddit',
-          afterDate: verifyStartedAt,
-        });
-        if (!verified.code) throw new Error('No verification code in inbox');
+        let verified = null;
+        const pollDeadline = Date.now() + 240000;
+        let resent = false;
+        while (Date.now() < pollDeadline) {
+          try {
+            verified = await emailInboxService.pollForVerification(emailAccount, {
+              timeoutMs: Math.min(45000, pollDeadline - Date.now()),
+              intervalMs: 4000,
+              limit: 40,
+              fromIncludes: 'reddit',
+              afterDate: verifyStartedAt,
+            });
+            if (verified?.code) break;
+          } catch (pollErr) {
+            if (!/not received within/i.test(pollErr.message)) throw pollErr;
+          }
+          if (!resent) {
+            const resend =
+              (await page.$('button:has-text("Resend"), button:has-text("Send again"), a:has-text("Resend")')) ||
+              (await page.getByText(/resend|send again|didn.?t get/i).first().elementHandle().catch(() => null));
+            if (resend) {
+              console.log('Reddit verify: clicking resend…');
+              await resend.click().catch(() => {});
+              resent = true;
+              await this.humanLikeDelay(2000, 4000);
+            }
+          }
+        }
+        if (!verified?.code) {
+          throw new Error(
+            `Verification email not received within 240000ms for ${emailAccount.email}`
+          );
+        }
         await this.humanLikeTyping(
           page,
           'input[name="code"], input[autocomplete="one-time-code"], input[placeholder*="code" i]',
