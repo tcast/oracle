@@ -575,8 +575,8 @@ class RedditPasswordResetService {
 
       // Poll inbox for reset link (Outlook web fallback for Hotmail)
       const verified = await emailInboxService.pollForVerification(inboxAccount, {
-        timeoutMs: 150000,
-        intervalMs: 8000,
+        timeoutMs: 90000,
+        intervalMs: 12000,
         fromIncludes: 'reddit',
         subjectIncludes: 'password',
         afterDate: triggeredAt,

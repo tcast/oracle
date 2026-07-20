@@ -179,13 +179,15 @@ class EmailInboxService {
   /**
    * Outlook/Hotmail webmail fallback when IMAP basic auth is disabled.
    */
-  async fetchViaOutlookWeb(account, { limit = 10 } = {}) {
+  async fetchViaOutlookWeb(account, { limit = 10, timeoutMs = 90000 } = {}) {
+    let browser;
+    const run = async () => {
     const executablePath =
       process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH ||
       process.env.CHROMIUM_PATH ||
       undefined;
 
-    const browser = await chromium.launch({
+    browser = await chromium.launch({
       headless: true,
       executablePath,
       args: ['--disable-blink-features=AutomationControlled'],
@@ -199,7 +201,7 @@ class EmailInboxService {
         locale: 'en-US',
       });
       const page = await context.newPage();
-      page.setDefaultTimeout(45000);
+      page.setDefaultTimeout(25000);
 
       await page.goto('https://login.live.com/', { waitUntil: 'domcontentloaded' });
       await page.waitForSelector('input[type="email"], input[name="loginfmt"]', { timeout: 20000 });
@@ -353,7 +355,24 @@ class EmailInboxService {
 
       return messages;
     } finally {
-      await browser.close().catch(() => {});
+      /* closed in outer finally */
+    }
+    };
+
+    let timer;
+    try {
+      return await Promise.race([
+        run(),
+        new Promise((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`Outlook web fetch timed out after ${timeoutMs}ms`)),
+            timeoutMs
+          );
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (browser) await browser.close().catch(() => {});
     }
   }
 
