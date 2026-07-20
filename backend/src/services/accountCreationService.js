@@ -159,14 +159,17 @@ class AccountCreationService {
   }
 
   /**
-   * Reclaim a proxy from a pending_setup Reddit shell, or take any free proxy.
+   * Reclaim a US proxy from a pending_setup Reddit shell, or take any free US proxy.
+   * USA-only policy: never assign non-US proxies for create/warm.
    */
   async claimProxyForNewAccount() {
     const shells = await pool.query(
       `SELECT sa.id AS account_id, sap.proxy_id
        FROM social_accounts sa
        JOIN social_account_proxies sap ON sap.social_account_id = sa.id AND sap.is_active = true
+       JOIN proxies p ON p.id = sap.proxy_id
        WHERE sa.status = 'pending_setup' AND sa.platform = 'reddit'
+         AND p.is_active = true AND p.country = 'US'
        ORDER BY sa.id
        LIMIT 1`
     );
@@ -189,6 +192,7 @@ class AccountCreationService {
     const free = await pool.query(
       `SELECT p.id FROM proxies p
        WHERE p.is_active = true
+         AND p.country = 'US'
          AND NOT EXISTS (
            SELECT 1 FROM social_account_proxies sap
            WHERE sap.proxy_id = p.id AND sap.is_active = true

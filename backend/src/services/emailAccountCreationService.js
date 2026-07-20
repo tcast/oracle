@@ -229,17 +229,47 @@ class EmailAccountCreationService {
       await page.waitForSelector('text="Add your phone number"', { timeout: 15000 });
       console.log('   ✅ Phone verification page loaded');
 
-      // Request phone number from 5SIM
-      console.log('   8/9 Requesting phone number from 5SIM...');
-      const smsRequest = await fiveSimService.getNumber('england', 'yahoo');
+      // Ensure US country code on Yahoo phone page (USA-only policy)
+      const countrySelectors = [
+        'select[name="shortCountryCode"]',
+        'select#shortCountryCode',
+        'select[name="countryCode"]',
+        'select[aria-label*="country" i]',
+      ];
+      for (const sel of countrySelectors) {
+        const el = await page.$(sel);
+        if (!el) continue;
+        try {
+          await page.selectOption(sel, { value: 'US' });
+        } catch (_) {
+          try {
+            await page.selectOption(sel, { label: 'United States' });
+          } catch (__) {
+            /* keep current selection */
+          }
+        }
+        break;
+      }
+
+      // Request USA phone number from 5SIM (USA-only)
+      console.log('   8/9 Requesting USA phone number from 5SIM...');
+      const smsRequest = await fiveSimService.getNumber('usa', 'yahoo');
+      if (smsRequest.country && smsRequest.country !== 'usa') {
+        await fiveSimService.cancelRequest(smsRequest.id);
+        throw new Error(`Refusing non-US SMS country: ${smsRequest.country}`);
+      }
+      if (!/^\+1\d{10}$/.test(String(smsRequest.number || '').replace(/\s/g, ''))) {
+        await fiveSimService.cancelRequest(smsRequest.id);
+        throw new Error(`Refusing non-US phone number: ${smsRequest.number}`);
+      }
       smsRequestId = smsRequest.id;
 
       // Enter phone number on verification page
       console.log(`   Entering phone: ${smsRequest.number}...`);
       const phoneInput = await page.$('input[type="tel"], input[name="phone"]');
       if (phoneInput) {
-        // Remove the + from the number, Yahoo adds country code dropdown
-        const phoneNumber = smsRequest.number.replace(/^\+44/, ''); // Remove +44
+        // National number only; Yahoo country dropdown is US
+        const phoneNumber = smsRequest.number.replace(/^\+1/, '').replace(/\D/g, '');
         await this.humanLikeTyping(page, 'input[type="tel"], input[name="phone"]', phoneNumber);
         await this.humanLikeDelay(2000, 3000);
       }
@@ -492,12 +522,14 @@ class EmailAccountCreationService {
 
     const accounts = [];
     const errors = [];
-    // Filter to only HTTP/HTTPS proxies (Playwright doesn't support SOCKS5 auth)
-    const allProxies = useProxies ? await proxyService.getActiveProxies({ is_residential: true }) : [];
+    // USA-only HTTP/HTTPS residential proxies (Playwright doesn't support SOCKS5 auth)
+    const allProxies = useProxies
+      ? await proxyService.getActiveProxies({ is_residential: true, country: 'US' })
+      : [];
     const proxies = allProxies.filter(p => p.type === 'http' || p.type === 'https');
 
     if (useProxies && proxies.length === 0) {
-      console.warn('⚠️  No proxies available, proceeding without proxies');
+      throw new Error('No US residential HTTP proxies available (USA-only policy)');
     }
 
     for (let i = 0; i < count; i++) {

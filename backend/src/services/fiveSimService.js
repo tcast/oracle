@@ -83,7 +83,7 @@ class FiveSimService {
    * @param {string} service - Service name (yandex, gmail, gmx, etc.)
    * @returns {Promise<Object>} { id, number, country, service }
    */
-  async getNumber(country = 'russia', service = 'yandex') {
+  async getNumber(country = 'usa', service = 'yandex', operator = 'any') {
     if (this.fiveSimApiIssue) {
       throw new Error('5SIM API is not configured or unavailable');
     }
@@ -101,9 +101,21 @@ class FiveSimService {
 
       const mappedCountry = countryMap[country.toUpperCase()] || country.toLowerCase();
 
+      // Hard USA-only for email signup SMS (Yahoo/GMX/etc.)
+      const usaOnlyServices = new Set(['yahoo', 'gmx', 'gmail', 'outlook', 'hotmail', 'microsoft']);
+      if (usaOnlyServices.has(String(service).toLowerCase()) && mappedCountry !== 'usa') {
+        throw new Error(`USA-only policy: refusing 5SIM country=${mappedCountry} for ${service}`);
+      }
+
+      // Prefer a known-good USA operator for Yahoo (guest prices: virtual63)
+      let op = operator || 'any';
+      if (mappedCountry === 'usa' && String(service).toLowerCase() === 'yahoo' && op === 'any') {
+        op = process.env.FIVESIM_USA_YAHOO_OPERATOR || 'virtual63';
+      }
+
       // Buy number using 5SIM API
       const response = await axios.get(
-        `${this.apiUrl}/user/buy/activation/${mappedCountry}/any/${service}`,
+        `${this.apiUrl}/user/buy/activation/${mappedCountry}/${op}/${service}`,
         {
           headers: {
             'Authorization': this.getAuthHeader(),
