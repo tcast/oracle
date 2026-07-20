@@ -56,6 +56,9 @@ router.get('/', async (req, res) => {
         status,
         persona_traits,
         profile_enrichment,
+        warmup_status,
+        warmed_up_at,
+        last_used_at,
         total_karma,
         post_karma,
         comment_karma,
@@ -107,7 +110,10 @@ router.get('/', async (req, res) => {
 router.get('/filters', async (req, res) => {
   try {
     const platforms = await pool.query(
-      'SELECT DISTINCT platform FROM social_accounts ORDER BY platform'
+      `SELECT platform, COUNT(*)::int AS count
+       FROM social_accounts
+       GROUP BY platform
+       ORDER BY COUNT(*) DESC, platform`
     );
     
     const statuses = await pool.query(
@@ -122,8 +128,11 @@ router.get('/filters', async (req, res) => {
        ORDER BY category`
     );
 
+    const platformRows = platforms.rows;
     res.json({
-      platforms: platforms.rows.map(row => row.platform),
+      platforms: platformRows.map(row => row.platform),
+      platform_counts: Object.fromEntries(platformRows.map(row => [row.platform, row.count])),
+      total_count: platformRows.reduce((sum, row) => sum + row.count, 0),
       statuses: statuses.rows.map(row => row.status),
       built_out_options: ['full', 'partial', 'none'],
       categories: categories.rows.map(row => row.category),
