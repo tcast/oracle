@@ -228,15 +228,40 @@ class AccountCreationService {
       const { browser: b, page } = await this.createBrowser(proxyConfig);
       browser = b;
 
-      await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-      await this.humanLikeDelay(1500, 3000);
+      await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
+      await this.humanLikeDelay(2500, 4500);
 
-      // Email-first flow (current Reddit) or classic multi-field
-      const emailInput =
-        (await page.$('input[name="email"]')) ||
-        (await page.$('input[type="email"]')) ||
-        (await page.$('#regEmail'));
-      if (!emailInput) throw new Error('Reddit register: email input not found');
+      // Dismiss cookie banners if present
+      for (const label of ['Accept all', 'Accept', 'I agree', 'Continue']) {
+        const btn = await page.$(`button:has-text("${label}")`);
+        if (btn) {
+          await btn.click().catch(() => {});
+          await this.humanLikeDelay(500, 1200);
+        }
+      }
+
+      // Wait for email field (Reddit sometimes hydrates slowly)
+      let emailInput = null;
+      const deadline = Date.now() + 25000;
+      while (Date.now() < deadline && !emailInput) {
+        emailInput =
+          (await page.$('input[name="email"]')) ||
+          (await page.$('input[type="email"]')) ||
+          (await page.$('#regEmail')) ||
+          (await page.$('faceplate-text-input[name="email"] input')) ||
+          (await page.$('auth-flow-modal input[type="email"]'));
+        if (!emailInput) await this.humanLikeDelay(800, 1200);
+      }
+      if (!emailInput) {
+        const snap = `/tmp/reddit-register-fail-${Date.now()}.png`;
+        await page.screenshot({ path: snap, fullPage: true }).catch(() => {});
+        const title = await page.title().catch(() => '');
+        const url = page.url();
+        const snippet = (await page.locator('body').innerText().catch(() => '')).slice(0, 400);
+        throw new Error(
+          `Reddit register: email input not found (title=${title} url=${url} snap=${snap}) ${snippet}`
+        );
+      }
 
       await emailInput.click({ clickCount: 3 }).catch(() => {});
       await this.humanLikeTyping(page, 'input[name="email"], input[type="email"], #regEmail', email);
