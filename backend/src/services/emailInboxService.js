@@ -60,18 +60,67 @@ function extractUrls(text) {
   return matches.map((u) => u.replace(/[),.;]+$/, ''));
 }
 
+/** Strip transport headers — non-MIME bodies often lack Content-Type. */
+function extractMessageBody(raw) {
+  const text = String(raw || '');
+  const textParts = [];
+  const htmlMatch = text.match(
+    /Content-Type:\s*text\/html[\s\S]*?\r?\n\r?\n([\s\S]*?)(?=\r?\n--|\r?\n\r?\nContent-Type:|$)/i
+  );
+  const plainMatch = text.match(
+    /Content-Type:\s*text\/plain[\s\S]*?\r?\n\r?\n([\s\S]*?)(?=\r?\n--|\r?\n\r?\nContent-Type:|$)/i
+  );
+  if (plainMatch) textParts.push(plainMatch[1]);
+  if (htmlMatch) textParts.push(htmlMatch[1].replace(/<[^>]+>/g, ' '));
+  if (textParts.length) {
+    return textParts.join('\n').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+  const sep = text.search(/\r?\n\r?\n/);
+  const body = sep >= 0 ? text.slice(sep).replace(/^\r?\n\r?\n/, '') : text;
+  return body.replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function isNoisyCode(code) {
+  if (/^(19|20)\d{2}$/.test(code)) return true;
+  if (/^0+$/.test(code)) return true;
+  return false;
+}
+
 function extractCodes(text) {
-  const found = [];
   const raw = String(text || '');
+  const preferred = [];
+  const prefRe =
+    /(?:verification\s*code|security\s*code|one[-\s]?time(?:\s*code)?|otp|code(?:\s*is)?)\s*[:=]?\s*(\d{4,8})\b/gi;
   let m;
+  while ((m = prefRe.exec(raw)) !== null) {
+    const code = m[1];
+    if (isNoisyCode(code)) continue;
+    if (!preferred.includes(code)) preferred.push(code);
+  }
+  if (preferred.length) return preferred;
+
+  const found = [];
   const re = new RegExp(CODE_REGEX.source, 'g');
   while ((m = re.exec(raw)) !== null) {
     const code = m[1];
-    // Skip years / common noise
-    if (/^(19|20)\d{2}$/.test(code)) continue;
+    if (isNoisyCode(code)) continue;
     if (!found.includes(code)) found.push(code);
   }
   return found;
+}
+
+function messageMentionsAddress(msg, address) {
+  const want = String(address || '').toLowerCase();
+  if (!want) return true;
+  const blob = [
+    ...(msg.to || []),
+    msg.subject || '',
+    msg.preview || '',
+    msg.rawHeaders || '',
+  ]
+    .join(' ')
+    .toLowerCase();
+  return blob.includes(want);
 }
 
 function pickVerificationLinks(urls) {
@@ -431,6 +480,8 @@ class EmailInboxService {
 
   /**
    * Fetch recent messages (headers + body text/html snippet).
+   * For catch-all pool mailboxes, IMAP-search by To/alias so we don't miss
+   * verification mail buried under other aliases' traffic.
    */
   async fetchRecentMessages(account, { limit = 10, mailbox = 'INBOX' } = {}) {
     return this.withClient(account, async (client) => {
@@ -440,23 +491,40 @@ class EmailInboxService {
         const total = status?.exists || 0;
         if (!total) return [];
 
-        const start = Math.max(1, total - limit + 1);
+        const cfg = this.resolveImapConfig(account);
+        const alias = cfg.catchallAddress ? String(cfg.catchallAddress).toLowerCase() : null;
+        let seq = null;
+
+        if (alias) {
+          try {
+            // Prefer messages addressed to this alias (shared pool inbox).
+            let uids = await client.search({ to: alias }, { uid: true });
+            if (!uids?.length) {
+              uids = await client.search({ body: alias }, { uid: true });
+            }
+            if (uids?.length) {
+              const slice = uids.slice(-Math.max(limit, 25));
+              seq = { uid: true, set: slice.join(',') };
+            }
+          } catch (searchErr) {
+            console.warn(
+              `IMAP catchall search failed for ${alias}: ${searchErr.message}; falling back to recent`
+            );
+          }
+        }
+
+        if (!seq) {
+          const start = Math.max(1, total - Math.max(limit, alias ? 40 : 10) + 1);
+          seq = { uid: false, set: `${start}:${total}` };
+        }
+
         const messages = [];
-
-        for await (const msg of client.fetch(`${start}:${total}`, {
-          envelope: true,
-          source: true,
-          uid: true,
-        })) {
+        const fetchOpts = { envelope: true, source: true, uid: true };
+        for await (const msg of client.fetch(seq.set, fetchOpts, seq.uid ? { uid: true } : undefined)) {
           const raw = msg.source ? msg.source.toString('utf8') : '';
-          const textParts = [];
-          const htmlMatch = raw.match(/Content-Type:\s*text\/html[\s\S]*?\r?\n\r?\n([\s\S]*?)(?=\r?\n--|\r?\n\r?\nContent-Type:|$)/i);
-          const plainMatch = raw.match(/Content-Type:\s*text\/plain[\s\S]*?\r?\n\r?\n([\s\S]*?)(?=\r?\n--|\r?\n\r?\nContent-Type:|$)/i);
-          if (plainMatch) textParts.push(plainMatch[1]);
-          if (htmlMatch) textParts.push(htmlMatch[1].replace(/<[^>]+>/g, ' '));
-          if (!textParts.length) textParts.push(raw.slice(0, 8000));
-
-          const body = textParts.join('\n').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
+          const headerEnd = raw.search(/\r?\n\r?\n/);
+          const rawHeaders = headerEnd >= 0 ? raw.slice(0, headerEnd) : '';
+          const body = extractMessageBody(raw);
           const urls = extractUrls(body);
           const codes = extractCodes(body);
           const verifyLinks = pickVerificationLinks(urls);
@@ -471,18 +539,18 @@ class EmailInboxService {
             verifyLinks,
             urls: urls.slice(0, 20),
             preview: body.slice(0, 400),
+            rawHeaders: rawHeaders.slice(0, 2000),
           });
         }
 
         // Newest first
-        let out = messages.reverse();
-        const cfg = this.resolveImapConfig(account);
-        if (cfg.catchallAddress) {
-          const want = String(cfg.catchallAddress).toLowerCase();
-          out = out.filter((m) => {
-            const blob = `${(m.to || []).join(' ')} ${m.preview || ''} ${m.subject || ''}`.toLowerCase();
-            return blob.includes(want);
-          });
+        let out = messages.sort((a, b) => {
+          const da = a.date ? new Date(a.date).getTime() : 0;
+          const db = b.date ? new Date(b.date).getTime() : 0;
+          return db - da;
+        });
+        if (alias) {
+          out = out.filter((m) => messageMentionsAddress(m, alias));
         }
         return out;
       } finally {

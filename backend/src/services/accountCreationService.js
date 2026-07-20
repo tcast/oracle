@@ -373,6 +373,7 @@ class AccountCreationService {
    */
   async claimEmailFromPool() {
     // Prefer catchall/domain-pool aliases — Yahoo IMAP often blocks Reddit verify.
+    // Prefer proteusmail.net (apex of the mail host) over parked catch-all domains.
     const result = await pool.query(
       `SELECT ea.*
        FROM email_accounts ea
@@ -388,7 +389,8 @@ class AccountCreationService {
          )
        ORDER BY
          CASE WHEN ea.provider = 'catchall' THEN 0 ELSE 1 END,
-         ea.id
+         CASE WHEN lower(ea.email) LIKE '%@proteusmail.net' THEN 0 ELSE 1 END,
+         ea.id DESC
        LIMIT 1`
     );
     return result.rows[0] || null;
@@ -540,9 +542,13 @@ class AccountCreationService {
       );
       if (codeInput && emailAccount) {
         console.log('Reddit asking for email verification code…');
+        const verifyStartedAt = new Date();
         const verified = await emailInboxService.pollForVerification(emailAccount, {
-          timeoutMs: 120000,
+          timeoutMs: 240000,
+          intervalMs: 4000,
+          limit: 40,
           fromIncludes: 'reddit',
+          afterDate: verifyStartedAt,
         });
         if (!verified.code) throw new Error('No verification code in inbox');
         await this.humanLikeTyping(
