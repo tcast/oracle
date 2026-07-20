@@ -138,8 +138,9 @@ class AccountCreationService {
   classifyCreateError(message = '') {
     const msg = String(message || '');
     if (/no unassigned email|no .*email/i.test(msg)) return 'no_email';
-    if (/no .*proxy|proxy.*unavailable|no healthy proxy/i.test(msg)) return 'no_proxy';
+    if (/no .*proxy|proxy.*unavailable|no healthy proxy|not assignable/i.test(msg)) return 'no_proxy';
     if (/not supported|not.?implemented|gated|needs.?accounts/i.test(msg)) return 'not_ready';
+    if (/verification (email|code)|scanned 0 messages|inbox/i.test(msg)) return 'email_verify';
     if (/CAPTCHA|sitekey/i.test(msg)) return 'challenge';
     if (/batch already running|create already in progress/i.test(msg)) return 'busy';
     return classifyFailure(msg);
