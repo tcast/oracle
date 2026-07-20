@@ -439,6 +439,11 @@ class RedditPasswordResetService {
     if (looksBlocked) {
       throw new Error(`Reddit forgot-password blocked: ${body.slice(0, 180)}`);
     }
+    if (!looksOk) {
+      throw new Error(
+        `Reddit forgot-password did not confirm email send: ${body.slice(0, 220)}`
+      );
+    }
     return {
       confirmationSnippet: body.slice(0, 240),
       looksOk,
@@ -587,7 +592,7 @@ class RedditPasswordResetService {
         subjectIncludes: 'password',
         afterDate: triggeredAt,
         linkIncludes: 'reddit.com',
-        searchQuery: 'from:reddit password',
+        searchQuery: 'password',
         limit: 12,
       });
 
@@ -602,7 +607,7 @@ class RedditPasswordResetService {
         const retry = await emailInboxService.getLatestVerification(inboxAccount, {
           limit: 15,
           fromIncludes: 'reddit',
-          searchQuery: 'from:reddit password',
+          searchQuery: 'password',
           linkIncludes: 'reddit.com',
         });
         resetLink =

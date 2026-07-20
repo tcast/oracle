@@ -271,49 +271,61 @@ class EmailInboxService {
         .catch(() => {});
       await page.waitForTimeout(1500);
 
-      const search = page.locator('input[aria-label*="Search" i], input[placeholder*="Search" i]').first();
-      if (searchQuery && (await search.isVisible().catch(() => false))) {
-        await search.fill(String(searchQuery));
-        await page.keyboard.press('Enter');
-        await page.waitForTimeout(3500);
-      }
-
-      const rows = await page.evaluate((max) => {
-        const items = [];
-        const reject =
-          /^(File|Home|View|Help|New mail|Delete|Archive|Report|Move to|Reply|Mark all|Flag|Enhance|Browse|Navigation|Reading Pane|Read \/ Unread|Focused|Other|Inbox|Junk|Drafts|Sent|Deleted|Select an item)/i;
-
-        const nodes = [...document.querySelectorAll(
-          '[role="option"], [role="row"], div[data-convid], div[aria-label*="Reddit" i]'
-        )];
-        for (const n of nodes) {
-          const label = (n.getAttribute('aria-label') || n.innerText || '')
-            .replace(/\s+/g, ' ')
-            .trim();
-          if (label.length < 12) continue;
-          if (reject.test(label)) continue;
-          if (!/reddit|password|reset|@|message|r\//i.test(label)) continue;
-          items.push({
-            preview: label.slice(0, 500),
-            index: items.length,
-          });
-          if (items.length >= max) break;
-        }
-
-        // Fallback: any long option that isn't chrome
-        if (!items.length) {
+      const collectRows = async () =>
+        page.evaluate((max) => {
+          const items = [];
+          const reject =
+            /^(File|Home|View|Help|New mail|Delete|Archive|Report|Move to|Reply|Mark all|Flag|Enhance|Browse|Navigation|Reading Pane|Read \/ Unread|Focused|Other|Inbox|Junk|Drafts|Sent|Deleted|Select an item)/i;
+          const nodes = [...document.querySelectorAll(
+            '[role="option"], [role="row"], div[data-convid], div[aria-label*="Reddit" i]'
+          )];
           for (const n of nodes) {
             const label = (n.getAttribute('aria-label') || n.innerText || '')
               .replace(/\s+/g, ' ')
               .trim();
-            if (label.length < 40) continue;
+            if (label.length < 12) continue;
             if (reject.test(label)) continue;
+            if (!/reddit|password|reset|@|message|r\//i.test(label)) continue;
             items.push({ preview: label.slice(0, 500), index: items.length });
             if (items.length >= max) break;
           }
+          return items;
+        }, limit);
+
+      const runSearch = async (q) => {
+        const search = page.locator('input[aria-label*="Search" i], input[placeholder*="Search" i]').first();
+        if (q && (await search.isVisible().catch(() => false))) {
+          await search.fill(String(q));
+          await page.keyboard.press('Enter');
+          await page.waitForTimeout(3500);
         }
-        return items;
-      }, limit);
+      };
+
+      let rows = [];
+      const folders =
+        searchQuery && /password/i.test(String(searchQuery))
+          ? [
+              'https://outlook.live.com/mail/0/junkemail',
+              'https://outlook.live.com/mail/0/',
+            ]
+          : [null];
+
+      for (const folderUrl of folders) {
+        if (folderUrl) {
+          await page.goto(folderUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+          await page.waitForTimeout(2500);
+        }
+        await runSearch(searchQuery);
+        rows = await collectRows();
+        if (rows.some((r) => /password|reset|recover/i.test(r.preview || ''))) break;
+        if (!searchQuery) break;
+        // Search returned nothing useful — try folder without search
+        await runSearch('');
+        await page.keyboard.press('Escape').catch(() => {});
+        await page.waitForTimeout(1500);
+        rows = await collectRows();
+        if (rows.some((r) => /password|reset|recover/i.test(r.preview || ''))) break;
+      }
 
       // Prefer password-reset subjects, else any Reddit message (for link scrape).
       let openedBody = null;
