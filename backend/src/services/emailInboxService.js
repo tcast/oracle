@@ -265,7 +265,18 @@ class EmailInboxService {
           timeout: 60000,
         });
       }
-      await page.waitForTimeout(4000);
+      await page.waitForTimeout(3000);
+      await page
+        .waitForSelector('[role="option"], [role="listbox"] [role="option"]', { timeout: 20000 })
+        .catch(() => {});
+      await page.waitForTimeout(1500);
+
+      const search = page.locator('input[aria-label*="Search" i], input[placeholder*="Search" i]').first();
+      if (await search.isVisible().catch(() => false)) {
+        await search.fill('from:reddit password');
+        await page.keyboard.press('Enter');
+        await page.waitForTimeout(3500);
+      }
 
       const rows = await page.evaluate((max) => {
         const items = [];
@@ -275,32 +286,22 @@ class EmailInboxService {
         for (const n of nodes) {
           const label = n.getAttribute('aria-label') || n.innerText || '';
           if (label.length < 8) continue;
+          // Skip chrome/toolbar noise
+          if (/^(File|Home|View|Help|New mail|Delete|Archive)\b/i.test(label.trim())) continue;
           items.push({
             preview: label.replace(/\s+/g, ' ').trim().slice(0, 500),
             index: items.length,
           });
           if (items.length >= max) break;
         }
-        if (!items.length) {
-          const text = (document.body?.innerText || '')
-            .split('\n')
-            .map((s) => s.trim())
-            .filter(Boolean);
-          for (const line of text) {
-            if (line.length > 20 && line.length < 300) {
-              items.push({ preview: line, index: items.length });
-            }
-            if (items.length >= max) break;
-          }
-        }
         return items;
       }, limit);
 
-      // Open the newest Reddit-looking message so we can scrape full reset links
-      // (list aria-labels rarely include the actual href).
+      // Prefer password-reset subjects, else any Reddit message (for link scrape).
       let openedBody = null;
-      const redditIdx = rows.findIndex((r) => /reddit/i.test(r.preview || ''));
-      if (redditIdx >= 0) {
+      let openIdx = rows.findIndex((r) => /password|reset|recover/i.test(r.preview || ''));
+      if (openIdx < 0) openIdx = rows.findIndex((r) => /reddit/i.test(r.preview || ''));
+      if (openIdx >= 0) {
         const clicked = await page.evaluate((idx) => {
           const nodes = [...document.querySelectorAll(
             '[role="option"], [role="row"], [aria-label*="Unread"], [aria-label*="Read"]'
@@ -312,7 +313,7 @@ class EmailInboxService {
           if (!target) return false;
           target.click();
           return true;
-        }, redditIdx).catch(() => false);
+        }, openIdx).catch(() => false);
 
         if (clicked) {
           await page.waitForTimeout(2500);
@@ -325,7 +326,7 @@ class EmailInboxService {
             const hrefs = [...root.querySelectorAll('a[href]')]
               .map((a) => a.href)
               .filter((h) => /^https?:/i.test(h))
-              .slice(0, 30);
+              .slice(0, 40);
             return { text, hrefs };
           }).catch(() => null);
         }
@@ -333,7 +334,7 @@ class EmailInboxService {
 
       const messages = rows.map((row, idx) => {
         const preview = row.preview || '';
-        const isOpened = openedBody && idx === redditIdx;
+        const isOpened = openedBody && idx === openIdx;
         const body = isOpened ? `${preview} ${openedBody.text || ''}` : preview;
         const urls = [
           ...extractUrls(body),
