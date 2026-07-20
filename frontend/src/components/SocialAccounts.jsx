@@ -302,7 +302,7 @@ const SocialAccounts = () => {
       case 'status':
         return (
           <td key={col} className="px-4 py-3 whitespace-nowrap">
-            <span className={`badge ${account.status === 'active' ? 'badge-success' : 'badge-neutral'}`}>
+            <span className={`badge ${account.status === 'active' ? 'badge-success' : account.status === 'banned' ? 'badge-danger' : 'badge-neutral'}`}>
               {account.status}
             </span>
           </td>
