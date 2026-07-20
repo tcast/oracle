@@ -83,7 +83,7 @@ function App() {
             <Route path="/users/new" element={<PrivateRoute fallback={<LoadingScreen />}><AppLayout><UserManagement /></AppLayout></PrivateRoute>} />
             <Route path="/social-accounts" element={<PrivateRoute fallback={<LoadingScreen />}><AppLayout><SocialAccounts /></AppLayout></PrivateRoute>} />
             <Route path="/organic-activity" element={<PrivateRoute fallback={<LoadingScreen />}><AppLayout><OrganicActivity /></AppLayout></PrivateRoute>} />
-            <Route path="/noc" element={<PrivateRoute fallback={<LoadingScreen />}><AppLayout><NocDashboard /></AppLayout></PrivateRoute>} />
+            <Route path="/noc" element={<PrivateRoute fallback={<LoadingScreen />}><AppLayout fullBleed><NocDashboard /></AppLayout></PrivateRoute>} />
             <Route path="/proxy-management" element={<PrivateRoute fallback={<LoadingScreen />}><AppLayout><ProxyManagement /></AppLayout></PrivateRoute>} />
             <Route path="/email-accounts" element={<PrivateRoute fallback={<LoadingScreen />}><AppLayout><EmailAccountManager /></AppLayout></PrivateRoute>} />
             <Route path="/proxy-assignments" element={<PrivateRoute fallback={<LoadingScreen />}><AppLayout><ProxyAccountAssignment /></AppLayout></PrivateRoute>} />
