@@ -179,7 +179,7 @@ class EmailInboxService {
   /**
    * Outlook/Hotmail webmail fallback when IMAP basic auth is disabled.
    */
-  async fetchViaOutlookWeb(account, { limit = 10, timeoutMs = 90000 } = {}) {
+  async fetchViaOutlookWeb(account, { limit = 10, timeoutMs = 90000, searchQuery = null } = {}) {
     let browser;
     const run = async () => {
     const executablePath =
@@ -272,27 +272,45 @@ class EmailInboxService {
       await page.waitForTimeout(1500);
 
       const search = page.locator('input[aria-label*="Search" i], input[placeholder*="Search" i]').first();
-      if (await search.isVisible().catch(() => false)) {
-        await search.fill('from:reddit password');
+      if (searchQuery && (await search.isVisible().catch(() => false))) {
+        await search.fill(String(searchQuery));
         await page.keyboard.press('Enter');
         await page.waitForTimeout(3500);
       }
 
       const rows = await page.evaluate((max) => {
         const items = [];
+        const reject =
+          /^(File|Home|View|Help|New mail|Delete|Archive|Report|Move to|Reply|Mark all|Flag|Enhance|Browse|Navigation|Reading Pane|Read \/ Unread|Focused|Other|Inbox|Junk|Drafts|Sent|Deleted|Select an item)/i;
+
         const nodes = [...document.querySelectorAll(
-          '[role="option"], [role="row"], [aria-label*="Unread"], [aria-label*="Read"]'
+          '[role="option"], [role="row"], div[data-convid], div[aria-label*="Reddit" i]'
         )];
         for (const n of nodes) {
-          const label = n.getAttribute('aria-label') || n.innerText || '';
-          if (label.length < 8) continue;
-          // Skip chrome/toolbar noise
-          if (/^(File|Home|View|Help|New mail|Delete|Archive)\b/i.test(label.trim())) continue;
+          const label = (n.getAttribute('aria-label') || n.innerText || '')
+            .replace(/\s+/g, ' ')
+            .trim();
+          if (label.length < 12) continue;
+          if (reject.test(label)) continue;
+          if (!/reddit|password|reset|@|message|r\//i.test(label)) continue;
           items.push({
-            preview: label.replace(/\s+/g, ' ').trim().slice(0, 500),
+            preview: label.slice(0, 500),
             index: items.length,
           });
           if (items.length >= max) break;
+        }
+
+        // Fallback: any long option that isn't chrome
+        if (!items.length) {
+          for (const n of nodes) {
+            const label = (n.getAttribute('aria-label') || n.innerText || '')
+              .replace(/\s+/g, ' ')
+              .trim();
+            if (label.length < 40) continue;
+            if (reject.test(label)) continue;
+            items.push({ preview: label.slice(0, 500), index: items.length });
+            if (items.length >= max) break;
+          }
         }
         return items;
       }, limit);
@@ -301,28 +319,47 @@ class EmailInboxService {
       let openedBody = null;
       let openIdx = rows.findIndex((r) => /password|reset|recover/i.test(r.preview || ''));
       if (openIdx < 0) openIdx = rows.findIndex((r) => /reddit/i.test(r.preview || ''));
+      if (openIdx < 0 && rows.length) openIdx = 0;
+
       if (openIdx >= 0) {
-        const clicked = await page.evaluate((idx) => {
-          const nodes = [...document.querySelectorAll(
-            '[role="option"], [role="row"], [aria-label*="Unread"], [aria-label*="Read"]'
-          )].filter((n) => {
-            const label = n.getAttribute('aria-label') || n.innerText || '';
-            return label.length >= 8;
-          });
-          const target = nodes[idx];
-          if (!target) return false;
-          target.click();
-          return true;
-        }, openIdx).catch(() => false);
+        // Click by matching preview text when possible (more reliable than index)
+        const needle = (rows[openIdx].preview || '').slice(0, 40);
+        let clicked = false;
+        if (needle.length > 10) {
+          clicked = await page
+            .getByText(needle.slice(0, 24), { exact: false })
+            .first()
+            .click({ timeout: 5000 })
+            .then(() => true)
+            .catch(() => false);
+        }
+        if (!clicked) {
+          clicked = await page.evaluate((idx) => {
+            const reject =
+              /^(File|Home|View|Help|New mail|Delete|Archive|Report|Reading Pane|Read \/ Unread)/i;
+            const nodes = [...document.querySelectorAll(
+              '[role="option"], [role="row"], div[data-convid], div[aria-label*="Reddit" i]'
+            )].filter((n) => {
+              const label = (n.getAttribute('aria-label') || n.innerText || '')
+                .replace(/\s+/g, ' ')
+                .trim();
+              return label.length >= 12 && !reject.test(label);
+            });
+            const target = nodes[idx];
+            if (!target) return false;
+            target.click();
+            return true;
+          }, openIdx).catch(() => false);
+        }
 
         if (clicked) {
-          await page.waitForTimeout(2500);
+          await page.waitForTimeout(3000);
           openedBody = await page.evaluate(() => {
             const reading = document.querySelector(
               '[role="main"], [aria-label*="Reading Pane"], .ReadingPaneContents, #ReadingPaneContainerId'
             );
             const root = reading || document.body;
-            const text = (root?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 6000);
+            const text = (root?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 8000);
             const hrefs = [...root.querySelectorAll('a[href]')]
               .map((a) => a.href)
               .filter((h) => /^https?:/i.test(h))
@@ -498,9 +535,12 @@ class EmailInboxService {
 
   async getLatestVerification(
     account,
-    { limit = 15, fromIncludes, subjectIncludes, afterDate, linkIncludes } = {}
+    { limit = 15, fromIncludes, subjectIncludes, afterDate, linkIncludes, searchQuery } = {}
   ) {
-    const { messages } = await this.fetchRecentMessagesWithFallback(account, { limit });
+    const { messages } = await this.fetchRecentMessagesWithFallback(account, {
+      limit,
+      searchQuery,
+    });
     return this.pickLatestFromMessages(messages, {
       fromIncludes,
       subjectIncludes,
@@ -518,6 +558,7 @@ class EmailInboxService {
       subjectIncludes,
       afterDate,
       linkIncludes,
+      searchQuery,
       limit = 10,
     } = {}
   ) {
@@ -530,6 +571,7 @@ class EmailInboxService {
         subjectIncludes,
         afterDate,
         linkIncludes,
+        searchQuery,
       });
       if (last.found) return last;
       await new Promise((r) => setTimeout(r, intervalMs));

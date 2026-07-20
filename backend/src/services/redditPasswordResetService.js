@@ -581,6 +581,7 @@ class RedditPasswordResetService {
         subjectIncludes: 'password',
         afterDate: triggeredAt,
         linkIncludes: 'reddit.com',
+        searchQuery: 'from:reddit password',
         limit: 12,
       });
 
