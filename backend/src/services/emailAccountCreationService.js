@@ -2,6 +2,7 @@ const { chromium } = require('playwright-extra');
 const stealth = require('puppeteer-extra-plugin-stealth')();
 const pool = require('./db');
 const fiveSimService = require('./fiveSimService');
+const smsManService = require('./smsManService');
 const captchaSolverService = require('./captchaSolverService');
 const proxyService = require('./proxyService');
 const { generatePassword } = require('../utils/passwordGenerator');
@@ -20,6 +21,15 @@ chromium.use(stealth);
 class EmailAccountCreationService {
   constructor() {
     this.activeBrowsers = new Map();
+  }
+
+  async cancelSms(provider, requestId) {
+    if (!requestId) return;
+    if (provider === 'smsman') {
+      await smsManService.cancelRequest(requestId);
+    } else {
+      await fiveSimService.cancelRequest(requestId);
+    }
   }
 
   /**
@@ -122,6 +132,36 @@ class EmailAccountCreationService {
   }
 
   /**
+   * Enter OTP — Yahoo now uses 6 separate digit boxes (verify-code-0..5).
+   */
+  async enterOtpCode(page, code) {
+    const digits = String(code).replace(/\D/g, '');
+    const splitBoxes = await page.$$('input[id^="verify-code-"]');
+    if (splitBoxes.length >= digits.length && digits.length > 0) {
+      for (let i = 0; i < digits.length; i++) {
+        const box = await page.$(`#verify-code-${i}`);
+        if (!box) break;
+        await box.click({ force: true }).catch(() => {});
+        await box.fill('');
+        await box.type(digits[i], { delay: 80 });
+        await this.humanLikeDelay(40, 120);
+      }
+      return;
+    }
+
+    const single =
+      (await page.$('input[name="verificationCode"]')) ||
+      (await page.$('input[name="code"]')) ||
+      (await page.$('input[autocomplete="one-time-code"]'));
+    if (!single) {
+      throw new Error('OTP input not found');
+    }
+    await single.click({ force: true });
+    await single.fill('');
+    await single.type(digits, { delay: 60 });
+  }
+
+  /**
    * Create Yahoo email account
    * @param {string} username - Desired username
    * @param {string} password - Account password
@@ -139,9 +179,9 @@ class EmailAccountCreationService {
       browser = b;
 
       // Navigate to Yahoo signup
-      console.log('   1/8 Navigating to Yahoo signup...');
+      console.log('   1/9 Navigating to Yahoo signup...');
       await page.goto('https://login.yahoo.com/account/create', {
-        waitUntil: 'networkidle',
+        waitUntil: 'domcontentloaded',
         timeout: 60000
       });
       await this.humanLikeDelay(2000, 3000);
@@ -251,18 +291,27 @@ class EmailAccountCreationService {
         break;
       }
 
-      // Request USA phone number from 5SIM (USA-only)
-      console.log('   8/9 Requesting USA phone number from 5SIM...');
-      const smsRequest = await fiveSimService.getNumber('usa', 'yahoo');
+      // Request USA phone number from SMS-Man (USA-only; 5sim fallback)
+      console.log('   8/9 Requesting USA phone number from SMS-Man...');
+      let smsProvider = 'smsman';
+      let smsRequest;
+      try {
+        smsRequest = await smsManService.getNumber('US', 'yahoo');
+      } catch (smsManErr) {
+        console.warn(`   SMS-Man failed (${smsManErr.message}); falling back to 5SIM USA...`);
+        smsProvider = '5sim';
+        smsRequest = await fiveSimService.getNumber('usa', 'yahoo');
+      }
       if (smsRequest.country && smsRequest.country !== 'usa') {
-        await fiveSimService.cancelRequest(smsRequest.id);
+        await this.cancelSms(smsProvider, smsRequest.id);
         throw new Error(`Refusing non-US SMS country: ${smsRequest.country}`);
       }
       if (!/^\+1\d{10}$/.test(String(smsRequest.number || '').replace(/\s/g, ''))) {
-        await fiveSimService.cancelRequest(smsRequest.id);
+        await this.cancelSms(smsProvider, smsRequest.id);
         throw new Error(`Refusing non-US phone number: ${smsRequest.number}`);
       }
       smsRequestId = smsRequest.id;
+      this._lastSmsProvider = smsProvider;
 
       // Enter phone number on verification page
       console.log(`   Entering phone: ${smsRequest.number}...`);
@@ -279,18 +328,28 @@ class EmailAccountCreationService {
       await page.click('button:has-text("Get code by text")');
       await this.humanLikeDelay(3000, 5000);
 
-      // Wait for SMS verification code from 5SIM
-      console.log('   9/9 Waiting for SMS verification code...');
-      const verification = await fiveSimService.getVerificationCode(smsRequestId, 180000);
+      // Wait for SMS verification code
+      console.log(`   9/9 Waiting for SMS verification code (${smsProvider})...`);
+      const verification = smsProvider === 'smsman'
+        ? await smsManService.getVerificationCode(smsRequestId, 180000)
+        : await fiveSimService.getVerificationCode(smsRequestId, 180000);
 
       // Enter verification code
       console.log(`   Entering code: ${verification.code}...`);
-      await page.waitForSelector('input[name="verificationCode"], input[id*="code"]', { timeout: 15000 });
-      await this.humanLikeTyping(page, 'input[name="verificationCode"], input[id*="code"]', verification.code);
+      await page.waitForSelector(
+        'input[id^="verify-code-"], input[name="verificationCode"], input[id*="code"], input[autocomplete="one-time-code"]',
+        { timeout: 15000 }
+      );
+      await this.enterOtpCode(page, verification.code);
       await this.humanLikeDelay();
 
-      // Submit verification
-      await page.click('button[type="submit"]');
+      // Submit verification (some Yahoo flows auto-advance after last digit)
+      const submitBtn = await page.$('button[type="submit"]:not([disabled])');
+      if (submitBtn) {
+        await submitBtn.click({ force: true }).catch(() => page.keyboard.press('Enter'));
+      } else {
+        await page.keyboard.press('Enter').catch(() => {});
+      }
       await this.humanLikeDelay(5000, 7000);
 
       // Verify success - look for Yahoo mail indicators
@@ -329,7 +388,7 @@ class EmailAccountCreationService {
         username,
         password,
         phone: smsRequest.number,
-        phoneProvider: '5sim'
+        phoneProvider: smsProvider
       };
 
     } catch (error) {
@@ -337,7 +396,7 @@ class EmailAccountCreationService {
 
       // Cancel SMS request if it exists
       if (smsRequestId) {
-        await fiveSimService.cancelRequest(smsRequestId);
+        await this.cancelSms(this._lastSmsProvider || 'smsman', smsRequestId);
       }
 
       throw error;
@@ -422,10 +481,23 @@ class EmailAccountCreationService {
         }
       }
 
-      // Request phone number
-      console.log('   6/9 Requesting phone number...');
-      const smsRequest = await fiveSimService.getNumber('usa', 'gmx');
+      // Request USA phone number (SMS-Man first)
+      console.log('   6/9 Requesting USA phone number...');
+      let smsProvider = 'smsman';
+      let smsRequest;
+      try {
+        smsRequest = await smsManService.getNumber('US', 'gmx');
+      } catch (smsManErr) {
+        console.warn(`   SMS-Man failed (${smsManErr.message}); falling back to 5SIM USA...`);
+        smsProvider = '5sim';
+        smsRequest = await fiveSimService.getNumber('usa', 'gmx');
+      }
+      if (!/^\+1\d{10}$/.test(String(smsRequest.number || '').replace(/\s/g, ''))) {
+        await this.cancelSms(smsProvider, smsRequest.id);
+        throw new Error(`Refusing non-US phone number: ${smsRequest.number}`);
+      }
       smsRequestId = smsRequest.id;
+      this._lastSmsProvider = smsProvider;
 
       // Enter phone number
       console.log(`   7/9 Entering phone: ${smsRequest.number}...`);
@@ -440,8 +512,10 @@ class EmailAccountCreationService {
       await this.humanLikeDelay(2000, 3000);
 
       // Wait for SMS verification code
-      console.log('   8/9 Waiting for SMS verification...');
-      const verification = await fiveSimService.getVerificationCode(smsRequestId, 180000);
+      console.log(`   8/9 Waiting for SMS verification (${smsProvider})...`);
+      const verification = smsProvider === 'smsman'
+        ? await smsManService.getVerificationCode(smsRequestId, 180000)
+        : await fiveSimService.getVerificationCode(smsRequestId, 180000);
 
       // Enter verification code
       console.log(`   9/9 Entering verification code: ${verification.code}...`);
@@ -489,14 +563,14 @@ class EmailAccountCreationService {
         username,
         password,
         phone: smsRequest.number,
-        phoneProvider: '5sim'
+        phoneProvider: this._lastSmsProvider || 'smsman'
       };
 
     } catch (error) {
       console.error(`   ❌ GMX account creation failed:`, error.message);
 
       if (smsRequestId) {
-        await fiveSimService.cancelRequest(smsRequestId);
+        await this.cancelSms(this._lastSmsProvider || 'smsman', smsRequestId);
       }
 
       throw error;
