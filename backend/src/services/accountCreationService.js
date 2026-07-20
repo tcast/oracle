@@ -192,36 +192,33 @@ class AccountCreationService {
       return proxy_id;
     }
 
-    // Prefer free US Bright Data ISP, then any free US proxy
-    const free = await pool.query(
+    // Prefer BrightData isp_proxy3 (even if shared with non-Reddit) over free isp_proxy4.
+    // Reddit has been network-blocking the newer isp_proxy4 pool.
+    const pick = await pool.query(
       `SELECT p.id FROM proxies p
        WHERE p.is_active = true
          AND p.country = 'US'
-         AND NOT EXISTS (
-           SELECT 1 FROM social_account_proxies sap
-           WHERE sap.proxy_id = p.id AND sap.is_active = true
-         )
-       ORDER BY CASE WHEN p.provider ILIKE '%brightdata%' THEN 0 ELSE 1 END, p.id
-       LIMIT 1`
-    );
-    if (free.rows[0]) return free.rows[0].id;
-
-    // Cross-platform share OK: reuse a US proxy already on non-Reddit (e.g. X),
-    // but never two Reddit accounts on the same proxy.
-    const shared = await pool.query(
-      `SELECT p.id FROM proxies p
-       WHERE p.is_active = true
-         AND p.country = 'US'
-         AND p.provider ILIKE '%brightdata%'
+         AND (p.cooldown_until IS NULL OR p.cooldown_until <= NOW())
          AND NOT EXISTS (
            SELECT 1 FROM social_account_proxies sap
            JOIN social_accounts sa ON sa.id = sap.social_account_id
            WHERE sap.proxy_id = p.id AND sap.is_active = true AND sa.platform = 'reddit'
          )
-       ORDER BY p.id
+       ORDER BY
+         CASE WHEN p.provider ILIKE '%brightdata%' THEN 0 ELSE 1 END,
+         CASE
+           WHEN COALESCE(p.metadata->>'zone', '') = 'isp_proxy3' THEN 0
+           WHEN COALESCE(p.metadata->>'zone', '') = 'isp_proxy4' THEN 2
+           ELSE 1
+         END,
+         CASE WHEN EXISTS (
+           SELECT 1 FROM social_account_proxies sap
+           WHERE sap.proxy_id = p.id AND sap.is_active = true
+         ) THEN 1 ELSE 0 END,
+         p.id
        LIMIT 1`
     );
-    return shared.rows[0]?.id || null;
+    return pick.rows[0]?.id || null;
   }
 
   async createRedditAccount(username, email, password, proxyConfig = null, emailToken = null, emailAccount = null) {
@@ -573,18 +570,6 @@ class AccountCreationService {
         step.email = emailAccount.email;
         step.emailAccountId = emailAccount.id;
 
-        const proxyId = await this.claimProxyForNewAccount();
-        step.proxyId = proxyId;
-
-        let proxyConfig = null;
-        if (proxyId) {
-          const proxyRow = await pool.query('SELECT * FROM proxies WHERE id = $1', [proxyId]);
-          if (proxyRow.rows[0]) {
-            proxyConfig = proxyService.formatProxyConfig(proxyRow.rows[0]);
-            proxyConfig._proxyId = proxyId;
-          }
-        }
-
         const username = (
           opts.usernamePrefix
             ? `${opts.usernamePrefix}${Math.floor(Math.random() * 10000)}`
@@ -592,14 +577,58 @@ class AccountCreationService {
         ).slice(0, 20);
         const password = generatePassword(14);
 
-        const created = await this.createRedditAccount(
-          username,
-          emailAccount.email,
-          password,
-          proxyConfig,
-          null,
-          emailAccount
-        );
+        // Rotate proxies on Reddit network-security / js_challenge blocks
+        let proxyId = null;
+        let created = null;
+        let lastErr = null;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          proxyId = await this.claimProxyForNewAccount();
+          step.proxyId = proxyId;
+          let proxyConfig = null;
+          if (proxyId) {
+            const proxyRow = await pool.query('SELECT * FROM proxies WHERE id = $1', [proxyId]);
+            if (proxyRow.rows[0]) {
+              proxyConfig = proxyService.formatProxyConfig(proxyRow.rows[0]);
+              proxyConfig._proxyId = proxyId;
+            }
+          }
+          try {
+            created = await this.createRedditAccount(
+              username,
+              emailAccount.email,
+              password,
+              proxyConfig,
+              null,
+              emailAccount
+            );
+            if (proxyId) await proxyService.updateProxyStats(proxyId, true);
+            break;
+          } catch (err) {
+            lastErr = err;
+            const msg = err.message || String(err);
+            const netBlocked = /blocked by network security|js_challenge/i.test(msg);
+            if (proxyId) {
+              await proxyService.updateProxyStats(proxyId, false, {
+                reason: netBlocked ? 'reddit_network_security' : msg.slice(0, 120),
+              });
+              if (netBlocked) {
+                await pool.query(
+                  `UPDATE proxies
+                   SET cooldown_until = NOW() + INTERVAL '6 hours',
+                       consecutive_failures = GREATEST(COALESCE(consecutive_failures, 0), 3),
+                       updated_at = NOW()
+                   WHERE id = $1`,
+                  [proxyId]
+                );
+                console.warn(
+                  `Reddit create: proxy ${proxyId} network-blocked — cooled 6h, retry ${attempt}/3`
+                );
+              }
+            }
+            if (!netBlocked || attempt === 3) throw err;
+          }
+        }
+        if (!created) throw lastErr || new Error('Reddit create failed');
 
         const credentials = {
           password,
