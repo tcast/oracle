@@ -4,6 +4,7 @@ const pool = require('../services/db');
 const { authMiddleware } = require('../middleware/auth');
 const emailAccountCreationService = require('../services/emailAccountCreationService');
 const emailInboxService = require('../services/emailInboxService');
+const domainMailPoolService = require('../services/domainMailPoolService');
 const fiveSimService = require('../services/fiveSimService');
 const captchaSolverService = require('../services/captchaSolverService');
 
@@ -141,10 +142,21 @@ router.post('/create', async (req, res) => {
       });
     }
 
-    if (!['yahoo', 'gmx'].includes(provider)) {
+    if (!['yahoo', 'gmx', 'catchall'].includes(provider)) {
       return res.status(400).json({
-        error: 'Provider must be "yahoo" or "gmx"'
+        error: 'Provider must be "yahoo", "gmx", or "catchall"'
       });
+    }
+
+    if (provider === 'catchall') {
+      if (count < 1 || count > 200) {
+        return res.status(400).json({ error: 'Count must be between 1 and 200 for catchall' });
+      }
+      const results = await domainMailPoolService.mintMany(count, {
+        nameStyle,
+        domain: req.body.domain || null,
+      });
+      return res.json(results);
     }
 
     if (count < 1 || count > 50) {

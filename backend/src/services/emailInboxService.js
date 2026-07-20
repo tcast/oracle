@@ -77,14 +77,35 @@ function pickVerificationLinks(urls) {
 
 class EmailInboxService {
   resolveImapConfig(account) {
+    const meta = account.metadata || {};
     const provider = providerFromEmail(account.email, account.provider);
     const base = provider ? IMAP_HOSTS[provider] : null;
+
+    // Catch-all / custom domain pool: IMAP creds live in metadata
+    if (meta.imap_host || meta.catchall || account.provider === 'catchall') {
+      const insecure =
+        meta.imap_tls_reject_unauthorized === false ||
+        process.env.MAIL_IMAP_TLS_INSECURE === '1' ||
+        true; // self-signed cert on mail.proteusmail.net for now
+      return {
+        provider: provider || 'catchall',
+        host: meta.imap_host || process.env.MAIL_IMAP_IP || process.env.MAIL_IMAP_HOST,
+        port: meta.imap_port || Number(process.env.MAIL_IMAP_PORT || 993),
+        secure: true,
+        tls: { rejectUnauthorized: !insecure },
+        auth: {
+          user: meta.imap_user || process.env.MAIL_POOL_USER || account.email,
+          pass: account.password,
+        },
+        catchallAddress: account.email,
+      };
+    }
+
     if (!base) {
       throw new Error(
         `No IMAP host for provider=${account.provider || '?'} email=${account.email}`
       );
     }
-    const meta = account.metadata || {};
     return {
       provider,
       host: meta.imap_host || base.host,
@@ -112,6 +133,7 @@ class EmailInboxService {
         logger: false,
         greetingTimeout: 15000,
         socketTimeout: 30000,
+        tls: cfg.tls,
       });
       client.on('error', () => {});
 
@@ -336,6 +358,7 @@ class EmailInboxService {
             uid: msg.uid,
             subject: msg.envelope?.subject || null,
             from: (msg.envelope?.from || []).map((a) => a.address || a.name).filter(Boolean),
+            to: (msg.envelope?.to || []).map((a) => a.address || a.name).filter(Boolean),
             date: msg.envelope?.date || null,
             codes,
             verifyLinks,
@@ -345,8 +368,16 @@ class EmailInboxService {
         }
 
         // Newest first
-        messages.reverse();
-        return messages;
+        let out = messages.reverse();
+        const cfg = this.resolveImapConfig(account);
+        if (cfg.catchallAddress) {
+          const want = String(cfg.catchallAddress).toLowerCase();
+          out = out.filter((m) => {
+            const blob = `${(m.to || []).join(' ')} ${m.preview || ''} ${m.subject || ''}`.toLowerCase();
+            return blob.includes(want);
+          });
+        }
+        return out;
       } finally {
         lock.release();
       }
