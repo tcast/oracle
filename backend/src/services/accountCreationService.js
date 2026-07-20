@@ -240,19 +240,36 @@ class AccountCreationService {
         }
       }
 
-      // Wait for email field (Reddit sometimes hydrates slowly)
-      let emailInput = null;
-      const deadline = Date.now() + 25000;
-      while (Date.now() < deadline && !emailInput) {
-        emailInput =
-          (await page.$('input[name="email"]')) ||
-          (await page.$('input[type="email"]')) ||
-          (await page.$('#regEmail')) ||
-          (await page.$('faceplate-text-input[name="email"] input')) ||
-          (await page.$('auth-flow-modal input[type="email"]'));
-        if (!emailInput) await this.humanLikeDelay(800, 1200);
+      // Current Reddit signup: choose Email vs Phone first
+      const emailChoice =
+        (await page.$('button:has-text("Email")')) ||
+        (await page.$('a:has-text("Email")')) ||
+        (await page.getByText('Email', { exact: true }).first().elementHandle().catch(() => null));
+      if (emailChoice) {
+        await emailChoice.click().catch(() => {});
+        await this.humanLikeDelay(1000, 2000);
       }
-      if (!emailInput) {
+
+      // Wait for email field (faceplate shadow DOM or classic inputs)
+      let emailLocator = page
+        .locator('faceplate-text-input[name="email"] input, input[name="email"], input[type="email"], #regEmail')
+        .first();
+      try {
+        await emailLocator.waitFor({ state: 'visible', timeout: 25000 });
+      } catch (_) {
+        // Try clicking Email again / expand auth modal
+        await page.getByRole('button', { name: /email/i }).first().click().catch(() => {});
+        await this.humanLikeDelay(1000, 2000);
+        emailLocator = page
+          .locator(
+            'faceplate-text-input input, auth-flow-modal input[type="email"], input[name="email"], input[type="email"]'
+          )
+          .first();
+        await emailLocator.waitFor({ state: 'visible', timeout: 15000 }).catch(() => {});
+      }
+
+      const emailVisible = await emailLocator.isVisible().catch(() => false);
+      if (!emailVisible) {
         const snap = `/tmp/reddit-register-fail-${Date.now()}.png`;
         await page.screenshot({ path: snap, fullPage: true }).catch(() => {});
         const title = await page.title().catch(() => '');
@@ -263,8 +280,9 @@ class AccountCreationService {
         );
       }
 
-      await emailInput.click({ clickCount: 3 }).catch(() => {});
-      await this.humanLikeTyping(page, 'input[name="email"], input[type="email"], #regEmail', email);
+      await emailLocator.click({ clickCount: 3 }).catch(() => {});
+      await emailLocator.fill('');
+      await emailLocator.type(email, { delay: 60 });
       await this.humanLikeDelay();
 
       const continueBtn = await page.$(
