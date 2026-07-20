@@ -31,6 +31,11 @@ const VERIFY_LINK_HINTS = [
   'auth',
   'reddit.com',
   'click',
+  'password',
+  'reset',
+  'change-password',
+  'accountrecovery',
+  'forgot',
 ];
 
 function providerFromEmail(email, providerHint) {
@@ -262,13 +267,16 @@ class EmailInboxService {
 
       const rows = await page.evaluate((max) => {
         const items = [];
-        const nodes = document.querySelectorAll(
+        const nodes = [...document.querySelectorAll(
           '[role="option"], [role="row"], [aria-label*="Unread"], [aria-label*="Read"]'
-        );
+        )];
         for (const n of nodes) {
           const label = n.getAttribute('aria-label') || n.innerText || '';
           if (label.length < 8) continue;
-          items.push(label.replace(/\s+/g, ' ').trim().slice(0, 500));
+          items.push({
+            preview: label.replace(/\s+/g, ' ').trim().slice(0, 500),
+            index: items.length,
+          });
           if (items.length >= max) break;
         }
         if (!items.length) {
@@ -277,25 +285,68 @@ class EmailInboxService {
             .map((s) => s.trim())
             .filter(Boolean);
           for (const line of text) {
-            if (line.length > 20 && line.length < 300) items.push(line);
+            if (line.length > 20 && line.length < 300) {
+              items.push({ preview: line, index: items.length });
+            }
             if (items.length >= max) break;
           }
         }
         return items;
       }, limit);
 
-      const messages = rows.map((preview, idx) => {
-        const codes = extractCodes(preview);
-        const urls = extractUrls(preview);
+      // Open the newest Reddit-looking message so we can scrape full reset links
+      // (list aria-labels rarely include the actual href).
+      let openedBody = null;
+      const redditIdx = rows.findIndex((r) => /reddit/i.test(r.preview || ''));
+      if (redditIdx >= 0) {
+        const clicked = await page.evaluate((idx) => {
+          const nodes = [...document.querySelectorAll(
+            '[role="option"], [role="row"], [aria-label*="Unread"], [aria-label*="Read"]'
+          )].filter((n) => {
+            const label = n.getAttribute('aria-label') || n.innerText || '';
+            return label.length >= 8;
+          });
+          const target = nodes[idx];
+          if (!target) return false;
+          target.click();
+          return true;
+        }, redditIdx).catch(() => false);
+
+        if (clicked) {
+          await page.waitForTimeout(2500);
+          openedBody = await page.evaluate(() => {
+            const reading = document.querySelector(
+              '[role="main"], [aria-label*="Reading Pane"], .ReadingPaneContents, #ReadingPaneContainerId'
+            );
+            const root = reading || document.body;
+            const text = (root?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 6000);
+            const hrefs = [...root.querySelectorAll('a[href]')]
+              .map((a) => a.href)
+              .filter((h) => /^https?:/i.test(h))
+              .slice(0, 30);
+            return { text, hrefs };
+          }).catch(() => null);
+        }
+      }
+
+      const messages = rows.map((row, idx) => {
+        const preview = row.preview || '';
+        const isOpened = openedBody && idx === redditIdx;
+        const body = isOpened ? `${preview} ${openedBody.text || ''}` : preview;
+        const urls = [
+          ...extractUrls(body),
+          ...(isOpened ? openedBody.hrefs || [] : []),
+        ].filter((u, i, arr) => arr.indexOf(u) === i);
+        const codes = extractCodes(body);
         return {
           uid: `web-${idx}`,
           subject: preview.slice(0, 120),
-          from: [],
+          from: /reddit/i.test(preview) ? ['reddit'] : [],
           date: null,
           codes,
           verifyLinks: pickVerificationLinks(urls),
           urls,
-          preview,
+          preview: body.slice(0, 400),
           source: 'outlook_web',
         };
       });
@@ -387,8 +438,13 @@ class EmailInboxService {
   /**
    * Latest verification code/link across recent messages, optionally filtered by sender/subject.
    */
-  pickLatestFromMessages(messages, { fromIncludes, subjectIncludes } = {}) {
+  pickLatestFromMessages(messages, { fromIncludes, subjectIncludes, afterDate, linkIncludes } = {}) {
+    const afterMs = afterDate ? new Date(afterDate).getTime() : null;
     const filtered = (messages || []).filter((m) => {
+      if (afterMs && m.date) {
+        const t = new Date(m.date).getTime();
+        if (!Number.isNaN(t) && t < afterMs - 60_000) return false;
+      }
       if (fromIncludes) {
         const needle = String(fromIncludes).toLowerCase();
         const hay = `${(m.from || []).join(' ')} ${m.subject || ''} ${m.preview || ''}`.toLowerCase();
@@ -398,24 +454,39 @@ class EmailInboxService {
         const needle = String(subjectIncludes).toLowerCase();
         if (!String(m.subject || m.preview || '').toLowerCase().includes(needle)) return false;
       }
-      return (m.codes && m.codes.length) || (m.verifyLinks && m.verifyLinks.length);
+      const links = m.verifyLinks || m.urls || [];
+      if (linkIncludes) {
+        const needle = String(linkIncludes).toLowerCase();
+        const hasLink = links.some((u) => String(u).toLowerCase().includes(needle));
+        if (!hasLink && !(m.codes && m.codes.length)) return false;
+      }
+      return (m.codes && m.codes.length) || (links && links.length);
     });
 
     const best = filtered[0] || null;
+    const links = best?.verifyLinks?.length ? best.verifyLinks : best?.urls || [];
     return {
       found: !!best,
       code: best?.codes?.[0] || null,
-      link: best?.verifyLinks?.[0] || null,
+      link: links[0] || null,
       codes: best?.codes || [],
-      links: best?.verifyLinks || [],
+      links,
       message: best,
       scanned: (messages || []).length,
     };
   }
 
-  async getLatestVerification(account, { limit = 15, fromIncludes, subjectIncludes } = {}) {
+  async getLatestVerification(
+    account,
+    { limit = 15, fromIncludes, subjectIncludes, afterDate, linkIncludes } = {}
+  ) {
     const { messages } = await this.fetchRecentMessagesWithFallback(account, { limit });
-    return this.pickLatestFromMessages(messages, { fromIncludes, subjectIncludes });
+    return this.pickLatestFromMessages(messages, {
+      fromIncludes,
+      subjectIncludes,
+      afterDate,
+      linkIncludes,
+    });
   }
 
   async pollForVerification(
@@ -425,6 +496,8 @@ class EmailInboxService {
       intervalMs = 5000,
       fromIncludes,
       subjectIncludes,
+      afterDate,
+      linkIncludes,
       limit = 10,
     } = {}
   ) {
@@ -435,6 +508,8 @@ class EmailInboxService {
         limit,
         fromIncludes,
         subjectIncludes,
+        afterDate,
+        linkIncludes,
       });
       if (last.found) return last;
       await new Promise((r) => setTimeout(r, intervalMs));

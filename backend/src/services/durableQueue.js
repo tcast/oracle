@@ -4,6 +4,7 @@ const ORGANIC_QUEUE = 'organic-comments';
 const AUDIT_QUEUE = 'account-stats-audit';
 const X_FOLLOW_QUEUE = 'x-follows';
 const SOCIAL_WARM_QUEUE = 'social-warm';
+const REDDIT_PW_RESET_QUEUE = 'reddit-password-reset';
 
 function redisConnection() {
   return {
@@ -29,11 +30,15 @@ class DurableQueue {
     this.queues[AUDIT_QUEUE] = new Queue(AUDIT_QUEUE, { connection: this.connection });
     this.queues[X_FOLLOW_QUEUE] = new Queue(X_FOLLOW_QUEUE, { connection: this.connection });
     this.queues[SOCIAL_WARM_QUEUE] = new Queue(SOCIAL_WARM_QUEUE, { connection: this.connection });
+    this.queues[REDDIT_PW_RESET_QUEUE] = new Queue(REDDIT_PW_RESET_QUEUE, {
+      connection: this.connection,
+    });
 
     const organicCommentScheduler = require('./organicCommentScheduler');
     const accountStatsScheduler = require('./accountStatsScheduler');
     const xFollowScheduler = require('./xFollowScheduler');
     const socialWarmScheduler = require('./socialWarmScheduler');
+    const redditPasswordResetScheduler = require('./redditPasswordResetScheduler');
 
     this.workers[ORGANIC_QUEUE] = new Worker(
       ORGANIC_QUEUE,
@@ -84,6 +89,19 @@ class DurableQueue {
         connection: this.connection,
         concurrency: 1,
         lockDuration: 30 * 60 * 1000,
+      }
+    );
+
+    this.workers[REDDIT_PW_RESET_QUEUE] = new Worker(
+      REDDIT_PW_RESET_QUEUE,
+      async (job) => {
+        if (job.name !== 'tick') return { skipped: true, reason: 'unknown_job' };
+        return redditPasswordResetScheduler.tick();
+      },
+      {
+        connection: this.connection,
+        concurrency: 1,
+        lockDuration: 45 * 60 * 1000,
       }
     );
 
@@ -171,10 +189,32 @@ class DurableQueue {
       }
     });
 
+    this.workers[REDDIT_PW_RESET_QUEUE].on('completed', async () => {
+      try {
+        if ((await this.pendingCount(REDDIT_PW_RESET_QUEUE)) === 0) {
+          await this.scheduleRedditPasswordResetTick();
+        }
+      } catch (err) {
+        console.error('Failed to schedule next reddit-password-reset tick:', err.message);
+      }
+    });
+
+    this.workers[REDDIT_PW_RESET_QUEUE].on('failed', async (_job, err) => {
+      console.error('Reddit password-reset tick failed:', err?.message || err);
+      try {
+        if ((await this.pendingCount(REDDIT_PW_RESET_QUEUE)) === 0) {
+          await this.scheduleRedditPasswordResetTick(5 * 60 * 1000);
+        }
+      } catch (e) {
+        console.error('Failed to reschedule reddit-password-reset after failure:', e.message);
+      }
+    });
+
     await this.ensureOrganicLoop();
     await this.ensureAuditLoop();
     await this.ensureXFollowLoop();
     await this.ensureSocialWarmLoop();
+    await this.ensureRedditPasswordResetLoop();
 
     this.started = true;
     console.log(
@@ -385,6 +425,54 @@ class DurableQueue {
     await this.scheduleSocialWarmTick(10000);
   }
 
+  /** ~60–120 min between ticks — intentionally slow; max a few resets/day. */
+  redditPasswordResetDelayMs(overrideMs = null) {
+    if (overrideMs != null) return overrideMs;
+    const base = 60 * 60 * 1000;
+    const jitter = Math.random() * 60 * 60 * 1000;
+    return base + jitter;
+  }
+
+  async kickRedditPasswordResetSoon(delayMs = 10000) {
+    const q = this.queues[REDDIT_PW_RESET_QUEUE];
+    if (!q) throw new Error('Reddit password-reset queue not initialized');
+    const delayed = await q.getDelayed();
+    const waiting = await q.getWaiting();
+    for (const job of [...delayed, ...waiting]) {
+      if (job.name === 'tick') {
+        try {
+          await job.remove();
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    await this.scheduleRedditPasswordResetTick(delayMs);
+  }
+
+  async scheduleRedditPasswordResetTick(overrideMs = null) {
+    const q = this.queues[REDDIT_PW_RESET_QUEUE];
+    if (!q) throw new Error('Reddit password-reset queue not initialized');
+    const delay = this.redditPasswordResetDelayMs(overrideMs);
+    await q.add(
+      'tick',
+      { scheduledAt: new Date().toISOString() },
+      { delay, removeOnComplete: 50, removeOnFail: 25, attempts: 1 }
+    );
+    console.log(`Reddit password-reset tick scheduled in ${Math.round(delay / 1000)}s`);
+  }
+
+  async ensureRedditPasswordResetLoop() {
+    const pending = await this.pendingCount(REDDIT_PW_RESET_QUEUE);
+    if (pending > 0) {
+      console.log(
+        `Reddit password-reset queue already has ${pending} pending job(s) — skipping seed`
+      );
+      return;
+    }
+    await this.scheduleRedditPasswordResetTick(30000);
+  }
+
   async getStatus() {
     if (!this.started) {
       return { started: false, redis: null, queues: {} };
@@ -417,6 +505,13 @@ class DurableQueue {
       'completed',
       'failed'
     );
+    const redditPwReset = await this.queues[REDDIT_PW_RESET_QUEUE].getJobCounts(
+      'delayed',
+      'waiting',
+      'active',
+      'completed',
+      'failed'
+    );
     return {
       started: true,
       redis: `${this.connection.host}:${this.connection.port}`,
@@ -425,6 +520,7 @@ class DurableQueue {
         [AUDIT_QUEUE]: audit,
         [X_FOLLOW_QUEUE]: xFollow,
         [SOCIAL_WARM_QUEUE]: socialWarm,
+        [REDDIT_PW_RESET_QUEUE]: redditPwReset,
       },
     };
   }
