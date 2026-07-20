@@ -584,13 +584,38 @@ class RedditPasswordResetService {
         browser = null;
       }
 
-      // Phase 2: read reset link from seller Hotmail via Outlook web
-      const verified = await emailInboxService.pollForVerification(inboxAccount, {
-        timeoutMs: 240000,
-        intervalMs: 25000,
+      // Hotmail/Outlook: skip IMAP (always fails basic auth) — go straight to web scrape
+      const pollInbox = async (opts) => {
+        if (emailInboxService.isMicrosoftAccount(inboxAccount)) {
+          const start = Date.now();
+          let last = null;
+          while (Date.now() - start < (opts.timeoutMs || 90000)) {
+            const messages = await emailInboxService.fetchViaOutlookWeb(inboxAccount, {
+              limit: opts.limit || 12,
+              searchQuery: opts.searchQuery || 'password',
+              timeoutMs: 100000,
+            });
+            last = emailInboxService.pickLatestFromMessages(messages, {
+              fromIncludes: opts.fromIncludes,
+              subjectIncludes: opts.subjectIncludes,
+              linkIncludes: opts.linkIncludes,
+            });
+            if (last.found) return last;
+            await new Promise((r) => setTimeout(r, opts.intervalMs || 30000));
+          }
+          throw new Error(
+            `Verification email not received within ${opts.timeoutMs || 90000}ms` +
+              (last ? ` (scanned ${last.scanned} messages)` : '')
+          );
+        }
+        return emailInboxService.pollForVerification(inboxAccount, opts);
+      };
+
+      const verified = await pollInbox({
+        timeoutMs: 120000,
+        intervalMs: 35000,
         fromIncludes: 'reddit',
         subjectIncludes: 'password',
-        afterDate: triggeredAt,
         linkIncludes: 'reddit.com',
         searchQuery: 'password',
         limit: 12,
