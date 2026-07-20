@@ -26,6 +26,7 @@ const organicCommentsRouter = require('./routes/organicComments');
 const xFollowsRouter = require('./routes/xFollows');
 const socialWarmRouter = require('./routes/socialWarm');
 const accountStatsRouter = require('./routes/accountStats');
+const nocRouter = require('./routes/noc');
 const commentingService = require('./services/commentingService');
 const playwrightService = require('./services/playwrightService');
 const subredditService = require('./services/subredditService');
@@ -1165,6 +1166,7 @@ app.use('/api/organic-comments', organicCommentsRouter);
 app.use('/api/x-follows', xFollowsRouter);
 app.use('/api/social-warm', socialWarmRouter);
 app.use('/api/account-stats', accountStatsRouter);
+app.use('/api/noc', nocRouter);
 app.use('/api/email-accounts', emailAccountsRouter);
 app.use('/api/campaign-builder', campaignBuilderRouter);
 
