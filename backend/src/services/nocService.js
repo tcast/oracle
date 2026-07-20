@@ -17,6 +17,7 @@ class NocService {
       queue,
       geo,
       events,
+      accountCreation,
     ] = await Promise.all([
       this.getProxyHealth(),
       this.getAccountStatus(),
@@ -27,6 +28,7 @@ class NocService {
       this.getQueueStatus(),
       this.getGeoNodes(),
       this.getLiveEvents(),
+      this.getAccountCreationStats(),
     ]);
 
     const flow = this.buildFlowGraph({
@@ -35,6 +37,7 @@ class NocService {
       posting,
       postingByPlatform,
       queue,
+      accountCreation,
     });
 
     return {
@@ -47,6 +50,7 @@ class NocService {
       geo,
       events,
       flow,
+      accountCreation,
       mapping: {
         ok: mapping.ok,
         ...(mapping.overview || {}),
@@ -668,6 +672,147 @@ class NocService {
   }
 
   /**
+   * Account creation: created vs attempted (today + 24h) for NOC social category.
+   */
+  async getAccountCreationStats() {
+    const empty = {
+      today: { attempted: 0, created: 0, failed: 0, blocked: 0, skipped: 0, success_rate: 0 },
+      last_24h: { attempted: 0, created: 0, failed: 0, blocked: 0, skipped: 0, success_rate: 0 },
+      by_platform: [],
+      recent: [],
+    };
+
+    const overview = await pool.query(`
+      SELECT
+        COUNT(*) FILTER (WHERE created_at::date = CURRENT_DATE)::int AS today_attempted,
+        COUNT(*) FILTER (
+          WHERE created_at::date = CURRENT_DATE AND status = 'created'
+        )::int AS today_created,
+        COUNT(*) FILTER (
+          WHERE created_at::date = CURRENT_DATE AND status = 'attempt_failed'
+        )::int AS today_failed,
+        COUNT(*) FILTER (
+          WHERE created_at::date = CURRENT_DATE AND status = 'blocked'
+        )::int AS today_blocked,
+        COUNT(*) FILTER (
+          WHERE created_at::date = CURRENT_DATE AND status = 'skipped'
+        )::int AS today_skipped,
+        COUNT(*) FILTER (
+          WHERE created_at > NOW() - INTERVAL '24 hours'
+        )::int AS h24_attempted,
+        COUNT(*) FILTER (
+          WHERE created_at > NOW() - INTERVAL '24 hours' AND status = 'created'
+        )::int AS h24_created,
+        COUNT(*) FILTER (
+          WHERE created_at > NOW() - INTERVAL '24 hours' AND status = 'attempt_failed'
+        )::int AS h24_failed,
+        COUNT(*) FILTER (
+          WHERE created_at > NOW() - INTERVAL '24 hours' AND status = 'blocked'
+        )::int AS h24_blocked,
+        COUNT(*) FILTER (
+          WHERE created_at > NOW() - INTERVAL '24 hours' AND status = 'skipped'
+        )::int AS h24_skipped
+      FROM account_creation_attempts
+    `).catch(() => ({ rows: [{}] }));
+
+    const byPlatform = await pool.query(`
+      SELECT
+        platform,
+        COUNT(*) FILTER (WHERE created_at::date = CURRENT_DATE)::int AS today_attempted,
+        COUNT(*) FILTER (
+          WHERE created_at::date = CURRENT_DATE AND status = 'created'
+        )::int AS today_created,
+        COUNT(*) FILTER (
+          WHERE created_at::date = CURRENT_DATE
+            AND status IN ('attempt_failed', 'blocked', 'skipped')
+        )::int AS today_failed,
+        COUNT(*) FILTER (
+          WHERE created_at > NOW() - INTERVAL '24 hours'
+        )::int AS h24_attempted,
+        COUNT(*) FILTER (
+          WHERE created_at > NOW() - INTERVAL '24 hours' AND status = 'created'
+        )::int AS h24_created,
+        COUNT(*) FILTER (
+          WHERE created_at > NOW() - INTERVAL '24 hours'
+            AND status IN ('attempt_failed', 'blocked', 'skipped')
+        )::int AS h24_failed,
+        MAX(created_at) FILTER (WHERE status = 'created') AS last_created_at,
+        MAX(created_at) AS last_attempt_at
+      FROM account_creation_attempts
+      GROUP BY platform
+      ORDER BY today_attempted DESC, h24_attempted DESC, platform
+    `).catch(() => ({ rows: [] }));
+
+    // Also surface inventory (active accounts) so social category shows stock even with 0 attempts
+    const inventory = await pool.query(`
+      SELECT platform, COUNT(*) FILTER (WHERE status = 'active')::int AS active
+      FROM social_accounts
+      WHERE COALESCE(is_simulated, false) = false
+      GROUP BY platform
+    `).catch(() => ({ rows: [] }));
+    const invMap = Object.fromEntries(inventory.rows.map((r) => [r.platform, r.active]));
+
+    const o = overview.rows[0] || {};
+    const rate = (created, attempted) =>
+      attempted > 0 ? Math.round((created / attempted) * 1000) / 10 : 0;
+
+    const today = {
+      attempted: o.today_attempted || 0,
+      created: o.today_created || 0,
+      failed: o.today_failed || 0,
+      blocked: o.today_blocked || 0,
+      skipped: o.today_skipped || 0,
+      success_rate: rate(o.today_created || 0, o.today_attempted || 0),
+    };
+    const last_24h = {
+      attempted: o.h24_attempted || 0,
+      created: o.h24_created || 0,
+      failed: o.h24_failed || 0,
+      blocked: o.h24_blocked || 0,
+      skipped: o.h24_skipped || 0,
+      success_rate: rate(o.h24_created || 0, o.h24_attempted || 0),
+    };
+
+    const known = ['reddit', 'x', 'instagram', 'tiktok', 'linkedin'];
+    const platMap = Object.fromEntries(byPlatform.rows.map((r) => [r.platform, r]));
+    const by_platform = known.map((platform) => {
+      const row = platMap[platform] || {};
+      const attempted = row.today_attempted || 0;
+      const created = row.today_created || 0;
+      return {
+        platform,
+        accounts_active: invMap[platform] || 0,
+        today_attempted: attempted,
+        today_created: created,
+        today_failed: row.today_failed || 0,
+        today_success_rate: rate(created, attempted),
+        h24_attempted: row.h24_attempted || 0,
+        h24_created: row.h24_created || 0,
+        h24_failed: row.h24_failed || 0,
+        h24_success_rate: rate(row.h24_created || 0, row.h24_attempted || 0),
+        last_created_at: row.last_created_at || null,
+        last_attempt_at: row.last_attempt_at || null,
+      };
+    });
+
+    const recent = await pool.query(`
+      SELECT
+        id, platform, status, error_class, error_message,
+        proxy_id, social_account_id, username, email, source, created_at
+      FROM account_creation_attempts
+      ORDER BY created_at DESC
+      LIMIT 40
+    `).catch(() => ({ rows: [] }));
+
+    return {
+      today,
+      last_24h,
+      by_platform,
+      recent: recent.rows,
+    };
+  }
+
+  /**
    * Stable hash → US city anchor for proxies without lat/lon.
    * Bright Data / ProxyBase rarely store exact geo; we place by id+zone.
    */
@@ -775,7 +920,7 @@ class NocService {
   }
 
   async getLiveEvents() {
-    const [posts, jobFails, proxyEvents] = await Promise.all([
+    const [posts, jobFails, proxyEvents, createEvents] = await Promise.all([
       pool.query(`
         SELECT
           'post' AS kind,
@@ -830,16 +975,36 @@ class NocService {
         ORDER BY COALESCE(last_failure_at, cooldown_until, updated_at) DESC NULLS LAST
         LIMIT 25
       `).catch(() => ({ rows: [] })),
+      pool.query(`
+        SELECT
+          'create' AS kind,
+          CASE
+            WHEN status = 'created' THEN 'created'
+            WHEN status = 'blocked' THEN 'blocked'
+            WHEN status = 'skipped' THEN 'skipped'
+            ELSE 'attempt_failed'
+          END AS status,
+          platform,
+          COALESCE(username, email, '—') AS username,
+          COALESCE(error_class, status) AS target,
+          LEFT(COALESCE(error_message, source, status), 100) AS detail,
+          error_message AS error,
+          created_at AS at
+        FROM account_creation_attempts
+        WHERE created_at > NOW() - INTERVAL '24 hours'
+        ORDER BY created_at DESC
+        LIMIT 40
+      `).catch(() => ({ rows: [] })),
     ]);
 
-    const events = [...posts.rows, ...jobFails.rows, ...proxyEvents.rows]
+    const events = [...posts.rows, ...jobFails.rows, ...proxyEvents.rows, ...createEvents.rows]
       .sort((a, b) => new Date(b.at || 0) - new Date(a.at || 0))
-      .slice(0, 60);
+      .slice(0, 80);
 
     return { items: events };
   }
 
-  buildFlowGraph({ proxies, accounts, posting, postingByPlatform, queue }) {
+  buildFlowGraph({ proxies, accounts, posting, postingByPlatform, queue, accountCreation }) {
     const ov = proxies?.overview || {};
     const platforms = postingByPlatform?.platforms || [];
     const organic = posting?.organic || {};
@@ -850,6 +1015,8 @@ class NocService {
     const healthPct = ov.active
       ? Math.round(((ov.healthy || 0) / Math.max(1, ov.active)) * 1000) / 10
       : 0;
+
+    const createToday = accountCreation?.today || {};
 
     const hubs = [
       {
@@ -918,6 +1085,9 @@ class NocService {
         failed_today: todayFailed,
         proxies_active: ov.active || 0,
         jobs_enabled: organic.jobs?.enabled || 0,
+        creates_today: createToday.created || 0,
+        create_attempts_today: createToday.attempted || 0,
+        create_success_pct: createToday.success_rate || 0,
       },
     };
   }

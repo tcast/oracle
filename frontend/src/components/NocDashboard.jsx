@@ -347,14 +347,33 @@ const EventTicker = ({ events }) => {
     );
   }
 
-  const line = items.slice(0, 25).map((e) => {
-    const tag = e.kind === 'post' && e.status === 'posted' ? 'POST'
-      : e.kind === 'proxy' ? 'PROXY'
-        : e.status === 'cooldown' ? 'COOL' : 'FAIL';
-    const color = e.status === 'posted' ? 'text-emerald-400'
-      : e.status === 'cooldown' ? 'text-amber-400' : 'text-red-400';
+  const line = items.slice(0, 30).map((e) => {
+    let tag = 'FAIL';
+    let color = 'text-red-400';
+    if (e.kind === 'create' && e.status === 'created') {
+      tag = 'CREATED';
+      color = 'text-emerald-400';
+    } else if (e.kind === 'create' && e.status === 'attempt_failed') {
+      tag = 'ATTEMPT';
+      color = 'text-red-400';
+    } else if (e.kind === 'create' && e.status === 'blocked') {
+      tag = 'BLOCKED';
+      color = 'text-amber-400';
+    } else if (e.kind === 'create' && e.status === 'skipped') {
+      tag = 'SKIP';
+      color = 'text-slate-400';
+    } else if (e.kind === 'post' && e.status === 'posted') {
+      tag = 'POST';
+      color = 'text-emerald-400';
+    } else if (e.kind === 'proxy') {
+      tag = 'PROXY';
+      color = 'text-amber-400';
+    } else if (e.status === 'cooldown') {
+      tag = 'COOL';
+      color = 'text-amber-400';
+    }
     return (
-      <span key={`${e.kind}-${e.at}-${e.username}-${e.detail}`} className="noc-ticker-item">
+      <span key={`${e.kind}-${e.at}-${e.username}-${e.detail}-${e.status}`} className="noc-ticker-item">
         <span className={`font-bold ${color}`}>{tag}</span>
         <span className="text-slate-400">{ago(e.at)}</span>
         <span className="text-slate-200 capitalize">{e.platform}</span>
@@ -373,6 +392,66 @@ const EventTicker = ({ events }) => {
           {line}
           {line}
         </div>
+      </div>
+    </div>
+  );
+};
+
+const SocialCreationPanel = ({ accountCreation }) => {
+  const today = accountCreation?.today || {};
+  const h24 = accountCreation?.last_24h || {};
+  const platforms = accountCreation?.by_platform || [];
+
+  return (
+    <div className="noc-panel">
+      <div className="noc-panel-head">
+        <span>SOCIAL · ACCOUNT CREATION</span>
+        <span className="text-[10px] text-slate-500 font-mono">
+          created vs attempted · today / 24h
+        </span>
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 px-3 pt-3 font-mono text-xs">
+        <div className="noc-plat-card" style={{ borderColor: '#34d39955' }}>
+          <div className="text-slate-500 text-[10px]">CREATED TODAY</div>
+          <div className="text-emerald-400 text-xl font-bold">{today.created ?? 0}</div>
+        </div>
+        <div className="noc-plat-card" style={{ borderColor: '#22d3ee55' }}>
+          <div className="text-slate-500 text-[10px]">ATTEMPTED TODAY</div>
+          <div className="text-cyan-300 text-xl font-bold">{today.attempted ?? 0}</div>
+        </div>
+        <div className="noc-plat-card" style={{ borderColor: '#f8717155' }}>
+          <div className="text-slate-500 text-[10px]">FAILED / BLOCKED</div>
+          <div className={`text-xl font-bold ${(today.failed || today.blocked) ? 'text-red-400' : 'text-slate-500'}`}>
+            {(today.failed || 0) + (today.blocked || 0)}
+          </div>
+        </div>
+        <div className="noc-plat-card" style={{ borderColor: '#94a3b855' }}>
+          <div className="text-slate-500 text-[10px]">SUCCESS RATE</div>
+          <div className="text-slate-100 text-xl font-bold">{today.success_rate ?? 0}%</div>
+          <div className="text-[10px] text-slate-600 mt-0.5">24h {h24.created ?? 0}/{h24.attempted ?? 0}</div>
+        </div>
+      </div>
+      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-2 p-3">
+        {platforms.map((p) => (
+          <div key={p.platform} className="noc-plat-card" style={{ borderColor: '#1e293b' }}>
+            <div className="flex items-center justify-between mb-2">
+              <span className="font-semibold text-slate-100 capitalize tracking-wide">{p.platform}</span>
+              <span className="text-[10px] font-mono text-slate-500">{p.accounts_active} live</span>
+            </div>
+            <div className="grid grid-cols-2 gap-x-2 gap-y-1 font-mono text-[11px]">
+              <div className="text-slate-500">created</div>
+              <div className="text-emerald-400 text-right font-bold">{p.today_created}</div>
+              <div className="text-slate-500">attempted</div>
+              <div className="text-cyan-300 text-right font-bold">{p.today_attempted}</div>
+              <div className="text-slate-500">failed</div>
+              <div className={`text-right ${p.today_failed ? 'text-red-400' : 'text-slate-500'}`}>{p.today_failed}</div>
+              <div className="text-slate-500">rate</div>
+              <div className="text-slate-300 text-right">{p.today_success_rate}%</div>
+              <div className="text-slate-500">24h</div>
+              <div className="text-slate-400 text-right">{p.h24_created}/{p.h24_attempted}</div>
+            </div>
+          </div>
+        ))}
       </div>
     </div>
   );
@@ -542,6 +621,14 @@ const NocDashboard = () => {
           <div className="noc-metric-label">JOBS ON</div>
           <div className="noc-metric-num text-slate-100">{gauges.jobs_enabled ?? 0}</div>
         </div>
+        <div className="noc-metric-block">
+          <div className="noc-metric-label">CREATED TODAY</div>
+          <div className="noc-metric-num text-emerald-400">{gauges.creates_today ?? 0}</div>
+        </div>
+        <div className="noc-metric-block">
+          <div className="noc-metric-label">CREATE ATTEMPTS</div>
+          <div className="noc-metric-num text-cyan-300">{gauges.create_attempts_today ?? 0}</div>
+        </div>
       </div>
 
       <div className="px-3 mt-3">
@@ -549,6 +636,10 @@ const NocDashboard = () => {
           platforms={platforms}
           quietActive={!!data?.postingByPlatform?.quiet_hours?.active}
         />
+      </div>
+
+      <div className="px-3 mt-3">
+        <SocialCreationPanel accountCreation={data?.accountCreation} />
       </div>
 
       <div className="grid lg:grid-cols-2 gap-3 px-3 mt-3 min-h-[280px]">

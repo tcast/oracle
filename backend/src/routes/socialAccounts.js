@@ -216,20 +216,32 @@ router.delete('/:id', async (req, res) => {
 });
 
 router.post('/create', async (req, res) => {
-  const { platform, count, emailDomain, usernamePrefix, useEmailPool, warm } = req.body;
+  const {
+    platform,
+    count,
+    emailDomain,
+    usernamePrefix,
+    useEmailPool,
+    warm,
+    allowGated,
+  } = req.body;
 
   try {
     if (!platform || !count) {
       return res.status(400).json({ error: 'Missing required fields: platform, count' });
     }
 
-    const maxCount = useEmailPool ? 20 : 10;
-    if (count < 1 || count > maxCount) {
-      return res.status(400).json({ error: `Count must be between 1 and ${maxCount}` });
+    const catalog = accountCreationService.getPlatformCatalog();
+    if (!catalog[platform]) {
+      return res.status(400).json({
+        error: `Unknown platform. Supported: ${Object.keys(catalog).join(', ')}`,
+      });
     }
 
-    if (platform !== 'reddit') {
-      return res.status(400).json({ error: 'Only reddit self-create is supported in this pilot' });
+    // Conservative caps — avoid stampede / proxy burn
+    const maxCount = useEmailPool ? 5 : 3;
+    if (count < 1 || count > maxCount) {
+      return res.status(400).json({ error: `Count must be between 1 and ${maxCount}` });
     }
 
     if (useEmailPool) {
@@ -239,10 +251,16 @@ router.post('/create', async (req, res) => {
         null,
         usernamePrefix || null,
         [],
-        { useEmailPool: true, warm: warm !== false }
+        {
+          useEmailPool: true,
+          warm: warm !== false,
+          allowGated: allowGated === true,
+          source: 'api_email_pool',
+        }
       );
       return res.json({
-        mode: 'email_pool',
+        mode: results.mode || 'email_pool',
+        platform,
         ...results,
       });
     }
@@ -261,17 +279,30 @@ router.post('/create', async (req, res) => {
       return res.status(400).json({ error: 'Invalid username prefix' });
     }
 
-    const accounts = await accountCreationService.createAccounts(
+    const results = await accountCreationService.createAccounts(
       platform,
       count,
       emailDomain,
-      usernamePrefix
+      usernamePrefix,
+      [],
+      { allowGated: allowGated === true, source: 'api_domain' }
     );
 
-    res.json({ accounts });
+    res.json({ platform, ...results, accounts: results.accounts || results.created || [] });
   } catch (error) {
     console.error('Error creating accounts:', error);
     res.status(500).json({ error: 'Failed to create accounts', message: error.message });
+  }
+});
+
+/** Eligibility + platform readiness for the create UI / operators */
+router.get('/create/eligibility', async (req, res) => {
+  try {
+    const data = await accountCreationService.getEligibility(req.query.platform || null);
+    res.json(data);
+  } catch (error) {
+    console.error('Create eligibility error:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 

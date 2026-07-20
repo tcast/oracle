@@ -8,12 +8,244 @@ const playwrightService = require('./playwrightService');
 const { generatePassword } = require('../utils/passwordGenerator');
 const { generateRealisticUsername } = require('../utils/nameGenerator');
 const mailTmService = require('./mailTmService');
+const { classifyFailure } = require('./failureClassifier');
 
 chromium.use(stealth);
+
+/** Max concurrent create batches (always 1 — no stampede). */
+const CREATE_BATCH_LOCK_MS = 45 * 60 * 1000;
+
+const PLATFORM_CATALOG = {
+  reddit: {
+    label: 'Reddit',
+    readiness: 'ready',
+    selfCreate: true,
+    notes: 'Self-create via email pool + healthy US proxy',
+  },
+  x: {
+    label: 'X',
+    readiness: 'needs_accounts_bought',
+    selfCreate: false,
+    notes: 'Self-create gated — buy fresh accounts; instrumentation only',
+  },
+  instagram: {
+    label: 'Instagram',
+    readiness: 'not_implemented',
+    selfCreate: false,
+    notes: 'Import/buy flow preferred; browser signup not wired',
+  },
+  tiktok: {
+    label: 'TikTok',
+    readiness: 'not_implemented',
+    selfCreate: false,
+    notes: 'Import/buy flow preferred; browser signup not wired',
+  },
+  linkedin: {
+    label: 'LinkedIn',
+    readiness: 'not_implemented',
+    selfCreate: false,
+    notes: 'Import/buy flow preferred; browser signup not wired',
+  },
+};
 
 class AccountCreationService {
   constructor() {
     this.activeBrowsers = new Map();
+    this._batchRunning = false;
+    this._batchStartedAt = null;
+    this._attemptsTableReady = false;
+  }
+
+  getPlatformCatalog() {
+    return { ...PLATFORM_CATALOG };
+  }
+
+  async ensureAttemptsTable() {
+    if (this._attemptsTableReady) return;
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS account_creation_attempts (
+        id SERIAL PRIMARY KEY,
+        platform VARCHAR(50) NOT NULL,
+        status VARCHAR(50) NOT NULL,
+        error_class VARCHAR(50),
+        error_message TEXT,
+        proxy_id INTEGER REFERENCES proxies(id) ON DELETE SET NULL,
+        email_account_id INTEGER REFERENCES email_accounts(id) ON DELETE SET NULL,
+        social_account_id INTEGER REFERENCES social_accounts(id) ON DELETE SET NULL,
+        username VARCHAR(255),
+        email VARCHAR(255),
+        source VARCHAR(80) DEFAULT 'api',
+        detail JSONB DEFAULT '{}'::jsonb,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_account_creation_attempts_created
+        ON account_creation_attempts (created_at DESC)
+    `).catch(() => {});
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_account_creation_attempts_platform_day
+        ON account_creation_attempts (platform, created_at DESC)
+    `).catch(() => {});
+    this._attemptsTableReady = true;
+  }
+
+  /**
+   * Persist one create attempt for NOC (created / attempt_failed / skipped / blocked).
+   */
+  async recordAttempt({
+    platform,
+    status,
+    errorClass = null,
+    errorMessage = null,
+    proxyId = null,
+    emailAccountId = null,
+    socialAccountId = null,
+    username = null,
+    email = null,
+    source = 'api',
+    detail = {},
+  }) {
+    try {
+      await this.ensureAttemptsTable();
+      const result = await pool.query(
+        `INSERT INTO account_creation_attempts
+           (platform, status, error_class, error_message, proxy_id, email_account_id,
+            social_account_id, username, email, source, detail)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
+         RETURNING id, created_at`,
+        [
+          platform,
+          status,
+          errorClass,
+          errorMessage ? String(errorMessage).slice(0, 500) : null,
+          proxyId || null,
+          emailAccountId || null,
+          socialAccountId || null,
+          username || null,
+          email || null,
+          source,
+          JSON.stringify(detail || {}),
+        ]
+      );
+      return result.rows[0];
+    } catch (err) {
+      console.warn('recordAttempt failed:', err.message);
+      return null;
+    }
+  }
+
+  classifyCreateError(message = '') {
+    const msg = String(message || '');
+    if (/no unassigned email|no .*email/i.test(msg)) return 'no_email';
+    if (/no .*proxy|proxy.*unavailable|no healthy proxy/i.test(msg)) return 'no_proxy';
+    if (/not supported|not.?implemented|gated|needs.?accounts/i.test(msg)) return 'not_ready';
+    if (/CAPTCHA|sitekey/i.test(msg)) return 'challenge';
+    if (/batch already running|create already in progress/i.test(msg)) return 'busy';
+    return classifyFailure(msg);
+  }
+
+  acquireBatchLock() {
+    if (this._batchRunning) {
+      const age = this._batchStartedAt ? Date.now() - this._batchStartedAt : 0;
+      if (age < CREATE_BATCH_LOCK_MS) {
+        throw new Error(
+          `Account create already in progress (started ${Math.round(age / 1000)}s ago)`
+        );
+      }
+    }
+    this._batchRunning = true;
+    this._batchStartedAt = Date.now();
+  }
+
+  releaseBatchLock() {
+    this._batchRunning = false;
+    this._batchStartedAt = null;
+  }
+
+  /**
+   * Operator-facing eligibility: emails, healthy proxies, platform readiness.
+   */
+  async getEligibility(platform = null) {
+    const emailPool = await pool.query(`
+      SELECT
+        COUNT(*)::int AS available,
+        COUNT(*) FILTER (WHERE provider = 'catchall')::int AS catchall,
+        COUNT(*) FILTER (WHERE provider <> 'catchall')::int AS other
+      FROM email_accounts ea
+      WHERE ea.status = 'active'
+        AND COALESCE(ea.metadata->>'linked_reddit', '') = ''
+        AND NOT EXISTS (
+          SELECT 1 FROM social_accounts sa
+          WHERE sa.email IS NOT NULL AND lower(sa.email) = lower(ea.email)
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM social_accounts sa
+          WHERE sa.email_account_id = ea.id
+        )
+    `).catch(() => ({ rows: [{ available: 0, catchall: 0, other: 0 }] }));
+
+    const proxies = await pool.query(`
+      SELECT COUNT(*)::int AS healthy_us
+      FROM proxies p
+      WHERE p.is_active = true
+        AND p.country = 'US'
+        AND (p.cooldown_until IS NULL OR p.cooldown_until <= NOW())
+        AND COALESCE(p.consecutive_failures, 0) < 3
+        AND COALESCE(p.last_health_ok, true) = true
+        AND NOT EXISTS (
+          SELECT 1 FROM social_account_proxies sap
+          JOIN social_accounts sa ON sa.id = sap.social_account_id
+          WHERE sap.proxy_id = p.id AND sap.is_active = true AND sa.platform = 'reddit'
+        )
+    `).catch(() => ({ rows: [{ healthy_us: 0 }] }));
+
+    const attemptsToday = await pool.query(`
+      SELECT
+        platform,
+        COUNT(*)::int AS attempted,
+        COUNT(*) FILTER (WHERE status = 'created')::int AS created,
+        COUNT(*) FILTER (WHERE status IN ('attempt_failed', 'blocked', 'skipped'))::int AS failed
+      FROM account_creation_attempts
+      WHERE created_at::date = CURRENT_DATE
+      GROUP BY platform
+    `).catch(() => ({ rows: [] }));
+
+    const catalog = this.getPlatformCatalog();
+    const platforms = Object.entries(catalog).map(([id, meta]) => {
+      const today = attemptsToday.rows.find((r) => r.platform === id) || {
+        attempted: 0,
+        created: 0,
+        failed: 0,
+      };
+      const canSelfCreate =
+        meta.selfCreate &&
+        meta.readiness === 'ready' &&
+        (emailPool.rows[0]?.available || 0) > 0 &&
+        (proxies.rows[0]?.healthy_us || 0) > 0;
+      return {
+        platform: id,
+        ...meta,
+        can_self_create: canSelfCreate,
+        today,
+      };
+    });
+
+    const filtered = platform
+      ? platforms.filter((p) => p.platform === platform)
+      : platforms;
+
+    return {
+      batch_running: this._batchRunning,
+      batch_started_at: this._batchStartedAt
+        ? new Date(this._batchStartedAt).toISOString()
+        : null,
+      email_pool: emailPool.rows[0] || { available: 0, catchall: 0, other: 0 },
+      proxies: { healthy_us: proxies.rows[0]?.healthy_us || 0 },
+      platforms: filtered,
+      max_batch: 5,
+      default_concurrency: 1,
+    };
   }
 
   async createBrowser(proxyConfig = null) {
@@ -194,11 +426,14 @@ class AccountCreationService {
 
     // Prefer ProxyBase for Reddit *signup* (BrightData ISP currently network-blocked on /register),
     // then BrightData isp_proxy3, then other US proxies. Never two Reddit accounts on same proxy.
+    // Skip cooled / degraded / unhealthy — do not burn proxies.
     const pick = await pool.query(
       `SELECT p.id FROM proxies p
        WHERE p.is_active = true
          AND p.country = 'US'
          AND (p.cooldown_until IS NULL OR p.cooldown_until <= NOW())
+         AND COALESCE(p.consecutive_failures, 0) < 3
+         AND COALESCE(p.last_health_ok, true) = true
          AND NOT EXISTS (
            SELECT 1 FROM social_account_proxies sap
            JOIN social_accounts sa ON sa.id = sap.social_account_id
@@ -219,6 +454,7 @@ class AccountCreationService {
            SELECT 1 FROM social_account_proxies sap
            WHERE sap.proxy_id = p.id AND sap.is_active = true
          ) THEN 1 ELSE 0 END,
+         p.failure_count ASC NULLS FIRST,
          p.id
        LIMIT 1`
     );
@@ -556,19 +792,29 @@ class AccountCreationService {
 
   /**
    * Reddit create+warm pilot using durable emails from email_accounts pool.
-   * @param {number} count - 1..20
-   * @param {{ warm?: boolean, usernamePrefix?: string }} opts
+   * Serial only; records every attempt for NOC. Max 2 proxy rotations on network blocks.
+   * @param {number} count - 1..5 recommended
+   * @param {{ warm?: boolean, usernamePrefix?: string, source?: string }} opts
    */
   async createRedditFromPool(count, opts = {}) {
     const warm = opts.warm !== false;
-    const results = { created: [], errors: [], blocked: [] };
+    const source = opts.source || 'api_email_pool';
+    const results = { created: [], errors: [], blocked: [], skipped: [] };
 
     for (let i = 0; i < count; i++) {
       const step = { index: i + 1 };
       try {
         const emailAccount = await this.claimEmailFromPool();
         if (!emailAccount) {
-          results.errors.push({ ...step, error: 'No unassigned email_accounts available' });
+          const error = 'No unassigned email_accounts available';
+          results.errors.push({ ...step, error });
+          await this.recordAttempt({
+            platform: 'reddit',
+            status: 'skipped',
+            errorClass: 'no_email',
+            errorMessage: error,
+            source,
+          });
           break;
         }
         step.email = emailAccount.email;
@@ -580,21 +826,28 @@ class AccountCreationService {
             : generateRealisticUsername('random') + Date.now().toString().slice(-4)
         ).slice(0, 20);
         const password = generatePassword(14);
+        step.username = username;
 
-        // Rotate proxies on Reddit network-security / js_challenge blocks
+        // At most 2 proxy tries — smarter than blasting retries into network security.
         let proxyId = null;
         let created = null;
         let lastErr = null;
-        for (let attempt = 1; attempt <= 3; attempt++) {
+        for (let attempt = 1; attempt <= 2; attempt++) {
           proxyId = await this.claimProxyForNewAccount();
           step.proxyId = proxyId;
+          if (!proxyId) {
+            lastErr = new Error('No healthy US proxy available for create');
+            break;
+          }
           let proxyConfig = null;
-          if (proxyId) {
-            const proxyRow = await pool.query('SELECT * FROM proxies WHERE id = $1', [proxyId]);
-            if (proxyRow.rows[0]) {
-              proxyConfig = proxyService.formatProxyConfig(proxyRow.rows[0]);
-              proxyConfig._proxyId = proxyId;
+          const proxyRow = await pool.query('SELECT * FROM proxies WHERE id = $1', [proxyId]);
+          if (proxyRow.rows[0]) {
+            if (!proxyService.isAssignableProxy(proxyRow.rows[0])) {
+              lastErr = new Error(`Proxy ${proxyId} not assignable (cooled/degraded)`);
+              continue;
             }
+            proxyConfig = proxyService.formatProxyConfig(proxyRow.rows[0]);
+            proxyConfig._proxyId = proxyId;
           }
           try {
             created = await this.createRedditAccount(
@@ -625,11 +878,11 @@ class AccountCreationService {
                   [proxyId]
                 );
                 console.warn(
-                  `Reddit create: proxy ${proxyId} network-blocked — cooled 6h, retry ${attempt}/3`
+                  `Reddit create: proxy ${proxyId} network-blocked — cooled 6h, retry ${attempt}/2`
                 );
               }
             }
-            if (!netBlocked || attempt === 3) throw err;
+            if (!netBlocked || attempt === 2) throw err;
           }
         }
         if (!created) throw lastErr || new Error('Reddit create failed');
@@ -652,7 +905,6 @@ class AccountCreationService {
         );
         const account = inserted.rows[0];
         step.accountId = account.id;
-        step.username = username;
 
         await pool.query(
           `UPDATE email_accounts
@@ -691,6 +943,18 @@ class AccountCreationService {
           }
         }
 
+        await this.recordAttempt({
+          platform: 'reddit',
+          status: 'created',
+          proxyId,
+          emailAccountId: emailAccount.id,
+          socialAccountId: account.id,
+          username,
+          email: emailAccount.email,
+          source,
+          detail: { warm: warmResult, captcha: created.captcha, totp: !!created.totp_secret },
+        });
+
         results.created.push({
           ...step,
           totp: !!created.totp_secret,
@@ -698,33 +962,230 @@ class AccountCreationService {
           captcha: created.captcha,
         });
 
-        if (i < count - 1) await this.humanLikeDelay(20000, 45000);
+        // Conservative spacing between creates — avoid stampede / network blocks
+        if (i < count - 1) await this.humanLikeDelay(45000, 90000);
       } catch (error) {
         const msg = error.message || String(error);
-        const entry = { ...step, error: msg };
-        if (/CAPTCHA|captcha|sitekey/i.test(msg)) {
+        const errorClass = this.classifyCreateError(msg);
+        const entry = { ...step, error: msg, errorClass };
+        const isBlocked = /CAPTCHA|captcha|sitekey|network security|js_challenge/i.test(msg);
+        if (isBlocked) {
           results.blocked.push(entry);
         } else {
           results.errors.push(entry);
         }
+        await this.recordAttempt({
+          platform: 'reddit',
+          status: isBlocked ? 'blocked' : 'attempt_failed',
+          errorClass,
+          errorMessage: msg,
+          proxyId: step.proxyId || null,
+          emailAccountId: step.emailAccountId || null,
+          username: step.username || null,
+          email: step.email || null,
+          source,
+        });
         console.error(`Reddit pool create #${i + 1} failed:`, msg);
+        // Stop the batch early on security blocks — do not burn more proxies
+        if (/network security|js_challenge/i.test(msg)) {
+          results.skipped.push({
+            reason: 'Stopped batch after network-security block',
+            remaining: count - i - 1,
+          });
+          break;
+        }
       }
     }
 
     return results;
   }
 
+  /**
+   * Orchestrated multi-platform create entrypoint.
+   * Serial batches only; records telemetry; gates non-ready platforms.
+   */
   async createAccounts(platform, count, emailDomain = null, usernamePrefix = null, proxyConfigs = [], opts = {}) {
-    if (platform === 'reddit' && opts.useEmailPool) {
-      return this.createRedditFromPool(count, {
-        warm: opts.warm !== false,
-        usernamePrefix,
-      });
+    const catalog = this.getPlatformCatalog()[platform];
+    if (!catalog) {
+      throw new Error(`Unknown platform: ${platform}`);
     }
 
-    const accounts = [];
+    const source = opts.source || (opts.useEmailPool ? 'api_email_pool' : 'api');
+    const allowGated = opts.allowGated === true;
 
+    if (!catalog.selfCreate || catalog.readiness !== 'ready') {
+      if (!allowGated) {
+        await this.recordAttempt({
+          platform,
+          status: 'skipped',
+          errorClass: 'not_ready',
+          errorMessage: catalog.notes,
+          source,
+          detail: { readiness: catalog.readiness, requested: count },
+        });
+        return {
+          mode: 'gated',
+          platform,
+          readiness: catalog.readiness,
+          created: [],
+          errors: [],
+          blocked: [],
+          skipped: [
+            {
+              error: catalog.notes,
+              readiness: catalog.readiness,
+            },
+          ],
+          message: catalog.notes,
+        };
+      }
+    }
+
+    this.acquireBatchLock();
+    try {
+      if (platform === 'reddit' && opts.useEmailPool) {
+        return await this.createRedditFromPool(count, {
+          warm: opts.warm !== false,
+          usernamePrefix,
+          source,
+        });
+      }
+
+      if (platform === 'reddit') {
+        return await this.createRedditDomainBatch(
+          count,
+          emailDomain,
+          usernamePrefix,
+          proxyConfigs,
+          source
+        );
+      }
+
+      if (platform === 'x' && allowGated) {
+        return await this.createXDomainBatch(
+          count,
+          emailDomain,
+          usernamePrefix,
+          proxyConfigs,
+          source
+        );
+      }
+
+      await this.recordAttempt({
+        platform,
+        status: 'skipped',
+        errorClass: 'not_ready',
+        errorMessage: `Self-create path not available for ${platform}`,
+        source,
+      });
+      return {
+        mode: 'unsupported',
+        platform,
+        created: [],
+        errors: [{ error: `Self-create path not available for ${platform}` }],
+        blocked: [],
+        skipped: [],
+      };
+    } finally {
+      this.releaseBatchLock();
+    }
+  }
+
+  async createRedditDomainBatch(count, emailDomain, usernamePrefix, proxyConfigs, source) {
+    const results = { created: [], errors: [], blocked: [], accounts: [] };
     for (let i = 0; i < count; i++) {
+      const step = { index: i + 1 };
+      try {
+        const username = usernamePrefix
+          ? `${usernamePrefix}${Math.floor(Math.random() * 10000)}`
+          : `user${Date.now()}${i}`;
+        const email = `${username}@${emailDomain}`;
+        const password = generatePassword();
+        step.username = username;
+        step.email = email;
+
+        let proxyId = null;
+        let proxyConfig = proxyConfigs[i % (proxyConfigs.length || 1)] || null;
+        if (!proxyConfig) {
+          proxyId = await this.claimProxyForNewAccount();
+          if (!proxyId) throw new Error('No healthy US proxy available for create');
+          const proxyRow = await pool.query('SELECT * FROM proxies WHERE id = $1', [proxyId]);
+          if (!proxyRow.rows[0] || !proxyService.isAssignableProxy(proxyRow.rows[0])) {
+            throw new Error('No assignable proxy for create');
+          }
+          proxyConfig = proxyService.formatProxyConfig(proxyRow.rows[0]);
+          proxyConfig._proxyId = proxyId;
+        }
+        step.proxyId = proxyId || proxyConfig?._proxyId || null;
+
+        const account = await this.createRedditAccount(
+          username,
+          email,
+          password,
+          proxyConfig,
+          null
+        );
+        if (step.proxyId) await proxyService.updateProxyStats(step.proxyId, true);
+
+        const credentials = { password };
+        if (account.totp_secret) credentials.totp_secret = account.totp_secret;
+        credentials.source = 'self_create_domain';
+
+        const result = await pool.query(
+          `INSERT INTO social_accounts
+           (platform, username, email, credentials, status, is_simulated, warmup_status)
+           VALUES ('reddit', $1, $2, $3, 'active', false, 'pending')
+           RETURNING *`,
+          [username, email, JSON.stringify(credentials)]
+        );
+        const row = result.rows[0];
+        if (step.proxyId) {
+          await proxyService.assignProxiesToAccount(row.id, [step.proxyId]);
+        }
+
+        await this.recordAttempt({
+          platform: 'reddit',
+          status: 'created',
+          proxyId: step.proxyId,
+          socialAccountId: row.id,
+          username,
+          email,
+          source,
+        });
+        results.created.push({ ...step, accountId: row.id });
+        results.accounts.push(row);
+        if (i < count - 1) await this.humanLikeDelay(45000, 90000);
+      } catch (error) {
+        const msg = error.message || String(error);
+        const errorClass = this.classifyCreateError(msg);
+        results.errors.push({ ...step, error: msg, errorClass });
+        await this.recordAttempt({
+          platform: 'reddit',
+          status: 'attempt_failed',
+          errorClass,
+          errorMessage: msg,
+          proxyId: step.proxyId || null,
+          username: step.username || null,
+          email: step.email || null,
+          source,
+        });
+        if (step.proxyId) {
+          await proxyService.updateProxyStats(step.proxyId, false, {
+            reason: msg.slice(0, 120),
+          });
+        }
+        console.error(`Failed to create reddit account ${i + 1}:`, msg);
+      }
+    }
+    return results;
+  }
+
+  async createXDomainBatch(count, emailDomain, usernamePrefix, proxyConfigs, source) {
+    const results = { created: [], errors: [], blocked: [], accounts: [] };
+    // Hard cap: never mass-create X even when allowGated
+    const capped = Math.min(count, 1);
+    for (let i = 0; i < capped; i++) {
+      const step = { index: i + 1 };
       try {
         let email;
         let emailToken;
@@ -741,56 +1202,56 @@ class AccountCreationService {
           username = email.split('@')[0];
         }
         const password = generatePassword();
+        step.username = username;
+        step.email = email;
 
-        const proxyConfig = proxyConfigs[i % proxyConfigs.length] || null;
+        const proxyConfig = proxyConfigs[i % (proxyConfigs.length || 1)] || null;
+        const account = await this.createXAccount(
+          username,
+          email,
+          password,
+          proxyConfig,
+          emailToken
+        );
 
-        let account;
-        switch (platform) {
-          case 'reddit':
-            account = await this.createRedditAccount(
-              username,
-              email,
-              password,
-              proxyConfig,
-              emailToken
-            );
-            break;
-          case 'x':
-            account = await this.createXAccount(
-              username,
-              email,
-              password,
-              proxyConfig,
-              emailToken
-            );
-            break;
-          default:
-            throw new Error(`Platform ${platform} not supported`);
-        }
-
-        const credentials = { password };
+        const credentials = { password, source: 'self_create_x_gated' };
         if (emailToken) credentials.emailToken = emailToken;
-        if (account.totp_secret) credentials.totp_secret = account.totp_secret;
 
         const result = await pool.query(
           `INSERT INTO social_accounts
-           (platform, username, email, credentials, status, is_simulated, proxy_config, warmup_status)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
+           (platform, username, email, credentials, status, is_simulated, warmup_status)
+           VALUES ('x', $1, $2, $3, 'active', false, 'pending')
            RETURNING *`,
-          [platform, username, email, credentials, 'active', false, proxyConfig]
+          [username, email, JSON.stringify(credentials)]
         );
-
-        accounts.push(result.rows[0]);
-
-        if (i < count - 1) {
-          await this.humanLikeDelay(30000, 60000);
-        }
+        const row = result.rows[0];
+        await this.recordAttempt({
+          platform: 'x',
+          status: 'created',
+          socialAccountId: row.id,
+          username,
+          email,
+          source,
+          detail: { email_verified: account.email_verified },
+        });
+        results.created.push({ ...step, accountId: row.id });
+        results.accounts.push(row);
       } catch (error) {
-        console.error(`Failed to create account ${i + 1}:`, error);
+        const msg = error.message || String(error);
+        const errorClass = this.classifyCreateError(msg);
+        results.errors.push({ ...step, error: msg, errorClass });
+        await this.recordAttempt({
+          platform: 'x',
+          status: 'attempt_failed',
+          errorClass,
+          errorMessage: msg,
+          username: step.username || null,
+          email: step.email || null,
+          source,
+        });
       }
     }
-
-    return accounts;
+    return results;
   }
 
   async cleanup() {
