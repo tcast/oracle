@@ -610,27 +610,59 @@ class RedditPasswordResetService {
         browser = null;
       }
 
-      // Hotmail/Outlook: skip IMAP (always fails basic auth) — go straight to web scrape
+      // Hotmail/Outlook: skip IMAP (always fails basic auth) — go straight to web scrape.
+      // Reddit mail often takes 1–3+ minutes and lands in Junk/Other.
+      const SEARCH_QUERIES = [
+        'from:reddit',
+        'reddit password',
+        'password reset',
+        'reddit',
+        'password',
+        'reset',
+      ];
+      const SUBJECT_NEEDLES = ['password', 'reset', 'recover', 'reddit'];
+      const FROM_NEEDLES = ['reddit', 'redditmail', 'noreply'];
+
       const pollInbox = async (opts) => {
         if (emailInboxService.isMicrosoftAccount(inboxAccount)) {
+          // Give Reddit time to deliver before first Outlook scrape.
+          await new Promise((r) => setTimeout(r, opts.initialDelayMs || 45000));
           const start = Date.now();
           let last = null;
-          while (Date.now() - start < (opts.timeoutMs || 90000)) {
+          let attempt = 0;
+          while (Date.now() - start < (opts.timeoutMs || 420000)) {
+            const searchQuery = SEARCH_QUERIES[attempt % SEARCH_QUERIES.length];
+            attempt += 1;
             const messages = await emailInboxService.fetchViaOutlookWeb(inboxAccount, {
-              limit: opts.limit || 12,
-              searchQuery: opts.searchQuery || 'password',
-              timeoutMs: 100000,
+              limit: opts.limit || 20,
+              searchQuery,
+              timeoutMs: 150000,
             });
             last = emailInboxService.pickLatestFromMessages(messages, {
-              fromIncludes: opts.fromIncludes,
-              subjectIncludes: opts.subjectIncludes,
+              fromIncludes: opts.fromIncludes || FROM_NEEDLES,
+              subjectIncludes: opts.subjectIncludes || SUBJECT_NEEDLES,
               linkIncludes: opts.linkIncludes,
+              afterDate: opts.afterDate,
             });
+            // If subject filter is too strict but we have a reddit.com reset link, take it.
+            if (!last.found && messages?.length) {
+              const loose = emailInboxService.pickLatestFromMessages(messages, {
+                linkIncludes: 'reddit.com',
+              });
+              if (loose.found && /password|reset|recover|change|account/i.test(
+                `${loose.message?.subject || ''} ${loose.message?.preview || ''} ${loose.link || ''}`
+              )) {
+                last = loose;
+              }
+            }
             if (last.found) return last;
-            await new Promise((r) => setTimeout(r, opts.intervalMs || 30000));
+            console.warn(
+              `Outlook reset poll attempt ${attempt} for ${inboxAccount.email}: scanned ${last?.scanned || 0} (query=${searchQuery})`
+            );
+            await new Promise((r) => setTimeout(r, opts.intervalMs || 40000));
           }
           throw new Error(
-            `Verification email not received within ${opts.timeoutMs || 90000}ms` +
+            `Verification email not received within ${opts.timeoutMs || 420000}ms` +
               (last ? ` (scanned ${last.scanned} messages)` : '')
           );
         }
@@ -638,33 +670,36 @@ class RedditPasswordResetService {
       };
 
       const verified = await pollInbox({
-        timeoutMs: 120000,
-        intervalMs: 35000,
-        fromIncludes: 'reddit',
-        subjectIncludes: 'password',
+        timeoutMs: 420000,
+        intervalMs: 40000,
+        initialDelayMs: 45000,
+        fromIncludes: FROM_NEEDLES,
+        subjectIncludes: SUBJECT_NEEDLES,
         linkIncludes: 'reddit.com',
-        searchQuery: 'password',
-        limit: 12,
+        afterDate: triggeredAt,
+        limit: 20,
       });
 
       let resetLink = verified.link;
       if (!resetLink && verified.links?.length) {
         resetLink =
-          verified.links.find((u) => /reddit\.com.*(password|reset|change|account)/i.test(u)) ||
+          verified.links.find((u) => /reddit\.com.*(password|reset|change|account|recover)/i.test(u)) ||
           verified.links.find((u) => /reddit\.com/i.test(u)) ||
           verified.links[0];
       }
       if (!resetLink) {
-        const retry = await emailInboxService.getLatestVerification(inboxAccount, {
-          limit: 15,
-          fromIncludes: 'reddit',
-          searchQuery: 'password',
+        const retry = await emailInboxService.fetchViaOutlookWeb(inboxAccount, {
+          limit: 25,
+          searchQuery: 'from:reddit',
+          timeoutMs: 150000,
+        });
+        const picked = emailInboxService.pickLatestFromMessages(retry, {
           linkIncludes: 'reddit.com',
         });
         resetLink =
-          retry.link ||
-          retry.links?.find((u) => /reddit\.com.*(password|reset|change|account)/i.test(u)) ||
-          retry.links?.find((u) => /reddit\.com/i.test(u));
+          picked.link ||
+          picked.links?.find((u) => /reddit\.com.*(password|reset|change|account|recover)/i.test(u)) ||
+          picked.links?.find((u) => /reddit\.com/i.test(u));
       }
       if (!resetLink) {
         throw new Error(

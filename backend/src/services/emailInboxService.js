@@ -225,24 +225,236 @@ class EmailInboxService {
     return MICROSOFT_PROVIDERS.has(provider);
   }
 
+  isYahooAccount(account) {
+    return providerFromEmail(account.email, account.provider) === 'yahoo';
+  }
+
   /**
-   * Outlook/Hotmail webmail fallback when IMAP basic auth is disabled.
+   * Yahoo webmail fallback when IMAP auth fails (common on freshly minted accounts).
    */
-  async fetchViaOutlookWeb(account, { limit = 10, timeoutMs = 90000, searchQuery = null } = {}) {
+  async fetchViaYahooWeb(account, { limit = 10, timeoutMs = 120000, searchQuery = null } = {}) {
     let browser;
     const run = async () => {
-    const executablePath =
-      process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH ||
-      process.env.CHROMIUM_PATH ||
-      undefined;
+      const executablePath =
+        process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH ||
+        process.env.CHROMIUM_PATH ||
+        undefined;
 
-    browser = await chromium.launch({
-      headless: true,
-      executablePath,
-      args: ['--disable-blink-features=AutomationControlled'],
-    });
+      browser = await chromium.launch({
+        headless: true,
+        executablePath,
+        args: ['--disable-blink-features=AutomationControlled'],
+      });
 
+      const context = await browser.newContext({
+        viewport: { width: 1280, height: 900 },
+        userAgent:
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        locale: 'en-US',
+      });
+      const page = await context.newPage();
+      page.setDefaultTimeout(25000);
+
+      await page.goto('https://login.yahoo.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await page.waitForSelector('#login-username, input[name="username"]', { timeout: 25000 });
+      await page.fill('#login-username, input[name="username"]', account.email);
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {}),
+        page.click('#login-signin, button[type="submit"], input[type="submit"]'),
+      ]);
+      await page.waitForTimeout(1200);
+
+      const pwSel = '#login-passwd, input[name="password"], input[type="password"]';
+      await page.waitForSelector(pwSel, { timeout: 25000 });
+      await page.fill(pwSel, account.password);
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {}),
+        page.click('#login-signin, button[type="submit"], input[type="submit"]'),
+      ]);
+      await page.waitForTimeout(2500);
+
+      // Dismiss optional challenges / "stay signed in" where possible
+      for (let i = 0; i < 4; i++) {
+        const challenge = await page.evaluate(() => {
+          const text = (document.body?.innerText || '').slice(0, 500);
+          return {
+            text,
+            badPw: /invalid|incorrect|didn't match|wrong password|try again/i.test(text),
+            blocked: /suspicious|verify your identity|phone|captcha|unusual/i.test(text),
+            inMail: /mail\.yahoo\.com|inbox/i.test(location.href + ' ' + text),
+          };
+        }).catch(() => ({ text: '', badPw: false, blocked: false, inMail: false }));
+
+        if (challenge.badPw) {
+          throw new Error(`Yahoo web login failed: ${challenge.text.slice(0, 160)}`);
+        }
+        if (challenge.blocked && !challenge.inMail) {
+          throw new Error(`Yahoo web login blocked: ${challenge.text.slice(0, 160)}`);
+        }
+        if (challenge.inMail || /mail\.yahoo\.com/i.test(page.url())) break;
+
+        const clicked = await page.evaluate(() => {
+          const btn = [...document.querySelectorAll('button, a, input[type="submit"]')].find((el) =>
+            /^(Yes|Next|Continue|Skip|Not now|Maybe later|Go to Inbox)$/i.test(
+              (el.innerText || el.value || '').trim()
+            )
+          );
+          if (btn) {
+            btn.click();
+            return true;
+          }
+          return false;
+        }).catch(() => false);
+        if (clicked) await page.waitForTimeout(2000);
+        else break;
+      }
+
+      if (!/mail\.yahoo\.com/i.test(page.url())) {
+        await page.goto('https://mail.yahoo.com/', {
+          waitUntil: 'domcontentloaded',
+          timeout: 60000,
+        });
+      }
+      await page.waitForTimeout(3500);
+
+      const q = searchQuery || 'reddit';
+      const search = page
+        .locator('input[placeholder*="Search" i], input[aria-label*="Search" i], #mail-search, input[name="q"]')
+        .first();
+      if (await search.isVisible().catch(() => false)) {
+        await search.fill(String(q));
+        await page.keyboard.press('Enter');
+        await page.waitForTimeout(3500);
+      }
+
+      const rows = await page.evaluate((max) => {
+        const items = [];
+        const nodes = [
+          ...document.querySelectorAll(
+            '[data-test-id="message-list-item"], [role="option"], li[data-test-id], div[data-test-id="message-list"] li, a[data-test-id="message-item"]'
+          ),
+        ];
+        for (const n of nodes) {
+          const label = (n.getAttribute('aria-label') || n.innerText || '')
+            .replace(/\s+/g, ' ')
+            .trim();
+          if (label.length < 8) continue;
+          if (!/reddit|verify|code|password|confirm|@/i.test(label) && items.length > 2) continue;
+          items.push({ preview: label.slice(0, 500), index: items.length });
+          if (items.length >= max) break;
+        }
+        // Fallback: any visible list-ish rows mentioning reddit
+        if (!items.length) {
+          const blob = (document.body?.innerText || '').slice(0, 12000);
+          const lines = blob
+            .split('\n')
+            .map((l) => l.replace(/\s+/g, ' ').trim())
+            .filter((l) => l.length > 12 && /reddit/i.test(l));
+          for (const line of lines.slice(0, max)) {
+            items.push({ preview: line.slice(0, 500), index: items.length });
+          }
+        }
+        return items;
+      }, limit);
+
+      let openedBody = null;
+      let openIdx = rows.findIndex((r) => /reddit|verify|code|confirm/i.test(r.preview || ''));
+      if (openIdx < 0 && rows.length) openIdx = 0;
+
+      if (openIdx >= 0) {
+        const clicked = await page.evaluate((idx) => {
+          const nodes = [
+            ...document.querySelectorAll(
+              '[data-test-id="message-list-item"], [role="option"], li[data-test-id], a[data-test-id="message-item"]'
+            ),
+          ].filter((n) => {
+            const label = (n.getAttribute('aria-label') || n.innerText || '')
+              .replace(/\s+/g, ' ')
+              .trim();
+            return label.length >= 8;
+          });
+          const target = nodes[idx] || nodes[0];
+          if (!target) return false;
+          target.click();
+          return true;
+        }, openIdx).catch(() => false);
+
+        if (clicked) {
+          await page.waitForTimeout(2500);
+          openedBody = await page.evaluate(() => {
+            const reading =
+              document.querySelector('[data-test-id="message-view"], [data-test-id="message-group"], .thread-item, main') ||
+              document.body;
+            const text = (reading?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 8000);
+            const hrefs = [...reading.querySelectorAll('a[href]')]
+              .map((a) => a.href)
+              .filter((h) => /^https?:/i.test(h))
+              .slice(0, 40);
+            return { text, hrefs };
+          }).catch(() => null);
+        }
+      }
+
+      return rows.map((row, idx) => {
+        const preview = row.preview || '';
+        const isOpened = openedBody && idx === openIdx;
+        const body = isOpened ? `${preview} ${openedBody.text || ''}` : preview;
+        const urls = [
+          ...extractUrls(body),
+          ...(isOpened ? openedBody.hrefs || [] : []),
+        ].filter((u, i, arr) => arr.indexOf(u) === i);
+        const codes = extractCodes(body);
+        return {
+          uid: `yahoo-web-${idx}`,
+          subject: preview.slice(0, 120),
+          from: /reddit/i.test(preview) ? ['reddit'] : [],
+          date: null,
+          codes,
+          verifyLinks: pickVerificationLinks(urls),
+          urls,
+          preview: body.slice(0, 400),
+          source: 'yahoo_web',
+        };
+      });
+    };
+
+    let timer;
     try {
+      return await Promise.race([
+        run(),
+        new Promise((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`Yahoo web fetch timed out after ${timeoutMs}ms`)),
+            timeoutMs
+          );
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (browser) await browser.close().catch(() => {});
+    }
+  }
+
+  /**
+   * Outlook/Hotmail webmail fallback when IMAP basic auth is disabled.
+   * Bought Reddit resets live here — discovery must be broad (inbox/Other/junk,
+   * multiple search queries) because seller Hotmail often hides Reddit in junk
+   * or Focused/Other, and empty Outlook search results previously returned scanned=0.
+   */
+  async fetchViaOutlookWeb(account, { limit = 15, timeoutMs = 150000, searchQuery = null } = {}) {
+    let browser;
+    const run = async () => {
+      const executablePath =
+        process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH ||
+        process.env.CHROMIUM_PATH ||
+        undefined;
+
+      browser = await chromium.launch({
+        headless: true,
+        executablePath,
+        args: ['--disable-blink-features=AutomationControlled'],
+      });
+
       const context = await browser.newContext({
         viewport: { width: 1280, height: 900 },
         userAgent:
@@ -269,8 +481,7 @@ class EmailInboxService {
       ]);
       await page.waitForTimeout(2000);
 
-      // Stay signed in / skip prompts (safe after navigation settles)
-      for (let i = 0; i < 3; i++) {
+      for (let i = 0; i < 4; i++) {
         const url = page.url();
         if (/outlook\.live\.com|outlook\.office/i.test(url)) break;
         const challenge = await page.evaluate(() => {
@@ -314,104 +525,233 @@ class EmailInboxService {
           timeout: 60000,
         });
       }
-      await page.waitForTimeout(3000);
-      await page
-        .waitForSelector('[role="option"], [role="listbox"] [role="option"]', { timeout: 20000 })
-        .catch(() => {});
-      await page.waitForTimeout(1500);
+      await page.waitForTimeout(3500);
 
-      const collectRows = async () =>
-        page.evaluate((max) => {
-          const items = [];
-          const reject =
-            /^(File|Home|View|Help|New mail|Delete|Archive|Report|Move to|Reply|Mark all|Flag|Enhance|Browse|Navigation|Reading Pane|Read \/ Unread|Focused|Other|Inbox|Junk|Drafts|Sent|Deleted|Select an item)/i;
-          const nodes = [...document.querySelectorAll(
-            '[role="option"], [role="row"], div[data-convid], div[aria-label*="Reddit" i]'
-          )];
-          for (const n of nodes) {
-            const label = (n.getAttribute('aria-label') || n.innerText || '')
-              .replace(/\s+/g, ' ')
-              .trim();
-            if (label.length < 12) continue;
-            if (reject.test(label)) continue;
-            if (!/reddit|password|reset|@|message|r\//i.test(label)) continue;
-            items.push({ preview: label.slice(0, 500), index: items.length });
-            if (items.length >= max) break;
-          }
-          return items;
-        }, limit);
+      const NAV_REJECT =
+        /^(File|Home|View|Help|New mail|Delete|Archive|Report|Move to|Reply|Mark all|Flag|Enhance|Browse|Navigation|Reading Pane|Read \/ Unread|Focused|Other|Inbox|Junk|Drafts|Sent|Deleted|Select an item|To Do|Notes|Folders)/i;
+      const INTERESTING =
+        /reddit|password|reset|recover|noreply|redditmail|change.?password|account.?security|r\/|@/i;
 
-      const runSearch = async (q) => {
-        const search = page.locator('input[aria-label*="Search" i], input[placeholder*="Search" i]').first();
-        if (q && (await search.isVisible().catch(() => false))) {
-          await search.fill(String(q));
-          await page.keyboard.press('Enter');
-          await page.waitForTimeout(3500);
-        }
+      const collectRows = async (max = limit) =>
+        page.evaluate(
+          ({ maxRows, rejectSrc, interestingSrc }) => {
+            const reject = new RegExp(rejectSrc, 'i');
+            const interesting = new RegExp(interestingSrc, 'i');
+            const seen = new Set();
+            const items = [];
+            const nodes = [
+              ...document.querySelectorAll(
+                '[role="option"], [role="row"], div[data-convid], div[aria-label*="Unread" i], div[aria-label*="Reddit" i], div[aria-label*="password" i]'
+              ),
+            ];
+            for (const n of nodes) {
+              const label = (n.getAttribute('aria-label') || n.innerText || '')
+                .replace(/\s+/g, ' ')
+                .trim();
+              if (label.length < 10) continue;
+              if (reject.test(label)) continue;
+              const key = label.slice(0, 160).toLowerCase();
+              if (seen.has(key)) continue;
+              seen.add(key);
+              items.push({
+                preview: label.slice(0, 500),
+                interesting: interesting.test(label),
+              });
+            }
+            // Prefer likely reset/reddit rows, but keep generic inbox rows as fallback.
+            items.sort((a, b) => Number(b.interesting) - Number(a.interesting));
+            if (items.length) return items.slice(0, maxRows);
+
+            // Last resort: scrape visible body lines (virtualized list / odd DOM).
+            const blob = (document.body?.innerText || '').slice(0, 16000);
+            const lines = blob
+              .split('\n')
+              .map((l) => l.replace(/\s+/g, ' ').trim())
+              .filter((l) => l.length > 14 && interesting.test(l) && !reject.test(l));
+            return lines.slice(0, maxRows).map((preview) => ({ preview, interesting: true }));
+          },
+          { maxRows: max, rejectSrc: NAV_REJECT.source, interestingSrc: INTERESTING.source }
+        );
+
+      const clickOtherTab = async () => {
+        const clicked = await page.evaluate(() => {
+          const el = [...document.querySelectorAll('button, [role="tab"], span, div')].find((n) =>
+            /^(Other)$/i.test((n.innerText || '').trim())
+          );
+          if (!el) return false;
+          el.click();
+          return true;
+        }).catch(() => false);
+        if (clicked) await page.waitForTimeout(2000);
+        return clicked;
       };
 
-      let rows = [];
-      const folders =
-        searchQuery && /password/i.test(String(searchQuery))
-          ? [
-              'https://outlook.live.com/mail/0/junkemail',
-              'https://outlook.live.com/mail/0/',
-            ]
-          : [null];
-
-      for (const folderUrl of folders) {
+      const clearSearch = async (folderUrl) => {
+        await page.keyboard.press('Escape').catch(() => {});
+        const search = page
+          .locator('input[aria-label*="Search" i], input[placeholder*="Search" i]')
+          .first();
+        if (await search.isVisible().catch(() => false)) {
+          await search.fill('');
+          await page.keyboard.press('Escape').catch(() => {});
+          await page.waitForTimeout(400);
+        }
+        // Hard reset: empty Outlook search results are sticky — re-open folder.
         if (folderUrl) {
           await page.goto(folderUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
           await page.waitForTimeout(2500);
         }
-        await runSearch(searchQuery);
-        rows = await collectRows();
-        if (rows.some((r) => /password|reset|recover/i.test(r.preview || ''))) break;
-        if (!searchQuery) break;
-        // Search returned nothing useful — try folder without search
-        await runSearch('');
-        await page.keyboard.press('Escape').catch(() => {});
-        await page.waitForTimeout(1500);
-        rows = await collectRows();
-        if (rows.some((r) => /password|reset|recover/i.test(r.preview || ''))) break;
+      };
+
+      const runSearch = async (q) => {
+        if (!q) return false;
+        const search = page
+          .locator('input[aria-label*="Search" i], input[placeholder*="Search" i]')
+          .first();
+        if (!(await search.isVisible().catch(() => false))) return false;
+        await search.click({ clickCount: 3 }).catch(() => {});
+        await search.fill(String(q));
+        await page.keyboard.press('Enter');
+        await page.waitForTimeout(4000);
+        return true;
+      };
+
+      const rowLooksLikeReset = (r) =>
+        /password|reset|recover|change.?password|account.?security/i.test(r?.preview || '');
+      const rowLooksLikeReddit = (r) =>
+        /reddit|redditmail|noreply/i.test(r?.preview || '') || rowLooksLikeReset(r);
+
+      // Keep this tight — outer Promise.race kills the browser at timeoutMs.
+      // Rotate query across poll attempts via searchQuery; within one visit do
+      // list → Other → 1–2 searches → junk list.
+      const searchQueries = [
+        ...(searchQuery ? [String(searchQuery)] : ['from:reddit']),
+        'reddit password',
+      ].filter((q, i, arr) => q && arr.indexOf(q) === i).slice(0, 2);
+
+      const folders = [
+        'https://outlook.live.com/mail/0/',
+        'https://outlook.live.com/mail/0/junkemail',
+      ];
+
+      let rows = [];
+      let bestRows = [];
+      let diagnostics = [];
+
+      for (const folderUrl of folders) {
+        await page.goto(folderUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+        await page.waitForTimeout(2500);
+        await page
+          .waitForSelector('[role="option"], [role="row"], div[data-convid]', { timeout: 12000 })
+          .catch(() => {});
+
+        // Focused → Other (seller Hotmail often parks Reddit in Other).
+        for (const pass of ['primary', 'other']) {
+          if (pass === 'other') {
+            if (!/mail\/0\/?$/i.test(folderUrl) && !/\/inbox/i.test(folderUrl)) break;
+            const switched = await clickOtherTab();
+            if (!switched) continue;
+          }
+
+          rows = await collectRows(limit);
+          diagnostics.push({
+            folderUrl,
+            pass,
+            mode: 'list',
+            count: rows.length,
+            sample: rows.slice(0, 2).map((r) => (r.preview || '').slice(0, 80)),
+          });
+          if (rows.some(rowLooksLikeReset)) {
+            bestRows = rows;
+            break;
+          }
+          if (rows.some(rowLooksLikeReddit) && bestRows.length === 0) bestRows = rows;
+          if (rows.length && bestRows.length === 0) bestRows = rows;
+
+          // Searches only on inbox primary pass — junk is usually small enough to list.
+          if (pass === 'primary' && /mail\/0\/?$/i.test(folderUrl)) {
+            for (const q of searchQueries) {
+              await runSearch(q);
+              rows = await collectRows(limit);
+              diagnostics.push({
+                folderUrl,
+                pass,
+                mode: `search:${q}`,
+                count: rows.length,
+                sample: rows.slice(0, 2).map((r) => (r.preview || '').slice(0, 80)),
+              });
+              if (rows.some(rowLooksLikeReset)) {
+                bestRows = rows;
+                break;
+              }
+              if (rows.some(rowLooksLikeReddit) && !bestRows.some(rowLooksLikeReddit)) {
+                bestRows = rows;
+              }
+              await clearSearch(folderUrl);
+            }
+          }
+          if (bestRows.some(rowLooksLikeReset)) break;
+        }
+        if (bestRows.some(rowLooksLikeReset)) break;
       }
 
-      // Prefer password-reset subjects, else any Reddit message (for link scrape).
+      rows = bestRows.length ? bestRows : rows;
+
+      if (!rows.length) {
+        console.warn(
+          `Outlook web scrape found 0 rows for ${account.email}:`,
+          JSON.stringify({
+            url: page.url(),
+            diagnostics: diagnostics.slice(-8),
+          })
+        );
+      }
+
       let openedBody = null;
-      let openIdx = rows.findIndex((r) => /password|reset|recover/i.test(r.preview || ''));
-      if (openIdx < 0) openIdx = rows.findIndex((r) => /reddit/i.test(r.preview || ''));
+      let openIdx = rows.findIndex(rowLooksLikeReset);
+      if (openIdx < 0) openIdx = rows.findIndex(rowLooksLikeReddit);
       if (openIdx < 0 && rows.length) openIdx = 0;
 
       if (openIdx >= 0) {
-        const clicked = await page.evaluate((idx) => {
+        const targetPreview = rows[openIdx]?.preview || '';
+        const clicked = await page.evaluate((want) => {
           const reject =
             /^(File|Home|View|Help|New mail|Delete|Archive|Report|Reading Pane|Read \/ Unread)/i;
-          const nodes = [...document.querySelectorAll(
-            '[role="option"], [role="row"], div[data-convid], div[aria-label*="Reddit" i]'
-          )].filter((n) => {
+          const nodes = [
+            ...document.querySelectorAll(
+              '[role="option"], [role="row"], div[data-convid], div[aria-label*="Unread" i]'
+            ),
+          ];
+          let target = null;
+          for (const n of nodes) {
             const label = (n.getAttribute('aria-label') || n.innerText || '')
               .replace(/\s+/g, ' ')
               .trim();
-            return label.length >= 12 && !reject.test(label) && /reddit|password|reset|@|r\//i.test(label);
-          });
-          const target = nodes[idx] || nodes[0];
+            if (label.length < 10 || reject.test(label)) continue;
+            if (want && label.slice(0, 80) === want.slice(0, 80)) {
+              target = n;
+              break;
+            }
+            if (!target) target = n;
+          }
           if (!target) return false;
           target.click();
           return true;
-        }, openIdx).catch(() => false);
+        }, targetPreview).catch(() => false);
 
         if (clicked) {
-          await page.waitForTimeout(3000);
+          await page.waitForTimeout(3500);
           openedBody = await page.evaluate(() => {
             const reading = document.querySelector(
               '[role="main"], [aria-label*="Reading Pane"], .ReadingPaneContents, #ReadingPaneContainerId'
             );
             const root = reading || document.body;
-            const text = (root?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 8000);
+            const text = (root?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 12000);
             const hrefs = [...root.querySelectorAll('a[href]')]
               .map((a) => a.href)
               .filter((h) => /^https?:/i.test(h))
-              .slice(0, 40);
+              .slice(0, 60);
+            // Reddit often wraps links; also pull raw URLs from text.
             return { text, hrefs };
           }).catch(() => null);
         }
@@ -426,23 +766,21 @@ class EmailInboxService {
           ...(isOpened ? openedBody.hrefs || [] : []),
         ].filter((u, i, arr) => arr.indexOf(u) === i);
         const codes = extractCodes(body);
+        const fromReddit = /reddit|redditmail|noreply/i.test(preview + body);
         return {
           uid: `web-${idx}`,
-          subject: preview.slice(0, 120),
-          from: /reddit/i.test(preview) ? ['reddit'] : [],
+          subject: preview.slice(0, 160),
+          from: fromReddit ? ['reddit'] : [],
           date: null,
           codes,
           verifyLinks: pickVerificationLinks(urls),
           urls,
-          preview: body.slice(0, 400),
+          preview: body.slice(0, 600),
           source: 'outlook_web',
         };
       });
 
       return messages;
-    } finally {
-      /* closed in outer finally */
-    }
     };
 
     let timer;
@@ -469,12 +807,21 @@ class EmailInboxService {
         messages: await this.fetchRecentMessages(account, opts),
       };
     } catch (imapErr) {
-      if (!this.isMicrosoftAccount(account)) throw imapErr;
-      console.warn(
-        `IMAP failed for ${account.email} (${imapErr.message}); trying Outlook web…`
-      );
-      const messages = await this.fetchViaOutlookWeb(account, opts);
-      return { method: 'outlook_web', messages, imapError: imapErr.message };
+      if (this.isMicrosoftAccount(account)) {
+        console.warn(
+          `IMAP failed for ${account.email} (${imapErr.message}); trying Outlook web…`
+        );
+        const messages = await this.fetchViaOutlookWeb(account, opts);
+        return { method: 'outlook_web', messages, imapError: imapErr.message };
+      }
+      if (this.isYahooAccount(account)) {
+        console.warn(
+          `IMAP failed for ${account.email} (${imapErr.message}); trying Yahoo web…`
+        );
+        const messages = await this.fetchViaYahooWeb(account, opts);
+        return { method: 'yahoo_web', messages, imapError: imapErr.message };
+      }
+      throw imapErr;
     }
   }
 
@@ -564,20 +911,25 @@ class EmailInboxService {
    */
   pickLatestFromMessages(messages, { fromIncludes, subjectIncludes, afterDate, linkIncludes } = {}) {
     const afterMs = afterDate ? new Date(afterDate).getTime() : null;
+    const subjectNeedles = subjectIncludes
+      ? (Array.isArray(subjectIncludes) ? subjectIncludes : [subjectIncludes]).map((s) =>
+          String(s).toLowerCase()
+        )
+      : [];
+    const fromNeedles = fromIncludes
+      ? (Array.isArray(fromIncludes) ? fromIncludes : [fromIncludes]).map((s) =>
+          String(s).toLowerCase()
+        )
+      : [];
+
     const filtered = (messages || []).filter((m) => {
       if (afterMs && m.date) {
         const t = new Date(m.date).getTime();
         if (!Number.isNaN(t) && t < afterMs - 60_000) return false;
       }
-      if (fromIncludes) {
-        const needle = String(fromIncludes).toLowerCase();
-        const hay = `${(m.from || []).join(' ')} ${m.subject || ''} ${m.preview || ''}`.toLowerCase();
-        if (!hay.includes(needle)) return false;
-      }
-      if (subjectIncludes) {
-        const needle = String(subjectIncludes).toLowerCase();
-        if (!String(m.subject || m.preview || '').toLowerCase().includes(needle)) return false;
-      }
+      const hay = `${(m.from || []).join(' ')} ${m.subject || ''} ${m.preview || ''}`.toLowerCase();
+      if (fromNeedles.length && !fromNeedles.some((n) => hay.includes(n))) return false;
+      if (subjectNeedles.length && !subjectNeedles.some((n) => hay.includes(n))) return false;
       const links = m.verifyLinks || m.urls || [];
       if (linkIncludes) {
         const needle = String(linkIncludes).toLowerCase();
@@ -587,12 +939,31 @@ class EmailInboxService {
       return (m.codes && m.codes.length) || (links && links.length);
     });
 
+    // Prefer reset-ish subjects when multiple match.
+    filtered.sort((a, b) => {
+      const score = (m) => {
+        const t = `${m.subject || ''} ${m.preview || ''}`.toLowerCase();
+        let s = 0;
+        if (/password|reset|recover/i.test(t)) s += 3;
+        if (/reddit/i.test(t)) s += 2;
+        if ((m.verifyLinks || []).length) s += 2;
+        if ((m.urls || []).length) s += 1;
+        return s;
+      };
+      return score(b) - score(a);
+    });
+
     const best = filtered[0] || null;
     const links = best?.verifyLinks?.length ? best.verifyLinks : best?.urls || [];
+    const resetLink =
+      links.find((u) => /reddit\.com.*(password|reset|change|account|recover)/i.test(u)) ||
+      links.find((u) => /reddit\.com/i.test(u)) ||
+      links[0] ||
+      null;
     return {
       found: !!best,
       code: best?.codes?.[0] || null,
-      link: links[0] || null,
+      link: resetLink,
       codes: best?.codes || [],
       links,
       message: best,
@@ -702,16 +1073,29 @@ class EmailInboxService {
       });
       return { success: true, method: 'imap', email: account.email, provider: account.provider };
     } catch (err) {
-      if (!this.isMicrosoftAccount(account)) throw err;
-      const messages = await this.fetchViaOutlookWeb(account, { limit: 3 });
-      return {
-        success: true,
-        method: 'outlook_web',
-        email: account.email,
-        provider: account.provider,
-        imapError: err.message,
-        sampleCount: messages.length,
-      };
+      if (this.isMicrosoftAccount(account)) {
+        const messages = await this.fetchViaOutlookWeb(account, { limit: 3 });
+        return {
+          success: true,
+          method: 'outlook_web',
+          email: account.email,
+          provider: account.provider,
+          imapError: err.message,
+          sampleCount: messages.length,
+        };
+      }
+      if (this.isYahooAccount(account)) {
+        const messages = await this.fetchViaYahooWeb(account, { limit: 3 });
+        return {
+          success: true,
+          method: 'yahoo_web',
+          email: account.email,
+          provider: account.provider,
+          imapError: err.message,
+          sampleCount: messages.length,
+        };
+      }
+      throw err;
     }
   }
 }
