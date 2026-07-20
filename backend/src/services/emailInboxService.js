@@ -322,35 +322,22 @@ class EmailInboxService {
       if (openIdx < 0 && rows.length) openIdx = 0;
 
       if (openIdx >= 0) {
-        // Click by matching preview text when possible (more reliable than index)
-        const needle = (rows[openIdx].preview || '').slice(0, 40);
-        let clicked = false;
-        if (needle.length > 10) {
-          clicked = await page
-            .getByText(needle.slice(0, 24), { exact: false })
-            .first()
-            .click({ timeout: 5000 })
-            .then(() => true)
-            .catch(() => false);
-        }
-        if (!clicked) {
-          clicked = await page.evaluate((idx) => {
-            const reject =
-              /^(File|Home|View|Help|New mail|Delete|Archive|Report|Reading Pane|Read \/ Unread)/i;
-            const nodes = [...document.querySelectorAll(
-              '[role="option"], [role="row"], div[data-convid], div[aria-label*="Reddit" i]'
-            )].filter((n) => {
-              const label = (n.getAttribute('aria-label') || n.innerText || '')
-                .replace(/\s+/g, ' ')
-                .trim();
-              return label.length >= 12 && !reject.test(label);
-            });
-            const target = nodes[idx];
-            if (!target) return false;
-            target.click();
-            return true;
-          }, openIdx).catch(() => false);
-        }
+        const clicked = await page.evaluate((idx) => {
+          const reject =
+            /^(File|Home|View|Help|New mail|Delete|Archive|Report|Reading Pane|Read \/ Unread)/i;
+          const nodes = [...document.querySelectorAll(
+            '[role="option"], [role="row"], div[data-convid], div[aria-label*="Reddit" i]'
+          )].filter((n) => {
+            const label = (n.getAttribute('aria-label') || n.innerText || '')
+              .replace(/\s+/g, ' ')
+              .trim();
+            return label.length >= 12 && !reject.test(label) && /reddit|password|reset|@|r\//i.test(label);
+          });
+          const target = nodes[idx] || nodes[0];
+          if (!target) return false;
+          target.click();
+          return true;
+        }, openIdx).catch(() => false);
 
         if (clicked) {
           await page.waitForTimeout(3000);
