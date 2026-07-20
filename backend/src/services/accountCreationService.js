@@ -876,16 +876,13 @@ class AccountCreationService {
                 reason: netBlocked ? 'reddit_network_security' : msg.slice(0, 120),
               });
               if (netBlocked) {
-                await pool.query(
-                  `UPDATE proxies
-                   SET cooldown_until = NOW() + INTERVAL '6 hours',
-                       consecutive_failures = GREATEST(COALESCE(consecutive_failures, 0), 3),
-                       updated_at = NOW()
-                   WHERE id = $1`,
-                  [proxyId]
-                );
+                const cool = await proxyService.applyProxyCooldown(proxyId, 6, {
+                  reason: 'reddit_network_security',
+                  minConsecutive: 3,
+                });
                 console.warn(
-                  `Reddit create: proxy ${proxyId} network-blocked — cooled 6h, retry ${attempt}/2`
+                  `Reddit create: proxy ${proxyId} network-blocked — ` +
+                    `${cool.action === 'cooldown' ? 'cooled 6h' : cool.action}, retry ${attempt}/2`
                 );
               }
             }

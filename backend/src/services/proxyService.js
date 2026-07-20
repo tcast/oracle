@@ -10,6 +10,8 @@ const PROTECTION = {
   disableAfterTotalFailures: 10,
   healthProbeMinIntervalMs: 60_000,
   healthProbeTimeoutMs: 12_000,
+  /** Hard cap: one event must not mass-cool the fleet (false bulk stamps). */
+  maxCooldownBurstPer5Min: 25,
 };
 
 class ProxyService {
@@ -383,6 +385,48 @@ class ProxyService {
     };
   }
 
+  /**
+   * Apply cooldown to one proxy, with a fleet burst cap so a single bad event
+   * (or mistaken bulk SQL path reused in app code) cannot mass-cool hundreds.
+   */
+  async applyProxyCooldown(proxyId, hours, { reason = null, minConsecutive = null } = {}) {
+    const burst = await pool.query(
+      `SELECT COUNT(*)::int AS n
+       FROM proxies
+       WHERE cooldown_until IS NOT NULL
+         AND cooldown_until > NOW()
+         AND updated_at > NOW() - INTERVAL '5 minutes'`
+    );
+    const recentCools = burst.rows[0]?.n || 0;
+    if (recentCools >= PROTECTION.maxCooldownBurstPer5Min) {
+      console.warn(
+        `Proxy ${proxyId} cooldown skipped — burst cap ` +
+          `${recentCools}/${PROTECTION.maxCooldownBurstPer5Min} in 5m` +
+          (reason ? ` (${String(reason).slice(0, 120)})` : '')
+      );
+      return { action: 'burst_capped', recentCools };
+    }
+
+    const result = await pool.query(
+      `UPDATE proxies
+       SET cooldown_until = NOW() + ($2 * INTERVAL '1 hour'),
+           consecutive_failures = CASE
+             WHEN $3::int IS NULL THEN consecutive_failures
+             ELSE GREATEST(COALESCE(consecutive_failures, 0), $3::int)
+           END,
+           updated_at = NOW()
+       WHERE id = $1
+       RETURNING id, consecutive_failures, cooldown_until`,
+      [proxyId, hours, minConsecutive]
+    );
+    if (!result.rows[0]) return { action: 'missing' };
+    console.warn(
+      `Proxy ${proxyId} circuit open for ${hours}h` +
+        (reason ? ` (${String(reason).slice(0, 120)})` : '')
+    );
+    return { action: 'cooldown', row: result.rows[0], recentCools };
+  }
+
   // Update proxy stats after use — circuit-breaker on repeated failures
   async updateProxyStats(proxyId, success, { reason = null } = {}) {
     const truncatedReason = reason ? String(reason).slice(0, 500) : null;
@@ -430,18 +474,8 @@ class ProxyService {
 
     if (consecutive >= tripAt) {
       const hours = Math.min(24, 4 * consecutive);
-      await pool.query(
-        `UPDATE proxies
-         SET cooldown_until = NOW() + ($2 * INTERVAL '1 hour'),
-             updated_at = NOW()
-         WHERE id = $1`,
-        [proxyId, hours]
-      );
-      action = 'cooldown';
-      console.warn(
-        `Proxy ${proxyId} circuit open for ${hours}h after ${consecutive} failures` +
-          (truncatedReason ? ` (${truncatedReason})` : '')
-      );
+      const cool = await this.applyProxyCooldown(proxyId, hours, { reason: truncatedReason });
+      action = cool.action === 'cooldown' ? 'cooldown' : cool.action;
     }
 
     const disableForConsecutive =
