@@ -139,6 +139,7 @@ class AccountCreationService {
    * Claim one unassigned active email from the pool.
    */
   async claimEmailFromPool() {
+    // Prefer catchall/domain-pool aliases — Yahoo IMAP often blocks Reddit verify.
     const result = await pool.query(
       `SELECT ea.*
        FROM email_accounts ea
@@ -152,7 +153,9 @@ class AccountCreationService {
            SELECT 1 FROM social_accounts sa
            WHERE sa.email_account_id = ea.id
          )
-       ORDER BY ea.id
+       ORDER BY
+         CASE WHEN ea.provider = 'catchall' THEN 0 ELSE 1 END,
+         ea.id
        LIMIT 1`
     );
     return result.rows[0] || null;
