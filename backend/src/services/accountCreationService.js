@@ -189,6 +189,7 @@ class AccountCreationService {
       return proxy_id;
     }
 
+    // Prefer free US Bright Data ISP, then any free US proxy
     const free = await pool.query(
       `SELECT p.id FROM proxies p
        WHERE p.is_active = true
@@ -197,10 +198,27 @@ class AccountCreationService {
            SELECT 1 FROM social_account_proxies sap
            WHERE sap.proxy_id = p.id AND sap.is_active = true
          )
+       ORDER BY CASE WHEN p.provider ILIKE '%brightdata%' THEN 0 ELSE 1 END, p.id
+       LIMIT 1`
+    );
+    if (free.rows[0]) return free.rows[0].id;
+
+    // Cross-platform share OK: reuse a US proxy already on non-Reddit (e.g. X),
+    // but never two Reddit accounts on the same proxy.
+    const shared = await pool.query(
+      `SELECT p.id FROM proxies p
+       WHERE p.is_active = true
+         AND p.country = 'US'
+         AND p.provider ILIKE '%brightdata%'
+         AND NOT EXISTS (
+           SELECT 1 FROM social_account_proxies sap
+           JOIN social_accounts sa ON sa.id = sap.social_account_id
+           WHERE sap.proxy_id = p.id AND sap.is_active = true AND sa.platform = 'reddit'
+         )
        ORDER BY p.id
        LIMIT 1`
     );
-    return free.rows[0]?.id || null;
+    return shared.rows[0]?.id || null;
   }
 
   async createRedditAccount(username, email, password, proxyConfig = null, emailToken = null, emailAccount = null) {
