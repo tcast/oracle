@@ -3,6 +3,7 @@ const router = express.Router();
 const pool = require('../services/db');
 const { authMiddleware } = require('../middleware/auth');
 const emailAccountCreationService = require('../services/emailAccountCreationService');
+const emailInboxService = require('../services/emailInboxService');
 const fiveSimService = require('../services/fiveSimService');
 const captchaSolverService = require('../services/captchaSolverService');
 
@@ -288,6 +289,57 @@ router.post('/:id/test', async (req, res) => {
     res.status(500).json({
       error: 'Failed to test email login',
       message: error.message
+    });
+  }
+});
+
+/**
+ * POST /api/email-accounts/:id/inbox
+ * Fetch recent inbox messages / latest verification code via IMAP
+ */
+router.post('/:id/inbox', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { limit, fromIncludes, subjectIncludes, testOnly } = req.body || {};
+
+    if (testOnly) {
+      const result = await emailInboxService.testImapLogin(parseInt(id, 10));
+      return res.json(result);
+    }
+
+    const result = await emailInboxService.checkInbox(parseInt(id, 10), {
+      limit: limit ? Math.min(parseInt(limit, 10) || 10, 30) : 10,
+      fromIncludes,
+      subjectIncludes,
+    });
+    res.json(result);
+  } catch (error) {
+    console.error('Error checking email inbox:', error);
+    res.status(500).json({
+      error: 'Failed to check inbox',
+      message: error.message,
+    });
+  }
+});
+
+/**
+ * GET /api/email-accounts/:id/inbox
+ * Same as POST for convenience (query params)
+ */
+router.get('/:id/inbox', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await emailInboxService.checkInbox(parseInt(id, 10), {
+      limit: req.query.limit ? Math.min(parseInt(req.query.limit, 10) || 10, 30) : 10,
+      fromIncludes: req.query.from,
+      subjectIncludes: req.query.subject,
+    });
+    res.json(result);
+  } catch (error) {
+    console.error('Error checking email inbox:', error);
+    res.status(500).json({
+      error: 'Failed to check inbox',
+      message: error.message,
     });
   }
 });

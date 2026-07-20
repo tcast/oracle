@@ -14,6 +14,7 @@ const path = require('path');
 const pool = require('../services/db');
 const proxyService = require('../services/proxyService');
 const playwrightService = require('../services/playwrightService');
+const { assertImportCredentials } = require('../utils/credentialGate');
 
 function parseLine(line) {
   const raw = String(line || '').trim();
@@ -25,7 +26,9 @@ function parseLine(line) {
   // email may contain no colons; password fields shouldn't either in this dump
   const [username, password, totp_secret, email, ...rest] = parts;
   const email_password = rest.join(':');
-  return { username, password, totp_secret, email, email_password };
+  const row = { username, password, totp_secret, email, email_password };
+  assertImportCredentials(row, { requireTotp: true, preferEmailAccess: true });
+  return row;
 }
 
 async function takeProxiesFromPendingShells(needed) {

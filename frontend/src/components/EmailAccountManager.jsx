@@ -89,6 +89,26 @@ const EmailAccountManager = () => {
     }
   };
 
+  const handleCheckInbox = async (accountId) => {
+    try {
+      const response = await api.post(`/api/email-accounts/${accountId}/inbox`, { limit: 10 });
+      const latest = response.data.latestVerification;
+      const lines = [
+        `Inbox for ${response.data.email}`,
+        `Messages scanned: ${response.data.messages?.length || 0}`,
+        latest?.found
+          ? `Latest code: ${latest.code || '(none)'} | link: ${latest.link || '(none)'}`
+          : 'No verification code/link found in recent mail',
+      ];
+      if (response.data.messages?.[0]) {
+        lines.push(`Newest subject: ${response.data.messages[0].subject || '(no subject)'}`);
+      }
+      alert(lines.join('\n'));
+    } catch (err) {
+      alert('Inbox check failed: ' + (err.response?.data?.message || err.message));
+    }
+  };
+
   const handleUpdateStatus = async (accountId, newStatus) => {
     try {
       await api.patch(`/api/email-accounts/${accountId}/status`, { status: newStatus });
@@ -353,6 +373,13 @@ const EmailAccountManager = () => {
                       {new Date(account.created_at).toLocaleDateString()}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm space-x-2">
+                      <button
+                        onClick={() => handleCheckInbox(account.id)}
+                        className="text-indigo-600 hover:text-indigo-800"
+                        title="Check inbox (IMAP)"
+                      >
+                        Inbox
+                      </button>
                       <button
                         onClick={() => handleTestLogin(account.id)}
                         className="text-blue-600 hover:text-blue-800"

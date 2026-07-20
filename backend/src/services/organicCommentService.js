@@ -333,6 +333,7 @@ Write only the comment text.`;
        WHERE sa.platform = 'reddit'
          AND COALESCE(sa.is_simulated, false) = false
          AND sa.status = 'active'
+         AND lower(sa.status) NOT IN ('banned', 'disabled')
          AND COALESCE(sa.credentials->>'password', '') NOT IN ('', 'default_password')
          AND COALESCE(sa.credentials->>'needs_signup', 'false') != 'true'
          AND (j.cooldown_until IS NULL OR j.cooldown_until <= NOW())

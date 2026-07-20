@@ -179,6 +179,7 @@ class SocialWarmService {
        WHERE sa.platform = $1
          AND COALESCE(sa.is_simulated, false) = false
          AND sa.status = 'active'
+         AND lower(sa.status) NOT IN ('banned', 'disabled')
          AND COALESCE(sa.credentials->>'password', '') NOT IN ('', 'default_password')
          AND (j.cooldown_until IS NULL OR j.cooldown_until <= NOW())
          AND COALESCE(j.failure_class, '') NOT IN ('bad_credentials')

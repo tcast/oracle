@@ -20,6 +20,7 @@ const path = require('path');
 const pool = require('../services/db');
 const proxyService = require('../services/proxyService');
 const playwrightService = require('../services/playwrightService');
+const { assertImportCredentials } = require('../utils/credentialGate');
 
 function parseLine(line) {
   const raw = String(line || '').trim();
@@ -48,11 +49,8 @@ function parseLine(line) {
   if (!/@/.test(email)) throw new Error(`Invalid email: ${email}`);
   if (!auth_token.startsWith('M.')) throw new Error('auth_token does not look like X cookie');
   if (!/^[0-9a-f]{40}$/i.test(ct0)) throw new Error(`ct0 must be 40-hex, got len=${ct0.length}`);
-  if (!/^[A-Z2-7]{16}$/i.test(totp_secret)) {
-    throw new Error(`totp_secret must be 16-char base32, got len=${totp_secret.length}`);
-  }
 
-  return {
+  const row = {
     username,
     password,
     email,
@@ -62,6 +60,8 @@ function parseLine(line) {
     totp_secret,
     ct0,
   };
+  assertImportCredentials(row, { requireTotp: true, preferEmailAccess: true });
+  return row;
 }
 
 function buildXCookies(authToken, ct0) {

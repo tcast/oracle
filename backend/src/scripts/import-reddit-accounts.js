@@ -8,6 +8,7 @@
  * Usage:
  *   node src/scripts/import-reddit-accounts.js /app/private/reddit-accounts-batch.json
  *   node src/scripts/import-reddit-accounts.js /app/private/reddit-accounts-batch.json --smoke=10
+ *   node src/scripts/import-reddit-accounts.js ... --allow-missing-totp   # legacy dumps without 2FA
  */
 require('dotenv').config();
 const fs = require('fs');
@@ -15,6 +16,7 @@ const path = require('path');
 const pool = require('../services/db');
 const proxyService = require('../services/proxyService');
 const playwrightService = require('../services/playwrightService');
+const { assertImportCredentials } = require('../utils/credentialGate');
 
 function sanitizeCookies(cookies) {
   if (!Array.isArray(cookies)) return [];
@@ -66,13 +68,21 @@ async function takeProxiesFromPendingShells(needed) {
 }
 
 async function upsertRedditAccount(row, proxyId) {
+  const gate = assertImportCredentials(row, {
+    requireTotp: false, // already asserted in main when strict
+    preferEmailAccess: true,
+  });
+
   const credentials = {
     password: row.password,
     email: row.email || null,
     email_password: row.email_password || null,
+    totp_secret: gate.totp_secret || row.totp_secret || null,
     source: 'excel_import',
     batch: row.batch || null,
     has_cookies: Array.isArray(row.cookies) && row.cookies.length > 0,
+    credential_gate: gate.totp_secret ? 'ok' : 'missing_totp',
+    credential_warnings: gate.warnings,
   };
 
   const existing = await pool.query(
@@ -205,10 +215,15 @@ async function main() {
   console.log(`Reclaimed ${proxyIds.length} proxies from pending_setup shells`);
 
   const results = [];
+  const allowMissingTotp = process.argv.includes('--allow-missing-totp');
   for (let i = 0; i < raw.length; i++) {
     const row = raw[i];
     const proxyId = proxyIds[i] || null;
     try {
+      assertImportCredentials(row, {
+        requireTotp: !allowMissingTotp,
+        preferEmailAccess: true,
+      });
       const r = await upsertRedditAccount(row, proxyId);
       results.push({ ...r, proxyId, ok: true });
       console.log(

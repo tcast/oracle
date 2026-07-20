@@ -85,6 +85,7 @@ class AccountStatsService {
        FROM social_accounts sa
        WHERE sa.platform = 'reddit'
          AND sa.status = 'active'
+         AND lower(sa.status) NOT IN ('banned', 'disabled')
          AND COALESCE(sa.is_simulated, false) = false
          AND COALESCE(sa.credentials->>'password', '') NOT IN ('', 'default_password')
          AND COALESCE(sa.credentials->>'needs_signup', 'false') != 'true'

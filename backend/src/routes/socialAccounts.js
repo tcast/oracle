@@ -216,16 +216,41 @@ router.delete('/:id', async (req, res) => {
 });
 
 router.post('/create', async (req, res) => {
-  const { platform, count, emailDomain, usernamePrefix } = req.body;
+  const { platform, count, emailDomain, usernamePrefix, useEmailPool, warm } = req.body;
 
   try {
-    // Validate input
-    if (!platform || !count || !emailDomain || !usernamePrefix) {
-      return res.status(400).json({ error: 'Missing required fields' });
+    if (!platform || !count) {
+      return res.status(400).json({ error: 'Missing required fields: platform, count' });
     }
 
-    if (count < 1 || count > 10) {
-      return res.status(400).json({ error: 'Count must be between 1 and 10' });
+    const maxCount = useEmailPool ? 20 : 10;
+    if (count < 1 || count > maxCount) {
+      return res.status(400).json({ error: `Count must be between 1 and ${maxCount}` });
+    }
+
+    if (platform !== 'reddit') {
+      return res.status(400).json({ error: 'Only reddit self-create is supported in this pilot' });
+    }
+
+    if (useEmailPool) {
+      const results = await accountCreationService.createAccounts(
+        platform,
+        count,
+        null,
+        usernamePrefix || null,
+        [],
+        { useEmailPool: true, warm: warm !== false }
+      );
+      return res.json({
+        mode: 'email_pool',
+        ...results,
+      });
+    }
+
+    if (!emailDomain || !usernamePrefix) {
+      return res.status(400).json({
+        error: 'Missing required fields: emailDomain, usernamePrefix (or set useEmailPool: true)',
+      });
     }
 
     if (!emailDomain.match(/^[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9]\.[a-zA-Z]{2,}$/)) {
@@ -236,7 +261,6 @@ router.post('/create', async (req, res) => {
       return res.status(400).json({ error: 'Invalid username prefix' });
     }
 
-    // Create accounts
     const accounts = await accountCreationService.createAccounts(
       platform,
       count,
@@ -247,7 +271,7 @@ router.post('/create', async (req, res) => {
     res.json({ accounts });
   } catch (error) {
     console.error('Error creating accounts:', error);
-    res.status(500).json({ error: 'Failed to create accounts' });
+    res.status(500).json({ error: 'Failed to create accounts', message: error.message });
   }
 });
 

@@ -5,8 +5,10 @@ const CreateAccountsForm = ({ onClose, onSuccess }) => {
   const [formData, setFormData] = useState({
     platform: 'reddit',
     count: 1,
+    useEmailPool: true,
+    usernamePrefix: '',
     emailDomain: '',
-    usernamePrefix: ''
+    warm: true,
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -16,11 +18,23 @@ const CreateAccountsForm = ({ onClose, onSuccess }) => {
     setLoading(true);
     setError(null);
     try {
-      const response = await api.post('/api/social-accounts/create', formData);
+      const payload = {
+        platform: formData.platform,
+        count: formData.count,
+        useEmailPool: formData.useEmailPool,
+        warm: formData.warm,
+      };
+      if (formData.useEmailPool) {
+        if (formData.usernamePrefix) payload.usernamePrefix = formData.usernamePrefix;
+      } else {
+        payload.emailDomain = formData.emailDomain;
+        payload.usernamePrefix = formData.usernamePrefix;
+      }
+      const response = await api.post('/api/social-accounts/create', payload);
       onSuccess(response.data);
       onClose();
     } catch (err) {
-      setError(err.response?.data?.error || err.message || 'Failed to create accounts');
+      setError(err.response?.data?.error || err.response?.data?.message || err.message || 'Failed to create accounts');
     } finally {
       setLoading(false);
     }
@@ -54,38 +68,71 @@ const CreateAccountsForm = ({ onClose, onSuccess }) => {
           <input
             type="number"
             min="1"
-            max="10"
+            max={formData.useEmailPool ? 20 : 10}
             value={formData.count}
             onChange={(e) => setFormData({ ...formData, count: parseInt(e.target.value) || 1 })}
             className="input-field"
           />
+          <p className="mt-1 text-xs text-gray-500">
+            Pilot: up to {formData.useEmailPool ? 20 : 10} per run
+          </p>
         </div>
 
-        <div>
-          <label className="label">Email Domain</label>
-          <div className="flex rounded-lg shadow-sm">
-            <span className="inline-flex items-center px-3 rounded-l-lg border border-r-0 border-gray-200 bg-gray-50 text-gray-500 text-sm">@</span>
+        <div className="flex items-center gap-2">
+          <input
+            id="useEmailPool"
+            type="checkbox"
+            checked={formData.useEmailPool}
+            onChange={(e) => setFormData({ ...formData, useEmailPool: e.target.checked })}
+            className="rounded border-gray-300"
+          />
+          <label htmlFor="useEmailPool" className="text-sm text-gray-700">
+            Use durable email from Email Accounts pool (recommended)
+          </label>
+        </div>
+
+        {formData.useEmailPool && (
+          <div className="flex items-center gap-2">
             <input
-              type="text"
-              value={formData.emailDomain}
-              onChange={(e) => setFormData({ ...formData, emailDomain: e.target.value })}
-              placeholder="example.com"
-              className="flex-1 min-w-0 block w-full px-3 py-2 rounded-none rounded-r-lg border-gray-200 focus:border-whisper-500 focus:ring-whisper-500 sm:text-sm"
+              id="warmAfter"
+              type="checkbox"
+              checked={formData.warm}
+              onChange={(e) => setFormData({ ...formData, warm: e.target.checked })}
+              className="rounded border-gray-300"
             />
+            <label htmlFor="warmAfter" className="text-sm text-gray-700">
+              Warm account after create
+            </label>
           </div>
-          <p className="mt-1 text-xs text-gray-500">Accounts will be created with emails like username@{formData.emailDomain || 'example.com'}</p>
-        </div>
+        )}
+
+        {!formData.useEmailPool && (
+          <div>
+            <label className="label">Email Domain</label>
+            <div className="flex rounded-lg shadow-sm">
+              <span className="inline-flex items-center px-3 rounded-l-lg border border-r-0 border-gray-200 bg-gray-50 text-gray-500 text-sm">@</span>
+              <input
+                type="text"
+                value={formData.emailDomain}
+                onChange={(e) => setFormData({ ...formData, emailDomain: e.target.value })}
+                placeholder="example.com"
+                className="flex-1 min-w-0 block w-full px-3 py-2 rounded-none rounded-r-lg border-gray-200 focus:border-whisper-500 focus:ring-whisper-500 sm:text-sm"
+                required={!formData.useEmailPool}
+              />
+            </div>
+          </div>
+        )}
 
         <div>
-          <label className="label">Username Prefix</label>
+          <label className="label">Username Prefix {formData.useEmailPool ? '(optional)' : ''}</label>
           <input
             type="text"
             value={formData.usernamePrefix}
             onChange={(e) => setFormData({ ...formData, usernamePrefix: e.target.value })}
             placeholder="user"
             className="input-field"
+            required={!formData.useEmailPool}
           />
-          <p className="mt-1 text-xs text-gray-500">Usernames will be created like: {formData.usernamePrefix || 'user'}123</p>
         </div>
 
         {error && (

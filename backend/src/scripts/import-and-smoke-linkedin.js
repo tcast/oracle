@@ -14,6 +14,7 @@ const path = require('path');
 const pool = require('../services/db');
 const proxyService = require('../services/proxyService');
 const playwrightService = require('../services/playwrightService');
+const { assertImportCredentials } = require('../utils/credentialGate');
 
 function parseLine(line) {
   const raw = String(line || '').trim();
@@ -29,7 +30,9 @@ function parseLine(line) {
   const profile_url = parts.slice(4).join(':');
   if (!/@/.test(email)) throw new Error(`Invalid email: ${email}`);
   if (!/linkedin\.com/i.test(profile_url)) throw new Error(`Invalid profile URL: ${profile_url}`);
-  return { email, password, email_password, totp_secret, profile_url };
+  const row = { email, password, email_password, totp_secret, profile_url };
+  assertImportCredentials(row, { requireTotp: true, preferEmailAccess: true });
+  return row;
 }
 
 function slugFromProfile(url) {
