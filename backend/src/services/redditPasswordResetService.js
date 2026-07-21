@@ -1383,8 +1383,62 @@ class RedditPasswordResetService {
       await this.clearPasswordRotateRisk(account.id).catch(() => {});
       await playwrightService.persistSession(page, 'reddit', account.id).catch(() => {});
 
-      // Close the logged-in browser before verify — clearing cookies in-place
-      // triggers Reddit "network policy" blocks on the same proxy session.
+      // Best verify: still logged in — probe update_password with the NEW password.
+      // Reddit returns old_password_match when curpass equals the live password.
+      let loginOk = false;
+      let oldStillWorks = false;
+      let verifyMeta = { verifyVia: 'session_probe_new_password' };
+      try {
+        const probe = await page.evaluate(
+          async ({ curpass, uh }) => {
+            const body = new URLSearchParams({
+              curpass,
+              newpass: curpass,
+              verpass: curpass,
+              uh,
+              api_type: 'json',
+            });
+            const res = await fetch('/api/update_password', {
+              method: 'POST',
+              credentials: 'include',
+              headers: {
+                'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                'x-modhash': uh,
+              },
+              body: body.toString(),
+            });
+            const text = await res.text();
+            let json = null;
+            try {
+              json = JSON.parse(text);
+            } catch (_) {
+              /* ignore */
+            }
+            return { status: res.status, json, text: text.slice(0, 400) };
+          },
+          {
+            curpass: newPassword,
+            uh: await page.evaluate(() => {
+              if (window.reddit?.modhash) return window.reddit.modhash;
+              const m = document.body.innerHTML.match(/modhash["']\s*:\s*["']([^"']+)/);
+              return m?.[1] || document.querySelector('input[name="uh"]')?.value || null;
+            }),
+          }
+        );
+        const blob = JSON.stringify(probe.json || probe.text || '').toLowerCase();
+        verifyMeta.sessionProbe = blob.slice(0, 220);
+        if (/old_password_match|new and old passwords must not match/i.test(blob)) {
+          loginOk = true;
+        } else if (/wrong.?password|incorrect password|bad_password/i.test(blob)) {
+          loginOk = false;
+          verifyMeta.sessionProbeFailed = true;
+        }
+      } catch (probeErr) {
+        verifyMeta.sessionProbeError = String(probeErr.message || probeErr).slice(0, 200);
+      }
+
+      // Close the logged-in browser before optional re-login verify — clearing cookies
+      // in-place triggers Reddit "network policy" blocks on the same proxy session.
       await Promise.race([
         browser.close().catch(() => {}),
         new Promise((r) => setTimeout(r, 8000)),
@@ -1393,16 +1447,11 @@ class RedditPasswordResetService {
       browser = null;
       await new Promise((r) => setTimeout(r, 5000));
 
-      let loginOk = false;
-      let oldStillWorks = false;
-      let verifyMeta = {};
-      {
-        // Prefer BrightData for verify — ProxyBase often network-policy blocks
-        // password login right after update_password on the same sticky IP.
+      if (!loginOk) {
         const opened = await this.openVerifyBrowser(account.id);
         browser = opened.browserResult.browser;
         const vpage = opened.browserResult.page;
-        verifyMeta = { ...opened.meta };
+        verifyMeta = { ...verifyMeta, ...opened.meta, fallbackVerify: true };
         try {
           const neu = await this.loginOldRedditPassword(vpage, account.username, newPassword);
           loginOk = !!neu.ok;
