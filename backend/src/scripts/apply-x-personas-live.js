@@ -62,10 +62,11 @@ function parseJson(value, fallback = {}) {
 
 function classifyApplyError(msg) {
   const m = String(msg || '');
+  if (/account_suspended|is suspended|has been suspended/i.test(m)) {
+    return 'banned';
+  }
   if (
-    /account_suspended|is suspended|no_live_session|session_not_logged_in|not.?logged.?in|login_wall|no_session/i.test(
-      m
-    )
+    /no_live_session|session_not_logged_in|not.?logged.?in|login_wall|no_session/i.test(m)
   ) {
     return 'session_dead';
   }
@@ -240,6 +241,20 @@ async function applyOne(accountId, { withPhoto, dryRun, delayMs }) {
   } catch (err) {
     const msg = err.message || String(err);
     const cls = classifyApplyError(msg);
+
+    if (cls === 'banned') {
+      const organicCommentService = require('../services/organicCommentService');
+      await organicCommentService
+        .markBannedAccount(accountId, `x_persona_live: ${msg}`)
+        .catch(() => {});
+      return {
+        accountId,
+        success: false,
+        error: msg,
+        class: cls,
+        accountMarkedBanned: true,
+      };
+    }
 
     if (cls === 'session_dead') {
       const organicCommentService = require('../services/organicCommentService');

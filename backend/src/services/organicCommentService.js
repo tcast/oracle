@@ -412,12 +412,63 @@ Write only the comment text.`;
     return { accountId, status: 'inactive', failureClass: 'session_dead' };
   }
 
+  /**
+   * Platform-level ban / suspension / deleted profile. Distinct from session_dead
+   * (dead cookies). Matches Reddit mark-banned path: status=banned, free proxy,
+   * disable organic with failure_class=banned.
+   */
+  async markBannedAccount(accountId, reason = 'banned') {
+    const msg = String(reason || 'banned');
+    await pool.query(
+      `UPDATE social_accounts
+       SET status = 'banned',
+           warmup_status = 'failed',
+           credentials = COALESCE(credentials, '{}'::jsonb)
+             || jsonb_build_object(
+                  'banned', true,
+                  'banned_at', NOW()::text,
+                  'banned_reason', $2::text
+                ),
+           updated_at = NOW()
+       WHERE id = $1`,
+      [accountId, msg.slice(0, 500)]
+    );
+    await pool.query(
+      `UPDATE organic_comment_jobs
+       SET enabled = false,
+           status = 'error',
+           failure_class = 'banned',
+           last_error = $2,
+           cooldown_until = NOW() + INTERVAL '365 days',
+           next_due_at = NOW() + INTERVAL '365 days',
+           updated_at = NOW()
+       WHERE social_account_id = $1`,
+      [accountId, msg.slice(0, 1000)]
+    );
+    await pool.query(
+      `UPDATE social_account_proxies
+       SET is_active = false
+       WHERE social_account_id = $1 AND is_active = true`,
+      [accountId]
+    );
+    console.warn(`Account ${accountId} marked banned — ${msg.slice(0, 120)}`);
+    return { accountId, status: 'banned', failureClass: 'banned' };
+  }
+
   async applyFailureQuarantine(job, errorMessage) {
     const failureClass = classifyFailure(errorMessage);
     const consecutive = (job.consecutive_failures || 0) + 1;
     const until = cooldownUntil(failureClass, consecutive);
-    // Terminal: bad password or confirmed dead cookies — disable until replaced
-    const disable = failureClass === 'bad_credentials' || failureClass === 'session_dead';
+    // Terminal: bad password, dead cookies, or platform ban — disable until replaced
+    const disable =
+      failureClass === 'bad_credentials' ||
+      failureClass === 'session_dead' ||
+      failureClass === 'banned';
+
+    if (failureClass === 'banned') {
+      await this.markBannedAccount(job.social_account_id, errorMessage);
+      return { failureClass, consecutive, until, disable: true };
+    }
 
     if (failureClass === 'session_dead') {
       await this.markDeadSessionAccount(job.social_account_id, errorMessage);

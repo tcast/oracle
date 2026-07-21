@@ -26,6 +26,13 @@ function classifyFailure(message = '') {
   ) {
     return 'challenge';
   }
+  // Platform ban / suspension / deleted — terminal, distinct from dead cookies.
+  if (
+    /account_suspended|account is suspended|has been suspended|account.?banned|\bbanned\b/i.test(msg) ||
+    /account doesn.?t exist|does not exist|this account doesn|user not found|deactivated/i.test(msg)
+  ) {
+    return 'banned';
+  }
   // Explicit dead-cookie signals only. Plain "no_live_session" can also come from
   // transient proxy/network flakes during verify, so keep those retryable.
   if (/session_not_logged_in|cookie_session_dead|session_dead/i.test(msg)) {
@@ -51,6 +58,7 @@ function cooldownHoursFor(failureClass, consecutiveFailures = 1) {
   const base = {
     security_block: 48,
     bad_credentials: 72,
+    banned: 8760, // ~1 year — terminal until replaced
     session_dead: 8760, // ~1 year — terminal until replaced
     challenge: 24,
     proxy_error: 6,
