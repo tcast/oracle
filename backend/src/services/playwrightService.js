@@ -577,6 +577,13 @@ class PlaywrightService {
             )
             .catch(() => null);
           await this.humanLikeDelay(1500, 2500);
+          const xBanText = await page.evaluate(() => (document.body?.innerText || '').slice(0, 4000)).catch(() => '');
+          if (/Account suspended|Your account is suspended|is not permitted to perform this action/i.test(xBanText)) {
+            throw new Error('account_suspended: Your account is suspended and is not permitted to perform this action');
+          }
+          if (/This account doesn.?t exist/i.test(xBanText)) {
+            throw new Error('account_does_not_exist: This account doesn\'t exist');
+          }
           const xUser = await page.$(
             '[data-testid="SideNav_AccountSwitcher_Button"], [data-testid="AppTabBar_Home_Link"], [data-testid="BottomBar_Home_Link"], a[href="/home"]'
           );
@@ -645,7 +652,10 @@ class PlaywrightService {
     } catch (error) {
       // Network/proxy failures must not be treated as dead sessions.
       const msg = error?.message || String(error);
-      if (/ERR_TUNNEL|ERR_TIMED_OUT|ERR_PROXY|ERR_CONNECTION|net::ERR_|Timeout/i.test(msg)) {
+      if (
+        /ERR_TUNNEL|ERR_TIMED_OUT|ERR_PROXY|ERR_CONNECTION|net::ERR_|Timeout/i.test(msg) ||
+        /account_suspended|account_does_not_exist/i.test(msg)
+      ) {
         throw error;
       }
       return false;
@@ -699,6 +709,115 @@ class PlaywrightService {
     await this.humanLikeDelay(300, 800);
     await this.randomScroll(page);
     await this.humanLikeDelay(200, 600);
+  }
+
+  /**
+   * Type into an already-focused element with human-ish cadence (not fill()).
+   */
+  async humanTypeInto(el, text, { clear = true } = {}) {
+    if (!el) return false;
+    await el.click({ clickCount: clear ? 3 : 1 }).catch(() => {});
+    await this.humanLikeDelay(200, 500);
+    if (clear) {
+      await el.fill('').catch(() => {});
+      await this.humanLikeDelay(150, 350);
+    }
+    const value = String(text || '');
+    for (let i = 0; i < value.length; i++) {
+      await el.type(value[i], { delay: 0 }).catch(async () => {
+        await el.press(value[i]).catch(() => {});
+      });
+      // Occasional longer pause mid-word / between words
+      const ch = value[i];
+      if (ch === ' ' || ch === '.' || ch === ',') {
+        await this.humanLikeDelay(120, 380);
+      } else if (Math.random() < 0.08) {
+        await this.humanLikeDelay(180, 450);
+      } else {
+        await this.humanLikeDelay(35, 110);
+      }
+    }
+    await this.humanLikeDelay(400, 900);
+    return true;
+  }
+
+  /**
+   * Look like a real X session before any profile edit:
+   * home feed → scroll → pause → maybe open/close a tweet → wander.
+   * Callers must still check suspension after this returns.
+   */
+  async humanBrowseXSession(page, { accountId } = {}) {
+    const tag = accountId ? `#${accountId}` : '';
+    console.log(`X ${tag}: human browse — landing on home feed`);
+
+    const url = page.url() || '';
+    const onHome = /(?:x|twitter)\.com\/home/i.test(url);
+    if (!onHome) {
+      const home =
+        (await page.$('[data-testid="AppTabBar_Home_Link"], a[href="/home"]')) ||
+        (await page.locator('a[aria-label="Home"]').first().elementHandle().catch(() => null));
+      if (home && /(?:x|twitter)\.com/i.test(url)) {
+        await this.randomMouseMove(page);
+        await home.click().catch(() => {});
+        await this.humanLikeDelay(2000, 3500);
+      } else {
+        await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 60000 });
+      }
+    }
+
+    await page
+      .waitForSelector(
+        '[data-testid="primaryColumn"], [aria-label="Home timeline"], [data-testid="tweet"]',
+        { timeout: 25000 }
+      )
+      .catch(() => null);
+    await this.humanLikeDelay(2000, 4000);
+    await this.randomMouseMove(page);
+    await this.humanLikeDelay(800, 1600);
+
+    // Scroll feed like reading
+    const scrolls = this.randomBetween(2, 4);
+    for (let i = 0; i < scrolls; i++) {
+      await this.randomScroll(page);
+      await this.randomMouseMove(page);
+      await this.humanLikeDelay(1200, 2800);
+    }
+
+    // Maybe open a tweet in the timeline, read, go back
+    if (Math.random() < 0.7) {
+      const tweet = await page
+        .locator('article[data-testid="tweet"]')
+        .nth(this.randomBetween(0, 2))
+        .elementHandle()
+        .catch(() => null);
+      if (tweet) {
+        console.log(`X ${tag}: opening a tweet casually`);
+        await this.randomMouseMove(page);
+        await tweet.click().catch(() => {});
+        await this.humanLikeDelay(2500, 5000);
+        await this.randomScroll(page);
+        await this.humanLikeDelay(1500, 3000);
+        const back =
+          (await page.$('[data-testid="app-bar-back"], [aria-label="Back"]')) ||
+          (await page.locator('button[aria-label="Back"]').first().elementHandle().catch(() => null));
+        if (back) {
+          await back.click().catch(() => {});
+        } else {
+          await page.goBack().catch(() => {});
+        }
+        await this.humanLikeDelay(1500, 3000);
+        await page
+          .waitForSelector('[data-testid="primaryColumn"], [aria-label="Home timeline"]', {
+            timeout: 15000,
+          })
+          .catch(() => null);
+      }
+    }
+
+    // One more idle wander on feed
+    await this.simulateHumanBehavior(page);
+    await this.humanLikeDelay(1500, 3500);
+    console.log(`X ${tag}: human browse done (url=${page.url()})`);
   }
 
   async redditLogin(page, username, password) {
@@ -3260,25 +3379,37 @@ class PlaywrightService {
       if (value == null || value === '') return false;
       const el = await page.waitForSelector(setupField, { timeout: 8000 }).catch(() => null);
       if (!el) return false;
-      await el.click({ clickCount: 3 }).catch(() => {});
-      await el.fill('').catch(() => {});
-      await el.type(String(value).slice(0, maxLen), { delay: 18 });
-      await this.humanLikeDelay(400, 800);
-      return true;
+      await this.randomMouseMove(page);
+      await this.humanLikeDelay(600, 1400);
+      return this.humanTypeInto(el, String(value).slice(0, maxLen), { clear: true });
     };
 
     let nameAttempted = false;
     let bioAttempted = false;
     let photoAttempted = false;
 
-    // Direct /settings/profile and /{user} often hang on spinner — use home → Profile click.
-    console.log(`X persona ${tag}: opening profile via sidebar`);
-    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForSelector('[data-testid="AppTabBar_Profile_Link"]', { timeout: 30000 });
-    await this.humanLikeDelay(1500, 2500);
-    await page.click('[data-testid="AppTabBar_Profile_Link"]');
-    await this.humanLikeDelay(3000, 4500);
+    // Prefer sidebar navigation from an already-warmed feed session (no URL teleport).
+    console.log(`X persona ${tag}: opening own profile via sidebar (human path)`);
+    if (!/x\.com|twitter\.com/i.test(page.url() || '')) {
+      await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await this.humanLikeDelay(2000, 3500);
+    }
+    await this.randomMouseMove(page);
+    await this.humanLikeDelay(800, 1600);
+    const profileLink =
+      (await page.$('[data-testid="AppTabBar_Profile_Link"]')) ||
+      (await page.locator('a[aria-label="Profile"]').first().elementHandle().catch(() => null));
+    if (!profileLink) {
+      await page.waitForSelector('[data-testid="AppTabBar_Profile_Link"]', { timeout: 30000 });
+    }
+    const profileEl = profileLink || (await page.$('[data-testid="AppTabBar_Profile_Link"]'));
+    if (!profileEl) throw new Error('X Profile sidebar link not found');
+    await this.randomMouseMove(page);
+    await profileEl.click();
+    await this.humanLikeDelay(3500, 6000);
+    await this.simulateHumanBehavior(page);
     await this.assertXProfileActionAllowed(page, { accountId });
+    await this.humanLikeDelay(1200, 2400);
     await page.waitForSelector(editBtnSel, { timeout: 45000 }).catch(() => null);
 
     let editBtn =
@@ -3389,8 +3520,7 @@ class PlaywrightService {
           if (nameEl) {
             await nameEl.click({ clickCount: 3 }).catch(() => {});
             await nameEl.fill('');
-            await nameEl.type(persona.display_name.slice(0, 50), { delay: 18 });
-            await this.humanLikeDelay(300, 600);
+            await this.humanTypeInto(nameEl, persona.display_name.slice(0, 50), { clear: true });
             nameAttempted = true;
             await clickTextButton('Save');
             await this.assertXProfileActionAllowed(page, { accountId });
@@ -3414,11 +3544,14 @@ class PlaywrightService {
         if (!el) continue;
         const visible = await el.isVisible().catch(() => false);
         if (!visible) continue;
-        await el.click({ clickCount: 3 }).catch(() => {});
-        await el.fill('');
-        await el.type(String(value).slice(0, label === 'bio' ? 160 : 50), { delay: 18 });
-        await this.humanLikeDelay(300, 700);
-        return true;
+        await this.randomMouseMove(page);
+        await this.humanLikeDelay(700, 1600);
+        const ok = await this.humanTypeInto(
+          el,
+          String(value).slice(0, label === 'bio' ? 160 : 50),
+          { clear: true }
+        );
+        if (ok) return true;
       }
       console.warn(`X persona ${tag}: could not fill ${label}`);
       return false;
@@ -3475,6 +3608,8 @@ class PlaywrightService {
       }
     }
 
+    await this.humanLikeDelay(1200, 2500);
+    await this.randomMouseMove(page);
     const save =
       (await page.$('[data-testid="settingsDetailSave"]')) ||
       (await page.$('[data-testid="Profile_Save_Button"]')) ||
@@ -3483,8 +3618,9 @@ class PlaywrightService {
       await page.screenshot({ path: `/tmp/x-persona-nosave-${accountId || 'x'}.png` }).catch(() => {});
       throw new Error('X profile Save button not found');
     }
+    await this.humanLikeDelay(800, 1800);
     await save.click();
-    await this.humanLikeDelay(2500, 4000);
+    await this.humanLikeDelay(3000, 5500);
     await this.assertXProfileActionAllowed(page, { accountId });
     await page.screenshot({ path: `/tmp/x-persona-saved-${accountId || 'x'}.png` }).catch(() => {});
     console.log(
@@ -3606,6 +3742,10 @@ class PlaywrightService {
         { allowLogin: false, totpSecret: creds.totp_secret }
       );
       if (!loggedIn) throw new Error(`no_live_session for x/${account.username}`);
+
+      // Act like a person: feed first, then ban check, then profile edit.
+      await this.humanBrowseXSession(page, { accountId });
+      await this.assertXProfileActionAllowed(page, { accountId });
 
       const personaResult = await this.updateXPersona(page, persona, {
         accountId,

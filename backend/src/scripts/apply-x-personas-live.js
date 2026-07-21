@@ -62,7 +62,11 @@ function parseJson(value, fallback = {}) {
 
 function classifyApplyError(msg) {
   const m = String(msg || '');
-  if (/account_suspended|is suspended|has been suspended/i.test(m)) {
+  if (
+    /account_suspended|is suspended|has been suspended|doesn.?t exist|account_does_not_exist|x_profile_error|Oops,?\s*something went wrong/i.test(
+      m
+    )
+  ) {
     return 'banned';
   }
   if (
@@ -73,10 +77,10 @@ function classifyApplyError(msg) {
   if (/x_persona_verify_failed/i.test(m)) {
     return 'verify_failed';
   }
-  if (/rate.?limit|try again later|something went wrong|x_profile_error/i.test(m)) {
+  if (/rate.?limit|try again later/i.test(m)) {
     return 'rate_limit';
   }
-  if (/proxy|oxylabs|ECONNREFUSED|ETIMEDOUT|tunnel|ERR_PROXY/i.test(m)) {
+  if (/proxy|oxylabs|ECONNREFUSED|ETIMEDOUT|tunnel|ERR_PROXY|ERR_TUNNEL/i.test(m)) {
     return 'proxy_error';
   }
   if (/challenge|unusual activity|verify you/i.test(m)) {
