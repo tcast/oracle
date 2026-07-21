@@ -562,33 +562,33 @@ class AccountCreationService {
   }
 
   async clickRedditSignupMethod(page, method) {
-    const phoneRe = /continue with phone|phone number|^phone$/i;
-    const emailRe = /continue with email|^email$/i;
-    const label = method === 'phone' ? phoneRe : emailRe;
-    // Prefer the full Reddit CTA labels seen on /register
     const preferredTexts =
       method === 'phone'
         ? ['Continue with Phone Number', 'Continue with Phone', 'Phone']
         : ['Continue with Email', 'Email'];
 
     for (const exact of preferredTexts) {
-      const choice =
-        (await page.$(`button:has-text("${exact}")`)) ||
-        (await page.$(`a:has-text("${exact}")`)) ||
-        (await page.getByRole('button', { name: exact }).elementHandle().catch(() => null));
-      if (choice) {
-        await choice.click().catch(() => {});
-        await this.humanLikeDelay(1000, 2000);
-        return true;
+      // Reddit uses <auth-flow-link> (shadow) rather than <button> for phone/email CTAs
+      const candidates = [
+        page.locator('auth-flow-link').filter({ hasText: exact }).first(),
+        page.getByText(exact, { exact: false }).first(),
+        page.locator(`button:has-text("${exact}")`).first(),
+        page.locator(`a:has-text("${exact}")`).first(),
+      ];
+      for (const loc of candidates) {
+        if (await loc.isVisible().catch(() => false)) {
+          await loc.click({ timeout: 10000 }).catch(async () => {
+            await loc.click({ force: true }).catch(() => {});
+          });
+          await this.humanLikeDelay(1000, 2000);
+          return true;
+        }
       }
     }
 
-    const byRole = await page
-      .getByRole('button', { name: label })
-      .first()
-      .elementHandle()
-      .catch(() => null);
-    if (byRole) {
+    const label = method === 'phone' ? /continue with phone|phone number/i : /continue with email|^email$/i;
+    const byRole = page.getByRole('button', { name: label }).first();
+    if (await byRole.isVisible().catch(() => false)) {
       await byRole.click().catch(() => {});
       await this.humanLikeDelay(1000, 2000);
       return true;
