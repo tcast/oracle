@@ -305,12 +305,27 @@ class AccountCreationService {
   }
 
   async humanLikeTyping(page, selector, text) {
-    await page.click(selector);
+    const loc = page.locator(selector).first();
+    await loc.waitFor({ state: 'visible', timeout: 15000 }).catch(() => {});
+    await loc.click({ timeout: 10000 }).catch(async () => {
+      await page.click(selector, { timeout: 5000 });
+    });
     await this.humanLikeDelay(200, 500);
+    // Clear without locator.fill — faceplate shadow inputs reject fill()
+    await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A');
+    await page.keyboard.press('Backspace');
     for (const char of text) {
       await page.keyboard.type(char);
-      await this.humanLikeDelay(50, 200);
+      await this.humanLikeDelay(40, 120);
     }
+  }
+
+  async typeIntoLocator(page, locator, text) {
+    await locator.click({ timeout: 10000 });
+    await this.humanLikeDelay(200, 500);
+    await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A');
+    await page.keyboard.press('Backspace');
+    await page.keyboard.type(text, { delay: 55 });
   }
 
   async extractCaptchaSiteKey(page) {
@@ -370,8 +385,7 @@ class AccountCreationService {
 
   /**
    * Claim one unassigned active email from the pool.
-   * Prefer parked catchall domains Reddit has already delivered to (e.g. bashed.net),
-   * then other parked catchalls, then @proteusmail.net, then Yahoo/MS backup.
+   * Prefer Yahoo (web OTP works), then proven parked catchalls, then other catchalls/MS/GMX.
    */
   async claimEmailFromPool(opts = {}) {
     const result = await pool.query(
@@ -393,15 +407,15 @@ class AccountCreationService {
          )
        ORDER BY
          CASE
+           WHEN ea.provider = 'yahoo' THEN 0
            -- Domains with proven Reddit SMTP delivery into the Hetzner pool inbox
            WHEN ea.provider = 'catchall'
              AND lower(split_part(ea.email, '@', 2)) IN (
                'bashed.net', 'faregiant.com', 'retain360.io', 'uspunk.com', 'usgeek.com'
-             ) THEN 0
+             ) THEN 1
            WHEN ea.provider = 'catchall'
-             AND lower(split_part(ea.email, '@', 2)) <> 'proteusmail.net' THEN 1
-           WHEN ea.provider = 'catchall' THEN 2
-           WHEN ea.provider = 'yahoo' THEN 3
+             AND lower(split_part(ea.email, '@', 2)) <> 'proteusmail.net' THEN 2
+           WHEN ea.provider = 'catchall' THEN 3
            WHEN ea.provider IN ('outlook', 'hotmail', 'live') THEN 4
            WHEN ea.provider = 'gmx' THEN 5
            ELSE 6
@@ -445,9 +459,9 @@ class AccountCreationService {
       return proxy_id;
     }
 
-    // Prefer ProxyBase for Reddit *signup* (BrightData ISP currently network-blocked on /register),
-    // then BrightData isp_proxy3, then other US proxies. Never two Reddit accounts on same proxy.
-    // Skip cooled / degraded / unhealthy — do not burn proxies.
+    // Prefer proxies that recently loaded Reddit successfully, then healthy ProxyBase
+    // (BrightData ISP is currently network-blocked on /register). Never two Reddit
+    // accounts on same proxy. Skip cooled / degraded / unhealthy.
     const pick = await pool.query(
       `SELECT p.id FROM proxies p
        WHERE p.is_active = true
@@ -462,20 +476,23 @@ class AccountCreationService {
          )
        ORDER BY
          CASE
-           WHEN p.provider ILIKE '%proxybase%' THEN 0
-           WHEN p.provider ILIKE '%brightdata%' THEN 1
-           ELSE 2
-         END,
-         CASE
-           WHEN COALESCE(p.metadata->>'zone', '') = 'isp_proxy3' THEN 0
-           WHEN COALESCE(p.metadata->>'zone', '') = 'isp_proxy4' THEN 2
-           ELSE 1
+           WHEN p.last_success_at IS NOT NULL
+             AND p.last_success_at > NOW() - INTERVAL '2 hours'
+             AND COALESCE(p.last_error, '') NOT ILIKE '%network_security%'
+             THEN 0
+           WHEN p.provider ILIKE '%proxybase%'
+             AND p.name ILIKE '%residential%' THEN 1
+           WHEN p.provider ILIKE '%proxybase%' THEN 2
+           WHEN p.provider ILIKE '%brightdata%'
+             AND COALESCE(p.metadata->>'zone', '') IN ('isp_proxy3', 'isp_proxy4') THEN 3
+           ELSE 4
          END,
          CASE WHEN EXISTS (
            SELECT 1 FROM social_account_proxies sap
            WHERE sap.proxy_id = p.id AND sap.is_active = true
          ) THEN 1 ELSE 0 END,
          p.failure_count ASC NULLS FIRST,
+         p.last_used_at ASC NULLS FIRST,
          p.id
        LIMIT 1`
     );
@@ -541,9 +558,7 @@ class AccountCreationService {
         );
       }
 
-      await emailLocator.click({ clickCount: 3 }).catch(() => {});
-      await emailLocator.fill('');
-      await emailLocator.type(email, { delay: 60 });
+      await this.typeIntoLocator(page, emailLocator, email);
       await this.humanLikeDelay();
 
       const continueBtn = await page.$(
@@ -554,10 +569,18 @@ class AccountCreationService {
         await this.humanLikeDelay(1000, 2000);
       }
 
-      // Optional email verification code step
-      const codeInput = await page.$(
-        'input[name="code"], input[autocomplete="one-time-code"], input[placeholder*="code" i]'
+      // Optional email verification code step — require verify-page copy to avoid false positives
+      const pageTextEarly = await page
+        .evaluate(() => (document.body?.innerText || '').slice(0, 600))
+        .catch(() => '');
+      const onVerifyPage = /verify your email|verification code|6-digit code|enter the code/i.test(
+        pageTextEarly
       );
+      const codeInput = onVerifyPage
+        ? await page.$(
+            'input[name="code"], input[autocomplete="one-time-code"], input[placeholder*="code" i]'
+          )
+        : null;
       if (codeInput && emailAccount) {
         const pageHint = await page
           .evaluate(() => (document.body?.innerText || '').slice(0, 400))
@@ -567,25 +590,27 @@ class AccountCreationService {
         );
         const verifyStartedAt = new Date(Date.now() - 90_000);
         let verified = null;
-        // Reddit → catchall SMTP can take 3–6+ minutes (seen on bashed.net).
-        const pollDeadline = Date.now() + 420000;
+        const isCatchall = String(emailAccount.provider || '').toLowerCase() === 'catchall';
+        // Yahoo/web: allow ~4 min. Catchall: abort at 75s if Reddit never SMTP'd (don't burn 7 min).
+        const pollDeadline = Date.now() + (isCatchall ? 75000 : 240000);
         let resentAt = 0;
-        let firstResendAfter = Date.now() + 120000;
+        let firstResendAfter = Date.now() + (isCatchall ? 45000 : 90000);
         while (Date.now() < pollDeadline) {
           try {
             verified = await emailInboxService.pollForVerification(emailAccount, {
-              timeoutMs: Math.min(60000, pollDeadline - Date.now()),
-              intervalMs: 5000,
+              timeoutMs: Math.min(isCatchall ? 25000 : 70000, pollDeadline - Date.now()),
+              intervalMs: 8000,
               limit: 50,
               fromIncludes: 'reddit',
               afterDate: verifyStartedAt,
+              searchQuery: 'reddit',
             });
             if (verified?.code) break;
           } catch (pollErr) {
             const msg = pollErr.message || String(pollErr);
             console.warn(`Reddit verify poll wait: ${msg.slice(0, 180)}`);
           }
-          if (Date.now() >= firstResendAfter && (!resentAt || Date.now() - resentAt > 120000)) {
+          if (Date.now() >= firstResendAfter && (!resentAt || Date.now() - resentAt > 90000)) {
             const resend =
               (await page.$('button:has-text("Resend"), button:has-text("Send again"), a:has-text("Resend")')) ||
               (await page.getByText(/resend|send again|didn.?t get/i).first().elementHandle().catch(() => null));
@@ -599,7 +624,7 @@ class AccountCreationService {
         }
         if (!verified?.code) {
           throw new Error(
-            `Verification email not received within 420000ms for ${emailAccount.email}`
+            `Verification email not received within ${isCatchall ? 75000 : 240000}ms for ${emailAccount.email}`
           );
         }
         await this.humanLikeTyping(
@@ -640,17 +665,23 @@ class AccountCreationService {
         await this.humanLikeDelay(1500, 3000);
       }
 
-      const userField =
-        (await page.$('input[name="username"]')) || (await page.$('#regUsername'));
-      const passField =
-        (await page.$('input[name="password"]')) || (await page.$('#regPassword'));
+      const userField = page
+        .locator(
+          'faceplate-text-input[name="username"] input, input[name="username"], #regUsername'
+        )
+        .first();
+      const passField = page
+        .locator(
+          'faceplate-text-input[name="password"] input, input[name="password"], #regPassword'
+        )
+        .first();
 
-      if (userField) {
-        await this.humanLikeTyping(page, 'input[name="username"], #regUsername', username);
+      if (await userField.isVisible().catch(() => false)) {
+        await this.typeIntoLocator(page, userField, username);
         await this.humanLikeDelay();
       }
-      if (passField) {
-        await this.humanLikeTyping(page, 'input[name="password"], #regPassword', password);
+      if (await passField.isVisible().catch(() => false)) {
+        await this.typeIntoLocator(page, passField, password);
         await this.humanLikeDelay();
       }
 
@@ -886,11 +917,11 @@ class AccountCreationService {
         const password = generatePassword(14);
         step.username = username;
 
-        // At most 3 proxy tries — rotate on network blocks and tunnel/timeout flakes.
+        // At most 5 proxy tries — ISP first; rotate on network blocks and tunnel/timeout flakes.
         let proxyId = null;
         let created = null;
         let lastErr = null;
-        for (let attempt = 1; attempt <= 3; attempt++) {
+        for (let attempt = 1; attempt <= 5; attempt++) {
           proxyId = await this.claimProxyForNewAccount();
           step.proxyId = proxyId;
           if (!proxyId) {
@@ -935,15 +966,15 @@ class AccountCreationService {
                 });
                 console.warn(
                   `Reddit create: proxy ${proxyId} network-blocked — ` +
-                    `${cool.action === 'cooldown' ? 'cooled 6h' : cool.action}, retry ${attempt}/3`
+                    `${cool.action === 'cooldown' ? 'cooled 6h' : cool.action}, retry ${attempt}/5`
                 );
               } else if (proxyFlake) {
                 console.warn(
-                  `Reddit create: proxy ${proxyId} flake (${msg.slice(0, 80)}) — retry ${attempt}/3`
+                  `Reddit create: proxy ${proxyId} flake (${msg.slice(0, 80)}) — retry ${attempt}/5`
                 );
               }
             }
-            if (!(netBlocked || proxyFlake) || attempt === 3) throw err;
+            if (!(netBlocked || proxyFlake) || attempt === 5) throw err;
           }
         }
         if (!created) throw lastErr || new Error('Reddit create failed');

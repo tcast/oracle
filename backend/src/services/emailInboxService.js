@@ -260,8 +260,9 @@ class EmailInboxService {
 
   /**
    * Yahoo webmail fallback when IMAP auth fails (common on freshly minted accounts).
+   * Always prefer a US residential proxy — bare datacenter IPs hang/challenge on Yahoo login.
    */
-  async fetchViaYahooWeb(account, { limit = 10, timeoutMs = 120000, searchQuery = null } = {}) {
+  async fetchViaYahooWeb(account, { limit = 10, timeoutMs = 90000, searchQuery = null, proxyConfig = null } = {}) {
     let browser;
     const run = async () => {
       const executablePath =
@@ -269,21 +270,68 @@ class EmailInboxService {
         process.env.CHROMIUM_PATH ||
         undefined;
 
+      let proxy = proxyConfig || null;
+      if (!proxy) {
+        try {
+          const proxyService = require('./proxyService');
+          const { rows } = await pool.query(
+            `SELECT * FROM proxies
+             WHERE is_active = true AND country = 'US'
+               AND (cooldown_until IS NULL OR cooldown_until <= NOW())
+               AND COALESCE(consecutive_failures, 0) < 3
+               AND (
+                 id = ANY($1::int[])
+                 OR (provider ILIKE '%proxybase%' AND name ILIKE '%residential%')
+                 OR provider ILIKE '%brightdata%'
+               )
+             ORDER BY
+               CASE WHEN id = ANY($1::int[]) THEN 0 ELSE 1 END,
+               CASE WHEN provider ILIKE '%proxybase%' AND name ILIKE '%residential%' THEN 0 ELSE 1 END,
+               last_success_at DESC NULLS LAST,
+               id
+             LIMIT 1`,
+            [[90, 104, 181, 136, 122, 161]]
+          );
+          if (rows[0]) {
+            proxy = proxyService.formatProxyConfig(rows[0]);
+            console.log(
+              `Yahoo web: using proxy ${rows[0].id} (${rows[0].name || rows[0].provider})`
+            );
+          }
+        } catch (proxyErr) {
+          console.warn(`Yahoo web proxy pick failed: ${proxyErr.message}`);
+        }
+      }
+
       browser = await chromium.launch({
         headless: true,
         executablePath,
-        args: ['--disable-blink-features=AutomationControlled'],
+        args: [
+          '--disable-blink-features=AutomationControlled',
+          '--no-sandbox',
+          '--disable-dev-shm-usage',
+        ],
       });
 
-      const context = await browser.newContext({
+      const contextOpts = {
         viewport: { width: 1280, height: 900 },
         userAgent:
           'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         locale: 'en-US',
-      });
+      };
+      if (proxy?.server) {
+        contextOpts.proxy = {
+          server: proxy.server,
+          username: proxy.username || undefined,
+          password: proxy.password || undefined,
+        };
+      }
+
+      const context = await browser.newContext(contextOpts);
       const page = await context.newPage();
       page.setDefaultTimeout(25000);
 
+      console.log(`Yahoo web: opening login for ${account.email}`);
       await page.goto('https://login.yahoo.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
       await page.waitForSelector('#login-username, input[name="username"]', { timeout: 25000 });
       await page.fill('#login-username, input[name="username"]', account.email);
@@ -347,56 +395,96 @@ class EmailInboxService {
       await page.waitForTimeout(3500);
 
       // Search is best-effort — #mail-search is often a clickable div, not an input.
-      const q = searchQuery || 'reddit';
-      try {
-        const searchBox = page.locator('#mail-search, [data-test-id="search-input"], button[aria-label*="Search" i]').first();
-        if (await searchBox.isVisible().catch(() => false)) {
-          await searchBox.click({ timeout: 5000 }).catch(() => {});
-          await page.waitForTimeout(800);
+      // If search finds nothing, fall back to plain inbox scrape.
+      const q = searchQuery || null;
+      let searched = false;
+      if (q) {
+        try {
+          const searchBox = page.locator('#mail-search, [data-test-id="search-input"], button[aria-label*="Search" i]').first();
+          if (await searchBox.isVisible().catch(() => false)) {
+            await searchBox.click({ timeout: 5000 }).catch(() => {});
+            await page.waitForTimeout(800);
+          }
+          const searchInput = page
+            .locator(
+              'input[placeholder*="Search" i], input[aria-label*="Search" i], input[name="q"], input[data-test-id="search-input"], #mail-search input'
+            )
+            .first();
+          if (await searchInput.isVisible().catch(() => false)) {
+            await searchInput.fill(String(q));
+            await page.keyboard.press('Enter');
+            await page.waitForTimeout(3500);
+            searched = true;
+          }
+        } catch (searchErr) {
+          console.warn(`Yahoo web search skipped: ${searchErr.message}`);
         }
-        const searchInput = page
-          .locator(
-            'input[placeholder*="Search" i], input[aria-label*="Search" i], input[name="q"], input[data-test-id="search-input"], #mail-search input'
-          )
-          .first();
-        if (await searchInput.isVisible().catch(() => false)) {
-          await searchInput.fill(String(q));
-          await page.keyboard.press('Enter');
-          await page.waitForTimeout(3500);
-        }
-      } catch (searchErr) {
-        console.warn(`Yahoo web search skipped: ${searchErr.message}`);
       }
 
-      const rows = await page.evaluate((max) => {
-        const items = [];
-        const nodes = [
-          ...document.querySelectorAll(
-            '[data-test-id="message-list-item"], [role="option"], li[data-test-id], div[data-test-id="message-list"] li, a[data-test-id="message-item"]'
-          ),
-        ];
-        for (const n of nodes) {
-          const label = (n.getAttribute('aria-label') || n.innerText || '')
-            .replace(/\s+/g, ' ')
-            .trim();
-          if (label.length < 8) continue;
-          if (!/reddit|verify|code|password|confirm|@/i.test(label) && items.length > 2) continue;
-          items.push({ preview: label.slice(0, 500), index: items.length });
-          if (items.length >= max) break;
-        }
-        // Fallback: any visible list-ish rows mentioning reddit
-        if (!items.length) {
-          const blob = (document.body?.innerText || '').slice(0, 12000);
-          const lines = blob
-            .split('\n')
-            .map((l) => l.replace(/\s+/g, ' ').trim())
-            .filter((l) => l.length > 12 && /reddit/i.test(l));
-          for (const line of lines.slice(0, max)) {
-            items.push({ preview: line.slice(0, 500), index: items.length });
+      const emptySearch = await page
+        .evaluate(() => /no messages matched|couldn't find|0 results/i.test(document.body?.innerText || ''))
+        .catch(() => false);
+      if (searched && emptySearch) {
+        console.log('Yahoo web: search empty — loading inbox');
+        await page.goto('https://mail.yahoo.com/d/folders/1', {
+          waitUntil: 'domcontentloaded',
+          timeout: 60000,
+        }).catch(() => {});
+        await page.waitForTimeout(3500);
+      }
+
+      // Also try spam if inbox looks empty of reddit
+      const grabRows = async () =>
+        page.evaluate((max) => {
+          const items = [];
+          const nodes = [
+            ...document.querySelectorAll(
+              '[data-test-id="message-list-item"], [role="option"], li[data-test-id], div[data-test-id="message-list"] li, a[data-test-id="message-item"], [data-test-id="virtual-list"] > div'
+            ),
+          ];
+          for (const n of nodes) {
+            const label = (n.getAttribute('aria-label') || n.innerText || '')
+              .replace(/\s+/g, ' ')
+              .trim();
+            if (label.length < 8) continue;
+            items.push({ preview: label.slice(0, 500), index: items.length });
+            if (items.length >= max) break;
           }
+          if (!items.length) {
+            const blob = (document.body?.innerText || '').slice(0, 16000);
+            const lines = blob
+              .split('\n')
+              .map((l) => l.replace(/\s+/g, ' ').trim())
+              .filter((l) => l.length > 18);
+            for (const line of lines.slice(0, max)) {
+              items.push({ preview: line.slice(0, 500), index: items.length });
+            }
+          }
+          return items;
+        }, limit);
+
+      let rows = await grabRows();
+      const hasReddit = rows.some((r) => /reddit|verify your email|noreply/i.test(r.preview || ''));
+      if (!hasReddit) {
+        console.log('Yahoo web: no reddit in inbox list — trying Bulk/Spam');
+        for (const folder of ['6', '3', '2']) {
+          await page.goto(`https://mail.yahoo.com/d/folders/${folder}`, {
+            waitUntil: 'domcontentloaded',
+            timeout: 45000,
+          }).catch(() => {});
+          await page.waitForTimeout(2500);
+          const more = await grabRows();
+          if (more.some((r) => /reddit|verify your email|noreply/i.test(r.preview || ''))) {
+            rows = more;
+            break;
+          }
+          if (more.length > rows.length) rows = more;
         }
-        return items;
-      }, limit);
+      }
+
+      console.log(
+        `Yahoo web: scraped ${rows.length} rows; redditHits=${rows.filter((r) => /reddit/i.test(r.preview || '')).length}`
+      );
 
       let openedBody = null;
       let openIdx = rows.findIndex((r) => /reddit|verify|code|confirm/i.test(r.preview || ''));
