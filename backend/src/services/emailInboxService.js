@@ -633,9 +633,101 @@ class EmailInboxService {
       const rowLooksLikeReddit = (r) =>
         /reddit|redditmail|noreply/i.test(r?.preview || '') || rowLooksLikeReset(r);
 
+      const openCandidatesInView = async (candidateRows) => {
+        const openOrder = candidateRows
+          .map((r, idx) => ({ r, idx }))
+          .sort((a, b) => {
+            const score = (row) =>
+              (rowLooksLikeReset(row) ? 5 : 0) + (rowLooksLikeReddit(row) ? 2 : 0);
+            return score(b.r) - score(a.r);
+          })
+          .slice(0, 6);
+
+        const openedByIdx = {};
+        for (const { r, idx } of openOrder) {
+          const targetPreview = r?.preview || '';
+          const clicked = await page.evaluate((want) => {
+            const reject =
+              /^(File|Home|View|Help|New mail|Delete|Archive|Report|Reading Pane|Read \/ Unread)/i;
+            const nodes = [
+              ...document.querySelectorAll(
+                '[role="option"], [role="row"], div[data-convid], div[aria-label*="Unread" i]'
+              ),
+            ];
+            const needle = String(want || '').slice(0, 48);
+            let target = null;
+            for (const n of nodes) {
+              const label = (n.getAttribute('aria-label') || n.innerText || '')
+                .replace(/\s+/g, ' ')
+                .trim();
+              if (label.length < 10 || reject.test(label)) continue;
+              if (needle && label.includes(needle)) {
+                target = n;
+                break;
+              }
+              if (!target) target = n;
+            }
+            if (!target) return false;
+            target.scrollIntoView?.({ block: 'center' });
+            target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            return true;
+          }, targetPreview).catch(() => false);
+
+          if (!clicked) continue;
+          await page.waitForTimeout(3000);
+          const openedBody = await page.evaluate(() => {
+            const reading = document.querySelector(
+              '[role="main"], [aria-label*="Reading Pane"], .ReadingPaneContents, #ReadingPaneContainerId'
+            );
+            const root = reading || document.body;
+            const text = (root?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 12000);
+            const hrefs = [...root.querySelectorAll('a[href]')]
+              .map((a) => a.href)
+              .filter((h) => /^https?:/i.test(h))
+              .slice(0, 60);
+            return { text, hrefs };
+          }).catch(() => null);
+          if (!openedBody) continue;
+          openedByIdx[idx] = openedBody;
+          const blob = `${targetPreview} ${openedBody.text || ''} ${(openedBody.hrefs || []).join(' ')}`;
+          if (/reddit\.com/i.test(blob) && /password|reset|recover|change/i.test(blob)) {
+            break;
+          }
+        }
+
+        return candidateRows.map((row, idx) => {
+          const preview = row.preview || '';
+          const openedBody = openedByIdx[idx];
+          const body = openedBody ? `${preview} ${openedBody.text || ''}` : preview;
+          const urls = [
+            ...extractUrls(body),
+            ...(openedBody?.hrefs || []),
+          ].filter((u, i, arr) => arr.indexOf(u) === i);
+          const codes = extractCodes(body);
+          const fromReddit = /reddit|redditmail|noreply/i.test(preview + body);
+          return {
+            uid: `web-${idx}`,
+            subject: preview.slice(0, 160),
+            from: fromReddit ? ['reddit'] : [],
+            date: null,
+            codes,
+            verifyLinks: pickVerificationLinks(urls),
+            urls,
+            preview: body.slice(0, 600),
+            source: 'outlook_web',
+            opened: !!openedBody,
+          };
+        });
+      };
+
+      const hasResetLink = (msgs) =>
+        (msgs || []).some((m) =>
+          (m.urls || m.verifyLinks || []).some((u) =>
+            /reddit\.com/i.test(u) && /password|reset|recover|change|account/i.test(u)
+          )
+        );
+
       // Keep this tight — outer Promise.race kills the browser at timeoutMs.
-      // Rotate query across poll attempts via searchQuery; within one visit do
-      // list → Other → 1–2 searches → junk list.
       const searchQueries = [
         ...(searchQuery ? [String(searchQuery)] : ['from:reddit']),
         'reddit password',
@@ -646,8 +738,7 @@ class EmailInboxService {
         'https://outlook.live.com/mail/0/junkemail',
       ];
 
-      let rows = [];
-      let bestRows = [];
+      let messages = [];
       let diagnostics = [];
 
       for (const folderUrl of folders) {
@@ -657,7 +748,6 @@ class EmailInboxService {
           .waitForSelector('[role="option"], [role="row"], div[data-convid]', { timeout: 12000 })
           .catch(() => {});
 
-        // Focused → Other (seller Hotmail often parks Reddit in Other).
         for (const pass of ['primary', 'other']) {
           if (pass === 'other') {
             if (!/mail\/0\/?$/i.test(folderUrl) && !/\/inbox/i.test(folderUrl)) break;
@@ -665,7 +755,7 @@ class EmailInboxService {
             if (!switched) continue;
           }
 
-          rows = await collectRows(limit);
+          let rows = await collectRows(limit);
           diagnostics.push({
             folderUrl,
             pass,
@@ -673,14 +763,21 @@ class EmailInboxService {
             count: rows.length,
             sample: rows.slice(0, 2).map((r) => (r.preview || '').slice(0, 80)),
           });
-          if (rows.some(rowLooksLikeReset)) {
-            bestRows = rows;
-            break;
-          }
-          if (rows.some(rowLooksLikeReddit) && bestRows.length === 0) bestRows = rows;
-          if (rows.length && bestRows.length === 0) bestRows = rows;
 
-          // Searches only on inbox primary pass — junk is usually small enough to list.
+          if (rows.length) {
+            // Open while this folder view is still on screen (navigating away loses the DOM).
+            const opened = await openCandidatesInView(rows);
+            if (opened.some((m) => m.opened) || opened.length >= messages.length) {
+              messages = opened;
+            }
+            if (hasResetLink(opened) || opened.some((m) => rowLooksLikeReset({ preview: m.subject }))) {
+              if (hasResetLink(opened)) {
+                messages = opened;
+                break;
+              }
+            }
+          }
+
           if (pass === 'primary' && /mail\/0\/?$/i.test(folderUrl)) {
             for (const q of searchQueries) {
               await runSearch(q);
@@ -692,24 +789,22 @@ class EmailInboxService {
                 count: rows.length,
                 sample: rows.slice(0, 2).map((r) => (r.preview || '').slice(0, 80)),
               });
-              if (rows.some(rowLooksLikeReset)) {
-                bestRows = rows;
-                break;
-              }
-              if (rows.some(rowLooksLikeReddit) && !bestRows.some(rowLooksLikeReddit)) {
-                bestRows = rows;
+              if (rows.length) {
+                const opened = await openCandidatesInView(rows);
+                if (hasResetLink(opened) || opened.some((m) => m.opened)) {
+                  messages = opened;
+                }
+                if (hasResetLink(opened)) break;
               }
               await clearSearch(folderUrl);
             }
           }
-          if (bestRows.some(rowLooksLikeReset)) break;
+          if (hasResetLink(messages)) break;
         }
-        if (bestRows.some(rowLooksLikeReset)) break;
+        if (hasResetLink(messages)) break;
       }
 
-      rows = bestRows.length ? bestRows : rows;
-
-      if (!rows.length) {
+      if (!messages.length) {
         console.warn(
           `Outlook web scrape found 0 rows for ${account.email}:`,
           JSON.stringify({
@@ -719,97 +814,14 @@ class EmailInboxService {
         );
       }
 
-      // Open several candidates until we extract a reddit.com reset/verify link.
-      const openOrder = rows
-        .map((r, idx) => ({ r, idx }))
-        .sort((a, b) => {
-          const score = (row) =>
-            (rowLooksLikeReset(row) ? 5 : 0) + (rowLooksLikeReddit(row) ? 2 : 0);
-          return score(b.r) - score(a.r);
-        })
-        .slice(0, 5);
-
-      const openedByIdx = {};
-      for (const { r, idx } of openOrder) {
-        const targetPreview = r?.preview || '';
-        const clicked = await page.evaluate((want) => {
-          const reject =
-            /^(File|Home|View|Help|New mail|Delete|Archive|Report|Reading Pane|Read \/ Unread)/i;
-          const nodes = [
-            ...document.querySelectorAll(
-              '[role="option"], [role="row"], div[data-convid], div[aria-label*="Unread" i]'
-            ),
-          ];
-          let target = null;
-          for (const n of nodes) {
-            const label = (n.getAttribute('aria-label') || n.innerText || '')
-              .replace(/\s+/g, ' ')
-              .trim();
-            if (label.length < 10 || reject.test(label)) continue;
-            if (want && label.slice(0, 90) === want.slice(0, 90)) {
-              target = n;
-              break;
-            }
-            if (!target && want && label.includes(want.slice(0, 40))) target = n;
-          }
-          if (!target) return false;
-          target.scrollIntoView?.({ block: 'center' });
-          target.click();
-          return true;
-        }, targetPreview).catch(() => false);
-
-        if (!clicked) continue;
-        await page.waitForTimeout(2800);
-        const openedBody = await page.evaluate(() => {
-          const reading = document.querySelector(
-            '[role="main"], [aria-label*="Reading Pane"], .ReadingPaneContents, #ReadingPaneContainerId'
-          );
-          const root = reading || document.body;
-          const text = (root?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 12000);
-          const hrefs = [...root.querySelectorAll('a[href]')]
-            .map((a) => a.href)
-            .filter((h) => /^https?:/i.test(h))
-            .slice(0, 60);
-          return { text, hrefs };
-        }).catch(() => null);
-        if (!openedBody) continue;
-        openedByIdx[idx] = openedBody;
-        const blob = `${targetPreview} ${openedBody.text || ''} ${(openedBody.hrefs || []).join(' ')}`;
-        if (/reddit\.com/i.test(blob) && /password|reset|recover|change/i.test(blob)) {
-          break;
-        }
-      }
-
-      const messages = rows.map((row, idx) => {
-        const preview = row.preview || '';
-        const openedBody = openedByIdx[idx];
-        const body = openedBody ? `${preview} ${openedBody.text || ''}` : preview;
-        const urls = [
-          ...extractUrls(body),
-          ...(openedBody?.hrefs || []),
-        ].filter((u, i, arr) => arr.indexOf(u) === i);
-        const codes = extractCodes(body);
-        const fromReddit = /reddit|redditmail|noreply/i.test(preview + body);
-        return {
-          uid: `web-${idx}`,
-          subject: preview.slice(0, 160),
-          from: fromReddit ? ['reddit'] : [],
-          date: null,
-          codes,
-          verifyLinks: pickVerificationLinks(urls),
-          urls,
-          preview: body.slice(0, 600),
-          source: 'outlook_web',
-        };
-      });
-
       console.warn(
-        `Outlook web scrape ${account.email}: rows=${messages.length} opened=${Object.keys(openedByIdx).length} ` +
+        `Outlook web scrape ${account.email}: rows=${messages.length} opened=${messages.filter((m) => m.opened).length} ` +
           `withLinks=${messages.filter((m) => (m.urls || []).length).length} ` +
           `sample=${JSON.stringify(
             messages.slice(0, 3).map((m) => ({
               s: (m.subject || '').slice(0, 60),
               links: (m.urls || []).slice(0, 2),
+              opened: !!m.opened,
             }))
           )}`
       );
@@ -879,12 +891,26 @@ class EmailInboxService {
         if (alias) {
           try {
             // Prefer messages addressed to this alias (shared pool inbox).
-            let uids = await client.search({ to: alias }, { uid: true });
-            if (!uids?.length) {
-              uids = await client.search({ body: alias }, { uid: true });
+            // Try several IMAP search strategies — To: indexing varies by server.
+            const localPart = alias.split('@')[0];
+            const attempts = [
+              { to: alias },
+              { header: { To: alias } },
+              { body: alias },
+              localPart ? { body: localPart } : null,
+              { or: [{ to: alias }, { from: 'reddit.com' }] },
+            ].filter(Boolean);
+            let uids = null;
+            for (const criteria of attempts) {
+              try {
+                uids = await client.search(criteria, { uid: true });
+                if (uids?.length) break;
+              } catch (_) {
+                /* try next strategy */
+              }
             }
             if (uids?.length) {
-              const slice = uids.slice(-Math.max(limit, 25));
+              const slice = uids.slice(-Math.max(limit, 40));
               seq = { uid: true, set: slice.join(',') };
             }
           } catch (searchErr) {
@@ -895,7 +921,7 @@ class EmailInboxService {
         }
 
         if (!seq) {
-          const start = Math.max(1, total - Math.max(limit, alias ? 40 : 10) + 1);
+          const start = Math.max(1, total - Math.max(limit, alias ? 80 : 10) + 1);
           seq = { uid: false, set: `${start}:${total}` };
         }
 
