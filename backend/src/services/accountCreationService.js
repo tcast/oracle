@@ -886,11 +886,11 @@ class AccountCreationService {
         const password = generatePassword(14);
         step.username = username;
 
-        // At most 2 proxy tries — smarter than blasting retries into network security.
+        // At most 3 proxy tries — rotate on network blocks and tunnel/timeout flakes.
         let proxyId = null;
         let created = null;
         let lastErr = null;
-        for (let attempt = 1; attempt <= 2; attempt++) {
+        for (let attempt = 1; attempt <= 3; attempt++) {
           proxyId = await this.claimProxyForNewAccount();
           step.proxyId = proxyId;
           if (!proxyId) {
@@ -922,6 +922,8 @@ class AccountCreationService {
             lastErr = err;
             const msg = err.message || String(err);
             const netBlocked = /blocked by network security|js_challenge/i.test(msg);
+            const proxyFlake =
+              /ERR_TUNNEL|ERR_TIMED_OUT|ERR_PROXY|ERR_CONNECTION|tunnel_connection|proxy/i.test(msg);
             if (proxyId) {
               await proxyService.updateProxyStats(proxyId, false, {
                 reason: netBlocked ? 'reddit_network_security' : msg.slice(0, 120),
@@ -933,11 +935,15 @@ class AccountCreationService {
                 });
                 console.warn(
                   `Reddit create: proxy ${proxyId} network-blocked — ` +
-                    `${cool.action === 'cooldown' ? 'cooled 6h' : cool.action}, retry ${attempt}/2`
+                    `${cool.action === 'cooldown' ? 'cooled 6h' : cool.action}, retry ${attempt}/3`
+                );
+              } else if (proxyFlake) {
+                console.warn(
+                  `Reddit create: proxy ${proxyId} flake (${msg.slice(0, 80)}) — retry ${attempt}/3`
                 );
               }
             }
-            if (!netBlocked || attempt === 2) throw err;
+            if (!(netBlocked || proxyFlake) || attempt === 3) throw err;
           }
         }
         if (!created) throw lastErr || new Error('Reddit create failed');
