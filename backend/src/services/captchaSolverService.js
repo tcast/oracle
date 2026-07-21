@@ -289,7 +289,9 @@ class CaptchaSolverService {
       });
 
       if (createResponse.data.errorId !== 0) {
-        throw new Error(`CapSolver error: ${createResponse.data.errorDescription}`);
+        throw new Error(
+          `CapSolver error: ${createResponse.data.errorDescription || createResponse.data.errorCode || 'unknown'} (task=${taskType})`
+        );
       }
 
       const taskId = createResponse.data.taskId;

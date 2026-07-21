@@ -145,7 +145,7 @@ class AccountCreationService {
     if (/no .*proxy|proxy.*unavailable|no healthy proxy|not assignable/i.test(msg)) return 'no_proxy';
     if (/not supported|not.?implemented|gated|needs.?accounts/i.test(msg)) return 'not_ready';
     if (/verification (email|code)|scanned 0 messages|inbox/i.test(msg)) return 'email_verify';
-    if (/CAPTCHA|sitekey/i.test(msg)) return 'challenge';
+    if (/CAPTCHA|sitekey|Error 56a391|phone verify rejected/i.test(msg)) return 'challenge';
     if (/batch already running|create already in progress/i.test(msg)) return 'busy';
     return classifyFailure(msg);
   }
@@ -994,8 +994,15 @@ class AccountCreationService {
       }
       if (verifyPhoneStatus === 403) {
         const dump = await this.dumpRedditPhoneStuck(page, 'verify403');
+        const hit = [...apiHits].reverse().find((h) => h.kind === 'verify_phone_init');
+        const body = hit?.body || '';
+        if (/56a391|query-bad-response|Something went wrong/i.test(body)) {
+          throw new Error(
+            `Reddit phone verify rejected (Error 56a391 / bad response, snap=${dump.snap}): ${body.slice(0, 180)}`
+          );
+        }
         throw new Error(
-          `blocked by network security / js_challenge on phone verify (HTTP 403 verify_phone_by_code_initialize, snap=${dump.snap})`
+          `blocked by network security / js_challenge on phone verify (HTTP 403 verify_phone_by_code_initialize, snap=${dump.snap}): ${body.slice(0, 160)}`
         );
       }
       const pageText = postContinue.snippet || '';
@@ -1018,8 +1025,15 @@ class AccountCreationService {
             `blocked by network security / js_challenge waiting for phone OTP (snap=${dump.snap}): ${mid.snippet}`
           );
         }
-        if (verifyPhoneStatus === 403) {
+      if (verifyPhoneStatus === 403) {
           const dump = await this.dumpRedditPhoneStuck(page, 'verify403-wait');
+          const hit = [...apiHits].reverse().find((h) => h.kind === 'verify_phone_init');
+          const body = hit?.body || '';
+          if (/56a391|query-bad-response|Something went wrong/i.test(body)) {
+            throw new Error(
+              `Reddit phone verify rejected waiting for OTP (Error 56a391, snap=${dump.snap}): ${body.slice(0, 180)}`
+            );
+          }
           throw new Error(
             `blocked by network security / js_challenge waiting for phone OTP (HTTP 403 verify_phone, snap=${dump.snap})`
           );
@@ -1662,7 +1676,10 @@ class AccountCreationService {
               /ERR_TUNNEL|ERR_TIMED_OUT|ERR_PROXY|ERR_CONNECTION|tunnel_connection|proxy|Phone signup option not found|register UI not ready/i.test(
                 msg
               );
-            const phoneRejected = /Reddit rejected phone/i.test(msg);
+            const phoneRejected =
+              /Reddit rejected phone|Error 56a391|query-bad-response|phone verify rejected/i.test(
+                msg
+              );
             if (proxyId) {
               await proxyService.updateProxyStats(proxyId, false, {
                 reason: netBlocked ? 'reddit_network_security' : msg.slice(0, 120),
