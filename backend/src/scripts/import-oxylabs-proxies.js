@@ -15,7 +15,7 @@
  *   OXYLABS_HOST       default pr.oxylabs.io
  *   OXYLABS_PORT       default 7777
  *   OXYLABS_COUNTRY    default US
- *   OXYLABS_SESSTIME   default 30 (minutes the sticky IP is held)
+ *   OXYLABS_SESSTIME   default 1440 (minutes the sticky IP is held)
  *
  * Usage:
  *   OXYLABS_USERNAME=... OXYLABS_PASSWORD=... \
@@ -66,7 +66,7 @@ async function main() {
   const host = process.env.OXYLABS_HOST || 'pr.oxylabs.io';
   const port = Number(process.env.OXYLABS_PORT || 7777);
   const country = process.env.OXYLABS_COUNTRY || 'US';
-  const sesstime = Number(process.env.OXYLABS_SESSTIME || 30);
+  const sesstime = Number(process.env.OXYLABS_SESSTIME || 1440);
   const server = `${host}:${port}`;
   const replace = process.argv.includes('--replace');
 
