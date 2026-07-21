@@ -1622,6 +1622,11 @@ class PlaywrightService {
       return `x-${Date.now()}`;
     } catch (error) {
       console.error('Error posting X comment:', error);
+      // Preserve transient teardown so organic can soft-skip instead of
+      // masking as "no platform comment id" → multi-hour quarantine.
+      if (/has been closed|Target closed|browser.*closed/i.test(error?.message || '')) {
+        throw error;
+      }
       return false;
     }
   }

@@ -672,8 +672,15 @@ Write only the comment text.`;
       };
     } catch (error) {
       const msg = error.message || String(error);
-      // Soft operational misses: short delay, no long quarantine
-      if (/No commentable threads|gate_failed|duplicate key/i.test(msg)) {
+      // Soft operational misses: short delay, no long quarantine.
+      // Match all platforms' empty-discovery strings ("No commentable X home posts",
+      // "...threads", "...LinkedIn posts", "...Instagram posts") plus transient
+      // browser teardown under concurrent organic ticks.
+      if (
+        /No commentable|gate_failed|duplicate key|has been closed|Target closed|browser.*closed/i.test(
+          msg
+        )
+      ) {
         const next = this.computeNextDue(settings, job.comments_today, { daily_target: job.daily_target });
         await pool.query(
           `UPDATE organic_comment_jobs
