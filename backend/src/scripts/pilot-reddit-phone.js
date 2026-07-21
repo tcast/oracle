@@ -16,10 +16,14 @@ const smsManService = require('../services/smsManService');
 const fiveSimService = require('../services/fiveSimService');
 
 const LOG = process.env.PILOT_LOG || '/tmp/reddit-phone-pilot.log';
-const forcedProxyIds = String(process.env.PILOT_PROXY_IDS || '115,89,194,181,90,104')
+const forcedProxyIds = String(process.env.PILOT_PROXY_IDS || '126,124,146,161')
   .split(',')
   .map((s) => parseInt(s.trim(), 10))
   .filter((n) => Number.isFinite(n) && n > 0);
+const maxProxyTries = Math.min(
+  parseInt(process.env.PILOT_MAX_TRIES || '2', 10) || 2,
+  forcedProxyIds.length || 2
+);
 
 function log(msg) {
   const line = `[${new Date().toISOString()}] ${msg}`;
@@ -50,11 +54,10 @@ async function main() {
   const health = await checkSms();
   log(`start proxies=${forcedProxyIds.join(',')} smsManBalance=${health.smsMan.balance}`);
 
-  // Prefer forced ProxyBase ids that previously loaded /register
+  // Prefer forced ProxyBase ids; do NOT fall through to random pool (burns SMS).
   let cursor = 0;
-  const origClaim = accountCreationService.claimProxyForNewAccount.bind(accountCreationService);
   accountCreationService.claimProxyForNewAccount = async () => {
-    while (cursor < forcedProxyIds.length) {
+    while (cursor < Math.min(forcedProxyIds.length, maxProxyTries)) {
       const id = forcedProxyIds[cursor++];
       const row = (await pool.query('SELECT * FROM proxies WHERE id=$1', [id])).rows[0];
       if (!row) {
@@ -68,7 +71,7 @@ async function main() {
       log(`using proxy ${id} provider=${row.provider}`);
       return id;
     }
-    return origClaim();
+    return null;
   };
 
   const organicBefore = (

@@ -561,6 +561,20 @@ class AccountCreationService {
     }
   }
 
+  async detectRedditNetworkBlock(page) {
+    return page.evaluate(() => {
+      const text = `${document.body?.innerText || ''} ${document.documentElement?.innerHTML || ''}`;
+      const blocked =
+        /blocked by network security|you.?ve been blocked by network security|js_challenge|network security/i.test(
+          text
+        );
+      return {
+        blocked,
+        snippet: (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 220),
+      };
+    });
+  }
+
   async clickRedditSignupMethod(page, method) {
     const preferredTexts =
       method === 'phone'
@@ -647,19 +661,12 @@ class AccountCreationService {
       }
 
       await this.humanLikeDelay(1500, 3000);
-      // Re-check block after clicking phone (Reddit often banners then)
-      const afterClick = await page
-        .evaluate(() => (document.body?.innerText || '').slice(0, 500))
-        .catch(() => '');
-      if (/blocked by network security|js_challenge/i.test(afterClick)) {
-        throw new Error('blocked by network security / js_challenge after phone click');
+      const afterClick = await this.detectRedditNetworkBlock(page);
+      if (afterClick.blocked) {
+        throw new Error(
+          `blocked by network security / js_challenge after phone click: ${afterClick.snippet}`
+        );
       }
-
-      smsRequest = await this.acquireRedditSmsNumber();
-      const phone = this.formatUsPhoneForReddit(smsRequest.number);
-      console.log(
-        `Reddit phone create: using ${phone.e164} via ${smsRequest.provider} (req ${smsRequest.id})`
-      );
 
       let phoneLocator = page
         .locator(
@@ -678,12 +685,31 @@ class AccountCreationService {
         await phoneLocator.waitFor({ state: 'visible', timeout: 15000 });
       }
 
+      // Solve invisible reCAPTCHA before spending an SMS number
+      const preCaptcha = await this.maybeSolveCaptcha(page, page.url());
+      if (preCaptcha.reason === 'captcha_present_no_sitekey') {
+        throw new Error(
+          'CAPTCHA present but sitekey not extractable on phone form — blocked'
+        );
+      }
+
+      const preBuyBlock = await this.detectRedditNetworkBlock(page);
+      if (preBuyBlock.blocked) {
+        throw new Error(
+          `blocked by network security before SMS buy: ${preBuyBlock.snippet}`
+        );
+      }
+
+      smsRequest = await this.acquireRedditSmsNumber();
+      const phone = this.formatUsPhoneForReddit(smsRequest.number);
+      console.log(
+        `Reddit phone create: using ${phone.e164} via ${smsRequest.provider} (req ${smsRequest.id}) captcha=${JSON.stringify(preCaptcha)}`
+      );
+
       // Reddit phone form shows a country +1 selector; always type national 10 digits.
-      // Typing 1856… leaves an extra leading 1 and Continue never advances to OTP.
       await this.typeIntoLocator(page, phoneLocator, phone.national);
       await this.humanLikeDelay(800, 1500);
 
-      // Confirm value landed as 10 digits
       const typed = await phoneLocator.inputValue().catch(() => '');
       const typedDigits = String(typed || '').replace(/\D/g, '');
       if (typedDigits.length && typedDigits.length !== 10) {
@@ -692,27 +718,24 @@ class AccountCreationService {
         await this.humanLikeDelay(500, 1000);
       }
 
-      const continueBtn = page
-        .locator('button:has-text("Continue"), button[type="submit"]')
-        .filter({ hasText: /^Continue$/i })
-        .first();
-      const continueFallback = page.locator('button:has-text("Continue")').last();
-      const btn = (await continueBtn.isVisible().catch(() => false))
-        ? continueBtn
-        : continueFallback;
+      // Prefer the enabled Continue in the auth modal (avoid disabled hidden Continues)
+      const btn = page.locator('button:has-text("Continue"):not([disabled])').last();
       if (await btn.isVisible().catch(() => false)) {
-        await btn.click().catch(() => {});
-        await this.humanLikeDelay(2500, 4000);
+        await btn.click({ timeout: 15000 });
+      } else {
+        await page.locator('button:has-text("Continue")').last().click({ force: true }).catch(() => {});
       }
+      await this.humanLikeDelay(2500, 4000);
 
-      const pageText = await page
-        .evaluate(() => (document.body?.innerText || '').slice(0, 700))
-        .catch(() => '');
-      if (/blocked by network security|js_challenge/i.test(pageText)) {
-        throw new Error('blocked by network security / js_challenge on phone verify');
+      const postContinue = await this.detectRedditNetworkBlock(page);
+      if (postContinue.blocked) {
+        throw new Error(
+          `blocked by network security / js_challenge on phone verify: ${postContinue.snippet}`
+        );
       }
+      const pageText = postContinue.snippet || '';
       if (/try a different number|invalid phone|not able to verify|couldn't verify|please enter a valid/i.test(pageText)) {
-        throw new Error(`Reddit rejected phone number: ${pageText.replace(/\s+/g, ' ').slice(0, 180)}`);
+        throw new Error(`Reddit rejected phone number: ${pageText.slice(0, 180)}`);
       }
 
       // Wait up to ~25s for OTP field to appear (SMS request already purchased)
@@ -723,17 +746,21 @@ class AccountCreationService {
         .first();
       let codeVisible = false;
       for (let w = 0; w < 10; w++) {
-        const midText = await page
-          .evaluate(() => (document.body?.innerText || '').slice(0, 500))
-          .catch(() => '');
-        if (/blocked by network security|js_challenge/i.test(midText)) {
-          throw new Error('blocked by network security / js_challenge waiting for phone OTP');
+        const mid = await this.detectRedditNetworkBlock(page);
+        if (mid.blocked) {
+          throw new Error(
+            `blocked by network security / js_challenge waiting for phone OTP: ${mid.snippet}`
+          );
         }
+        // Only count visible OTP inputs (hidden faceplate inputs exist on earlier steps)
         if (await codeInput.isVisible().catch(() => false)) {
-          codeVisible = true;
-          break;
+          const box = await codeInput.boundingBox().catch(() => null);
+          if (box && box.width > 0 && box.height > 0) {
+            codeVisible = true;
+            break;
+          }
         }
-        if (/verification code|enter the code|6-digit|texted you|sent you a code/i.test(midText)) {
+        if (/verification code|enter the code|6-digit|texted you|sent you a code/i.test(mid.snippet)) {
           codeVisible = true;
           break;
         }
@@ -742,10 +769,15 @@ class AccountCreationService {
       if (!codeVisible) {
         const snap = `/tmp/reddit-phone-nocode-${Date.now()}.png`;
         await page.screenshot({ path: snap, fullPage: true }).catch(() => {});
-        const finalText = await page
-          .evaluate(() => (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 220))
-          .catch(() => '');
-        throw new Error(`Reddit phone: code input not shown after submit (snap=${snap}) ${finalText}`);
+        const final = await this.detectRedditNetworkBlock(page);
+        if (final.blocked) {
+          throw new Error(
+            `blocked by network security / js_challenge on phone verify (snap=${snap}): ${final.snippet}`
+          );
+        }
+        throw new Error(
+          `Reddit phone: code input not shown after submit (snap=${snap}) ${final.snippet}`
+        );
       }
 
       const verified = await this.waitRedditSmsCode(smsRequest, 180000);
@@ -1315,7 +1347,7 @@ class AccountCreationService {
             const msg = err.message || String(err);
             const netBlocked = /blocked by network security|js_challenge/i.test(msg);
             const proxyFlake =
-              /ERR_TUNNEL|ERR_TIMED_OUT|ERR_PROXY|ERR_CONNECTION|tunnel_connection|proxy|Phone signup option not found|register UI not ready|code input not shown/i.test(
+              /ERR_TUNNEL|ERR_TIMED_OUT|ERR_PROXY|ERR_CONNECTION|tunnel_connection|proxy|Phone signup option not found|register UI not ready/i.test(
                 msg
               );
             const phoneRejected = /Reddit rejected phone/i.test(msg);
