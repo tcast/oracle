@@ -113,9 +113,10 @@ class PlaywrightService {
   }
 
   async randomMouseMove(page) {
-    const vp = page.viewportSize();
-    const toX = this.randomBetween(100, vp.width - 100);
-    const toY = this.randomBetween(100, vp.height - 100);
+    // Camoufox/Firefox contexts can report a null viewport; fall back to a sane size.
+    const vp = page.viewportSize() || { width: 1280, height: 800 };
+    const toX = this.randomBetween(100, Math.max(200, vp.width - 100));
+    const toY = this.randomBetween(100, Math.max(200, vp.height - 100));
     await page.mouse.move(toX, toY);
     await this.humanLikeDelay(100, 300);
   }
@@ -342,6 +343,17 @@ class PlaywrightService {
     }
 
     const opts = await launchOptions(cfOptions);
+    // Headless Firefox has no GPU; force software WebGL/WebRender so X's client
+    // bundle can create a GL context (otherwise its login flow errors out with
+    // "Something went wrong"). Camoufox still spoofs the reported vendor/renderer.
+    opts.firefoxUserPrefs = {
+      ...(opts.firefoxUserPrefs || {}),
+      'webgl.force-enabled': true,
+      'webgl.disabled': false,
+      'gfx.webrender.software': true,
+      'gfx.webrender.all': true,
+      'gfx.canvas.accelerated': true,
+    };
     const browser = await firefox.launch(opts);
 
     const contextOptions = { viewport };
