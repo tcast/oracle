@@ -225,6 +225,7 @@ router.post('/create', async (req, res) => {
     useEmailPool,
     warm,
     allowGated,
+    verifyMode,
   } = req.body;
 
   try {
@@ -257,6 +258,7 @@ router.post('/create', async (req, res) => {
           warm: warm !== false,
           allowGated: allowGated === true,
           source: 'api_email_pool',
+          verifyMode: verifyMode || process.env.REDDIT_CREATE_VERIFY || 'phone',
         }
       );
       return res.json({

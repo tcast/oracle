@@ -27,6 +27,8 @@ class SmsManService {
       hotmail: 133,
       gmail: 122,
       google: 122,
+      reddit: 5512,
+      Reddit: 5512,
     };
 
     if (!this.apiKey) {

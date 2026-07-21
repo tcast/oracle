@@ -5,6 +5,8 @@ const proxyService = require('./proxyService');
 const captchaSolverService = require('./captchaSolverService');
 const emailInboxService = require('./emailInboxService');
 const playwrightService = require('./playwrightService');
+const smsManService = require('./smsManService');
+const fiveSimService = require('./fiveSimService');
 const { generatePassword } = require('../utils/passwordGenerator');
 const { generateRealisticUsername } = require('../utils/nameGenerator');
 const mailTmService = require('./mailTmService');
@@ -20,7 +22,8 @@ const PLATFORM_CATALOG = {
     label: 'Reddit',
     readiness: 'ready',
     selfCreate: true,
-    notes: 'Self-create via catchall (parked domains) or Yahoo pool + healthy US proxy',
+    notes:
+      'Self-create via phone OTP (SMS-Man USA) or email pool (Yahoo/catchall) + healthy US proxy',
   },
   x: {
     label: 'X',
@@ -499,9 +502,263 @@ class AccountCreationService {
     return pick.rows[0]?.id || null;
   }
 
-  async createRedditAccount(username, email, password, proxyConfig = null, emailToken = null, emailAccount = null) {
+  /**
+   * Prefer SMS-Man USA for Reddit; fall back to 5SIM if configured.
+   * @returns {Promise<{id:string, number:string, provider:string, service:string}>}
+   */
+  async acquireRedditSmsNumber() {
+    try {
+      const sms = await smsManService.getNumber('US', 'reddit');
+      return { ...sms, provider: sms.provider || 'smsman' };
+    } catch (smsManErr) {
+      console.warn(`SMS-Man Reddit number failed (${smsManErr.message}); trying 5SIM…`);
+      const sms = await fiveSimService.getNumber('usa', 'reddit');
+      return { ...sms, provider: sms.provider || '5sim' };
+    }
+  }
+
+  async releaseSmsNumber(smsRequest) {
+    if (!smsRequest?.id) return;
+    try {
+      if (smsRequest.provider === 'smsman' || smsRequest.provider === 'SMS-Man') {
+        await smsManService.cancelRequest(smsRequest.id);
+      } else {
+        await fiveSimService.cancelRequest(smsRequest.id);
+      }
+    } catch (err) {
+      console.warn(`SMS release failed: ${err.message}`);
+    }
+  }
+
+  async waitRedditSmsCode(smsRequest, timeoutMs = 180000) {
+    if (smsRequest.provider === 'smsman' || smsRequest.provider === 'SMS-Man') {
+      return smsManService.getVerificationCode(smsRequest.id, timeoutMs);
+    }
+    return fiveSimService.getVerificationCode(smsRequest.id, timeoutMs);
+  }
+
+  /**
+   * Normalize SMS-Man/+E.164 US number for Reddit tel inputs.
+   * Returns digits for national entry (10) and full E.164.
+   */
+  formatUsPhoneForReddit(raw) {
+    const digits = String(raw || '').replace(/\D/g, '');
+    let national = digits;
+    if (national.length === 11 && national.startsWith('1')) national = national.slice(1);
+    if (national.length !== 10) {
+      throw new Error(`Expected US 10-digit phone, got ${raw}`);
+    }
+    return { national, e164: `+1${national}`, display: national };
+  }
+
+  async dismissRedditCookieBanners(page) {
+    for (const label of ['Accept all', 'Accept', 'I agree', 'Continue']) {
+      const btn = await page.$(`button:has-text("${label}")`);
+      if (btn) {
+        await btn.click().catch(() => {});
+        await this.humanLikeDelay(500, 1200);
+      }
+    }
+  }
+
+  async clickRedditSignupMethod(page, method) {
+    const label = method === 'phone' ? /phone/i : /email/i;
+    const exact = method === 'phone' ? 'Phone' : 'Email';
+    const choice =
+      (await page.$(`button:has-text("${exact}")`)) ||
+      (await page.$(`a:has-text("${exact}")`)) ||
+      (await page.getByRole('button', { name: label }).first().elementHandle().catch(() => null)) ||
+      (await page.getByText(exact, { exact: true }).first().elementHandle().catch(() => null));
+    if (choice) {
+      await choice.click().catch(() => {});
+      await this.humanLikeDelay(1000, 2000);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Phone OTP path for Reddit /register (SMS-Man USA preferred).
+   */
+  async createRedditAccountViaPhone(page, username, password) {
+    let smsRequest = null;
+    try {
+      const clicked = await this.clickRedditSignupMethod(page, 'phone');
+      if (!clicked) {
+        // Some builds land directly on a phone field
+        const telProbe = page
+          .locator(
+            'faceplate-text-input[name="phone"] input, input[name="phone"], input[type="tel"], input[autocomplete="tel"]'
+          )
+          .first();
+        if (!(await telProbe.isVisible().catch(() => false))) {
+          throw new Error('Reddit register: Phone signup option not found');
+        }
+      }
+
+      smsRequest = await this.acquireRedditSmsNumber();
+      const phone = this.formatUsPhoneForReddit(smsRequest.number);
+      console.log(
+        `Reddit phone create: using ${phone.e164} via ${smsRequest.provider} (req ${smsRequest.id})`
+      );
+
+      let phoneLocator = page
+        .locator(
+          'faceplate-text-input[name="phone"] input, faceplate-text-input[name="phoneNumber"] input, input[name="phone"], input[name="phoneNumber"], input[type="tel"], input[autocomplete="tel"]'
+        )
+        .first();
+      try {
+        await phoneLocator.waitFor({ state: 'visible', timeout: 20000 });
+      } catch (_) {
+        await this.clickRedditSignupMethod(page, 'phone');
+        phoneLocator = page
+          .locator(
+            'faceplate-text-input input, auth-flow-modal input[type="tel"], input[type="tel"], input[name="phone"]'
+          )
+          .first();
+        await phoneLocator.waitFor({ state: 'visible', timeout: 15000 });
+      }
+
+      // Prefer national 10-digit when a +1 country prefix is already shown
+      const pageHint = await page
+        .evaluate(() => (document.body?.innerText || '').slice(0, 500))
+        .catch(() => '');
+      const hasUsPrefix = /\+1\b|United States|USA/i.test(pageHint);
+      await this.typeIntoLocator(page, phoneLocator, hasUsPrefix ? phone.national : phone.e164);
+      await this.humanLikeDelay();
+
+      const continueBtn = await page.$(
+        'button:has-text("Continue"), button:has-text("Next"), button:has-text("Send code"), button[type="submit"]'
+      );
+      if (continueBtn) {
+        await continueBtn.click().catch(() => {});
+        await this.humanLikeDelay(1500, 3000);
+      }
+
+      const pageText = await page
+        .evaluate(() => (document.body?.innerText || '').slice(0, 700))
+        .catch(() => '');
+      if (/blocked by network security|js_challenge/i.test(pageText)) {
+        throw new Error('blocked by network security / js_challenge on phone verify');
+      }
+      if (/try a different number|invalid phone|not able to verify|couldn't verify/i.test(pageText)) {
+        throw new Error(`Reddit rejected phone number: ${pageText.replace(/\s+/g, ' ').slice(0, 180)}`);
+      }
+
+      const onCodePage = /verification code|enter the code|6-digit|texted you|sent you a code|sms code/i.test(
+        pageText
+      );
+      const codeInput = page
+        .locator(
+          'input[name="code"], input[autocomplete="one-time-code"], input[placeholder*="code" i], faceplate-text-input[name="code"] input'
+        )
+        .first();
+      const codeVisible =
+        onCodePage || (await codeInput.isVisible().catch(() => false));
+      if (!codeVisible) {
+        const snap = `/tmp/reddit-phone-nocode-${Date.now()}.png`;
+        await page.screenshot({ path: snap, fullPage: true }).catch(() => {});
+        throw new Error(
+          `Reddit phone: code input not shown after submit (snap=${snap}) ${pageText.replace(/\s+/g, ' ').slice(0, 220)}`
+        );
+      }
+
+      const verified = await this.waitRedditSmsCode(smsRequest, 180000);
+      if (!verified?.code) throw new Error('SMS verification code missing');
+      await this.typeIntoLocator(page, codeInput, String(verified.code));
+      await this.humanLikeDelay();
+      const submitCode = await page.$(
+        'button[type="submit"], button:has-text("Continue"), button:has-text("Next"), button:has-text("Verify")'
+      );
+      if (submitCode) await submitCode.click();
+      await this.humanLikeDelay(1500, 3000);
+
+      // Username / password
+      const userField = page
+        .locator(
+          'faceplate-text-input[name="username"] input, input[name="username"], #regUsername'
+        )
+        .first();
+      const passField = page
+        .locator(
+          'faceplate-text-input[name="password"] input, input[name="password"], #regPassword'
+        )
+        .first();
+      if (await userField.isVisible().catch(() => false)) {
+        await this.typeIntoLocator(page, userField, username);
+        await this.humanLikeDelay();
+      }
+      if (await passField.isVisible().catch(() => false)) {
+        await this.typeIntoLocator(page, passField, password);
+        await this.humanLikeDelay();
+      }
+
+      const captchaResult = await this.maybeSolveCaptcha(page, page.url());
+      if (captchaResult.reason === 'captcha_present_no_sitekey') {
+        throw new Error(
+          'CAPTCHA present but sitekey not extractable — blocked (need solver wiring for this challenge type)'
+        );
+      }
+
+      const submit = await page.$(
+        'button[type="submit"], button:has-text("Sign Up"), button:has-text("Create"), button:has-text("Continue")'
+      );
+      if (submit) await submit.click();
+      await page.waitForLoadState('domcontentloaded', { timeout: 20000 }).catch(() => {});
+      await this.humanLikeDelay(2000, 4000);
+
+      const loggedIn = await this.isRedditLoggedIn(page);
+      if (!loggedIn) {
+        const bodySnippet = await page.evaluate(() =>
+          (document.body?.innerText || '').slice(0, 300)
+        );
+        throw new Error(
+          `Account creation failed — not logged in after phone registration. Page: ${bodySnippet}`
+        );
+      }
+
+      let totpSecret = null;
+      try {
+        totpSecret = await this.enableRedditTotp(page);
+      } catch (err) {
+        console.warn('Reddit TOTP enable skipped:', err.message);
+      }
+
+      const cookies = await page.context().cookies();
+      // Number consumed successfully — finish/cancel not needed for SMS-Man after code; best-effort finish for 5SIM already done in getVerificationCode
+      return {
+        success: true,
+        username,
+        email: null,
+        phone: phone.e164,
+        password,
+        totp_secret: totpSecret,
+        email_verified: false,
+        phone_verified: true,
+        sms_provider: smsRequest.provider,
+        cookies,
+        captcha: captchaResult,
+      };
+    } catch (error) {
+      await this.releaseSmsNumber(smsRequest);
+      throw error;
+    }
+  }
+
+  async createRedditAccount(
+    username,
+    email,
+    password,
+    proxyConfig = null,
+    emailToken = null,
+    emailAccount = null,
+    opts = {}
+  ) {
     let browser;
     const pageUrl = 'https://www.reddit.com/register/';
+    const verifyMode = String(
+      opts.verifyMode || process.env.REDDIT_CREATE_VERIFY || 'phone'
+    ).toLowerCase();
     try {
       const { browser: b, page } = await this.createBrowser(proxyConfig);
       browser = b;
@@ -509,23 +766,29 @@ class AccountCreationService {
       await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
       await this.humanLikeDelay(2500, 4500);
 
-      // Dismiss cookie banners if present
-      for (const label of ['Accept all', 'Accept', 'I agree', 'Continue']) {
-        const btn = await page.$(`button:has-text("${label}")`);
-        if (btn) {
-          await btn.click().catch(() => {});
-          await this.humanLikeDelay(500, 1200);
+      await this.dismissRedditCookieBanners(page);
+
+      if (verifyMode === 'phone' || verifyMode === 'phone_only') {
+        return await this.createRedditAccountViaPhone(page, username, password);
+      }
+
+      if (verifyMode === 'phone_first') {
+        try {
+          return await this.createRedditAccountViaPhone(page, username, password);
+        } catch (phoneErr) {
+          console.warn(
+            `Reddit phone create failed (${phoneErr.message}); falling back to email…`
+          );
+          await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
+          await this.humanLikeDelay(2000, 3500);
+          await this.dismissRedditCookieBanners(page);
         }
       }
 
       // Current Reddit signup: choose Email vs Phone first
-      const emailChoice =
-        (await page.$('button:has-text("Email")')) ||
-        (await page.$('a:has-text("Email")')) ||
-        (await page.getByText('Email', { exact: true }).first().elementHandle().catch(() => null));
-      if (emailChoice) {
-        await emailChoice.click().catch(() => {});
-        await this.humanLikeDelay(1000, 2000);
+      const emailChoice = await this.clickRedditSignupMethod(page, 'email');
+      if (!emailChoice) {
+        /* may already be on email form */
       }
 
       // Wait for email field (faceplate shadow DOM or classic inputs)
@@ -880,34 +1143,42 @@ class AccountCreationService {
   }
 
   /**
-   * Reddit create+warm pilot using durable emails from email_accounts pool.
-   * Serial only; records every attempt for NOC. Max 2 proxy rotations on network blocks.
+   * Reddit create+warm pilot.
+   * Default verifyMode=phone (SMS-Man USA). Email pool used when verifyMode=email|phone_first fallback.
+   * Serial only; records every attempt for NOC.
    * @param {number} count - 1..5 recommended
-   * @param {{ warm?: boolean, usernamePrefix?: string, source?: string }} opts
+   * @param {{ warm?: boolean, usernamePrefix?: string, source?: string, verifyMode?: string }} opts
    */
   async createRedditFromPool(count, opts = {}) {
     const warm = opts.warm !== false;
     const source = opts.source || 'api_email_pool';
+    const verifyMode = String(
+      opts.verifyMode || process.env.REDDIT_CREATE_VERIFY || 'phone'
+    ).toLowerCase();
+    const phonePrimary = verifyMode === 'phone' || verifyMode === 'phone_only';
     const results = { created: [], errors: [], blocked: [], skipped: [] };
 
     for (let i = 0; i < count; i++) {
-      const step = { index: i + 1 };
+      const step = { index: i + 1, verifyMode };
       try {
-        const emailAccount = await this.claimEmailFromPool();
-        if (!emailAccount) {
-          const error = 'No unassigned email_accounts available';
-          results.errors.push({ ...step, error });
-          await this.recordAttempt({
-            platform: 'reddit',
-            status: 'skipped',
-            errorClass: 'no_email',
-            errorMessage: error,
-            source,
-          });
-          break;
+        let emailAccount = null;
+        if (!phonePrimary) {
+          emailAccount = await this.claimEmailFromPool();
+          if (!emailAccount) {
+            const error = 'No unassigned email_accounts available';
+            results.errors.push({ ...step, error });
+            await this.recordAttempt({
+              platform: 'reddit',
+              status: 'skipped',
+              errorClass: 'no_email',
+              errorMessage: error,
+              source,
+            });
+            break;
+          }
+          step.email = emailAccount.email;
+          step.emailAccountId = emailAccount.id;
         }
-        step.email = emailAccount.email;
-        step.emailAccountId = emailAccount.id;
 
         const username = (
           opts.usernamePrefix
@@ -941,11 +1212,12 @@ class AccountCreationService {
           try {
             created = await this.createRedditAccount(
               username,
-              emailAccount.email,
+              emailAccount?.email || null,
               password,
               proxyConfig,
               null,
-              emailAccount
+              emailAccount,
+              { verifyMode }
             );
             if (proxyId) await proxyService.updateProxyStats(proxyId, true);
             break;
@@ -955,6 +1227,7 @@ class AccountCreationService {
             const netBlocked = /blocked by network security|js_challenge/i.test(msg);
             const proxyFlake =
               /ERR_TUNNEL|ERR_TIMED_OUT|ERR_PROXY|ERR_CONNECTION|tunnel_connection|proxy/i.test(msg);
+            const phoneRejected = /Reddit rejected phone|Phone signup option not found/i.test(msg);
             if (proxyId) {
               await proxyService.updateProxyStats(proxyId, false, {
                 reason: netBlocked ? 'reddit_network_security' : msg.slice(0, 120),
@@ -974,6 +1247,8 @@ class AccountCreationService {
                 );
               }
             }
+            // Phone rejection is not a proxy flake — don't burn more proxies unless network block
+            if (phoneRejected && !netBlocked) throw err;
             if (!(netBlocked || proxyFlake) || attempt === 5) throw err;
           }
         }
@@ -981,10 +1256,13 @@ class AccountCreationService {
 
         const credentials = {
           password,
-          email: emailAccount.email,
-          email_password: emailAccount.password,
+          email: emailAccount?.email || null,
+          email_password: emailAccount?.password || null,
+          phone: created.phone || null,
+          phone_verified: !!created.phone_verified,
+          sms_provider: created.sms_provider || null,
           totp_secret: created.totp_secret || null,
-          source: 'self_create_pool',
+          source: phonePrimary ? 'self_create_phone' : 'self_create_pool',
           needs_signup: false,
         };
 
@@ -993,24 +1271,27 @@ class AccountCreationService {
              (platform, username, email, credentials, status, is_simulated, warmup_status, email_account_id)
            VALUES ('reddit', $1, $2, $3::jsonb, 'active', false, 'pending', $4)
            RETURNING *`,
-          [username, emailAccount.email, JSON.stringify(credentials), emailAccount.id]
+          [username, emailAccount?.email || null, JSON.stringify(credentials), emailAccount?.id || null]
         );
         const account = inserted.rows[0];
         step.accountId = account.id;
+        step.phone = created.phone || null;
 
-        await pool.query(
-          `UPDATE email_accounts
-           SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb
-           WHERE id = $1`,
-          [
-            emailAccount.id,
-            JSON.stringify({
-              linked_reddit: username,
-              linked_social_account_id: account.id,
-              linked_at: new Date().toISOString(),
-            }),
-          ]
-        );
+        if (emailAccount) {
+          await pool.query(
+            `UPDATE email_accounts
+             SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb
+             WHERE id = $1`,
+            [
+              emailAccount.id,
+              JSON.stringify({
+                linked_reddit: username,
+                linked_social_account_id: account.id,
+                linked_at: new Date().toISOString(),
+              }),
+            ]
+          );
+        }
 
         if (proxyId) {
           await proxyService.assignProxiesToAccount(account.id, [proxyId]);
@@ -1039,12 +1320,19 @@ class AccountCreationService {
           platform: 'reddit',
           status: 'created',
           proxyId,
-          emailAccountId: emailAccount.id,
+          emailAccountId: emailAccount?.id || null,
           socialAccountId: account.id,
           username,
-          email: emailAccount.email,
+          email: emailAccount?.email || created.phone || null,
           source,
-          detail: { warm: warmResult, captcha: created.captcha, totp: !!created.totp_secret },
+          detail: {
+            warm: warmResult,
+            captcha: created.captcha,
+            totp: !!created.totp_secret,
+            verifyMode,
+            phone: created.phone || null,
+            sms_provider: created.sms_provider || null,
+          },
         });
 
         results.created.push({
@@ -1140,6 +1428,7 @@ class AccountCreationService {
           warm: opts.warm !== false,
           usernamePrefix,
           source,
+          verifyMode: opts.verifyMode || process.env.REDDIT_CREATE_VERIFY || 'phone',
         });
       }
 
