@@ -82,16 +82,17 @@ class CaptchaSolverService {
    * @param {string} pageUrl - URL of the page with CAPTCHA
    * @param {string} captchaType - Type: 'recaptcha_v2', 'recaptcha_v3', 'hcaptcha'
    * @param {number} version - For reCAPTCHA v3: version number
+   * @param {Object} opts - Extra options ({ invisible: boolean })
    * @returns {Promise<string>} CAPTCHA solution token
    */
-  async solveCaptcha(siteKey, pageUrl, captchaType = 'recaptcha_v2', version = null) {
+  async solveCaptcha(siteKey, pageUrl, captchaType = 'recaptcha_v2', version = null, opts = {}) {
     console.log(`🧩 Solving ${captchaType} CAPTCHA for ${pageUrl}`);
 
     try {
       // Try 2Captcha first (primary solver)
       if (this.twoCaptchaKey && !this.twoCaptchaIssue) {
         console.log('   Attempting with 2Captcha...');
-        return await this.solve2Captcha(siteKey, pageUrl, captchaType, version);
+        return await this.solve2Captcha(siteKey, pageUrl, captchaType, version, opts);
       }
     } catch (error) {
       console.warn('   2Captcha failed, trying CapSolver:', error.message);
@@ -100,7 +101,7 @@ class CaptchaSolverService {
     // Fallback to CapSolver
     if (this.capSolverKey && !this.capSolverIssue) {
       console.log('   Attempting with CapSolver...');
-      return await this.solveCapSolver(siteKey, pageUrl, captchaType, version);
+      return await this.solveCapSolver(siteKey, pageUrl, captchaType, version, opts);
     }
 
     throw new Error('No CAPTCHA solver available or all solvers failed');
@@ -110,7 +111,7 @@ class CaptchaSolverService {
    * Solve CAPTCHA using 2Captcha
    * @private
    */
-  async solve2Captcha(siteKey, pageUrl, captchaType, version) {
+  async solve2Captcha(siteKey, pageUrl, captchaType, version, opts = {}) {
     try {
       // Step 1: Submit CAPTCHA task
       const submitParams = {
@@ -127,6 +128,10 @@ class CaptchaSolverService {
         submitParams.min_score = 0.3;
       } else if (captchaType === 'hcaptcha') {
         submitParams.method = 'hcaptcha';
+      }
+
+      if (opts.invisible && captchaType === 'recaptcha_v2') {
+        submitParams.invisible = 1;
       }
 
       const submitResponse = await axios.get(this.twoCaptchaSubmitUrl, {
@@ -184,7 +189,7 @@ class CaptchaSolverService {
    * Solve CAPTCHA using CapSolver
    * @private
    */
-  async solveCapSolver(siteKey, pageUrl, captchaType, version) {
+  async solveCapSolver(siteKey, pageUrl, captchaType, version, opts = {}) {
     try {
       // Step 1: Create task
       let taskType;
@@ -196,6 +201,7 @@ class CaptchaSolverService {
       switch (captchaType) {
         case 'recaptcha_v2':
           taskType = 'ReCaptchaV2TaskProxyLess';
+          if (opts.invisible) taskData.isInvisible = true;
           break;
         case 'recaptcha_v3':
           taskType = 'ReCaptchaV3TaskProxyLess';
@@ -207,6 +213,7 @@ class CaptchaSolverService {
           break;
         default:
           taskType = 'ReCaptchaV2TaskProxyLess';
+          if (opts.invisible) taskData.isInvisible = true;
       }
 
       const createResponse = await axios.post(this.capSolverUrl, {
@@ -268,31 +275,79 @@ class CaptchaSolverService {
    */
   async injectCaptchaToken(page, token) {
     try {
-      await page.evaluate((token) => {
-        // Inject token into reCAPTCHA textarea
-        const responseElement = document.getElementById('g-recaptcha-response');
-        if (responseElement) {
-          responseElement.innerHTML = token;
-        }
+      const result = await page.evaluate((token) => {
+        const setResponseFields = () => {
+          const nodes = [
+            ...document.querySelectorAll(
+              '#g-recaptcha-response, textarea[name="g-recaptcha-response"], textarea.g-recaptcha-response, [name="h-captcha-response"]'
+            ),
+          ];
+          for (const el of nodes) {
+            el.value = token;
+            el.innerHTML = token;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+          return nodes.length;
+        };
 
-        // For hCaptcha
-        const hCaptchaResponse = document.querySelector('[name="h-captcha-response"]');
-        if (hCaptchaResponse) {
-          hCaptchaResponse.value = token;
-        }
-
-        // Trigger callback if exists
-        if (window.___grecaptcha_cfg && window.___grecaptcha_cfg.clients) {
-          Object.keys(window.___grecaptcha_cfg.clients).forEach((key) => {
-            const client = window.___grecaptcha_cfg.clients[key];
-            if (client && client.callback) {
-              client.callback(token);
+        const findCallbacks = (obj, found = [], seen = new WeakSet()) => {
+          if (!obj || typeof obj !== 'object') return found;
+          if (seen.has(obj)) return found;
+          try {
+            seen.add(obj);
+          } catch (_) {
+            return found;
+          }
+          for (const key of Object.keys(obj)) {
+            let val;
+            try {
+              val = obj[key];
+            } catch (_) {
+              continue;
             }
-          });
+            if (
+              (key === 'callback' || key === 'promise-callback' || key === 'promiseCallback') &&
+              typeof val === 'function'
+            ) {
+              found.push(val);
+            } else if (val && typeof val === 'object') {
+              findCallbacks(val, found, seen);
+            }
+          }
+          return found;
+        };
+
+        const fields = setResponseFields();
+        let callbacks = 0;
+        const cfg = window.___grecaptcha_cfg;
+        if (cfg && cfg.clients) {
+          const cbs = findCallbacks(cfg.clients);
+          for (const cb of cbs) {
+            try {
+              cb(token);
+              callbacks += 1;
+            } catch (_) {
+              /* ignore individual callback failures */
+            }
+          }
         }
+
+        // Also try enterprise / standard grecaptcha helpers if present
+        try {
+          if (window.grecaptcha?.enterprise?.getResponse) {
+            /* no-op: token already injected */
+          }
+        } catch (_) {
+          /* ignore */
+        }
+
+        return { fields, callbacks };
       }, token);
 
-      console.log('   ✅ CAPTCHA token injected into page');
+      console.log(
+        `   ✅ CAPTCHA token injected into page (fields=${result.fields} callbacks=${result.callbacks})`
+      );
     } catch (error) {
       console.error('Error injecting CAPTCHA token:', error);
       throw new Error('Failed to inject CAPTCHA token');
