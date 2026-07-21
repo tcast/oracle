@@ -121,6 +121,20 @@ class PlaywrightService {
   }
 
   async createBrowser(proxyConfig = null, retryWithoutProxy = true, deviceProfile = null) {
+    // Alternate anti-detect engine (Camoufox / Firefox). Additive and opt-in:
+    // default stays Chromium so the organic Reddit stack is never affected.
+    if ((process.env.BROWSER_ENGINE || 'chromium').toLowerCase() === 'camoufox') {
+      try {
+        return await this.createCamoufoxBrowser(proxyConfig, deviceProfile);
+      } catch (error) {
+        if (proxyConfig && retryWithoutProxy) {
+          console.warn('Camoufox launch failed with proxy, retrying without proxy:', error.message);
+          return this.createCamoufoxBrowser(null, deviceProfile);
+        }
+        throw error;
+      }
+    }
+
     const profile = deviceProfile || buildStickyProfile({ preferMobile: false });
     const userAgent = profile.userAgent;
     const viewport = profile.viewport;
@@ -277,6 +291,79 @@ class PlaywrightService {
       }
       throw error;
     }
+  }
+
+  /**
+   * Alternate launch path: Camoufox (anti-detect Firefox fork).
+   *
+   * Returns the same `{ browser, context, page, proxyConfig, deviceProfile }`
+   * shape as createBrowser(), so every downstream flow (xLogin, persistSession,
+   * verifySessionAlive, etc.) works unchanged on the Playwright Page it yields.
+   *
+   * Camoufox spoofs the fingerprint at the C++ engine level (not JS injection),
+   * so we deliberately do NOT stack our Chromium initScript hacks on top. With
+   * `geoip` enabled it derives locale / timezone / WebRTC / geolocation from the
+   * proxy exit IP, which gives the per-account fingerprint consistency we want.
+   *
+   * camoufox-js is ESM-only and needs Node >= 20 + a glibc host with the Camoufox
+   * binary fetched (`npx camoufox-js fetch`). It will not run in the Alpine/Node18
+   * production image; that is intentional — this path is opt-in via BROWSER_ENGINE.
+   */
+  async createCamoufoxBrowser(proxyConfig = null, deviceProfile = null) {
+    const profile = deviceProfile || buildStickyProfile({ preferMobile: false, forceDesktop: true });
+    const { launchOptions } = await import('camoufox-js');
+    const { firefox } = require('playwright');
+
+    const userAgent = profile.userAgent || '';
+    const isMac = /Macintosh|Mac OS X/i.test(userAgent);
+    const isWin = /Windows/i.test(userAgent);
+    const os = isMac ? 'macos' : isWin ? 'windows' : 'linux';
+    const viewport = profile.viewport || { width: 1280, height: 800 };
+
+    let proxy;
+    if (proxyConfig) {
+      const { _proxyId, ...clean } = proxyConfig;
+      proxy = clean;
+    }
+
+    // geoip needs a proxy to resolve against; without one we fall back to the
+    // account's sticky locale/timezone so the fingerprint still stays coherent.
+    const cfOptions = {
+      os,
+      headless: process.env.PLAYWRIGHT_HEADLESS === 'false' ? false : true,
+      humanize: true,
+      block_webrtc: true,
+      geoip: proxy ? true : false,
+      window: [viewport.width, viewport.height],
+    };
+    if (proxy) cfOptions.proxy = proxy;
+    if (!proxy) {
+      cfOptions.locale = profile.locale || 'en-US';
+    }
+
+    const opts = await launchOptions(cfOptions);
+    const browser = await firefox.launch(opts);
+
+    const contextOptions = { viewport };
+    if (!proxy) {
+      contextOptions.timezoneId = profile.timezoneId || 'America/New_York';
+    }
+    const context = await browser.newContext(contextOptions);
+
+    const page = await context.newPage();
+    page.setDefaultTimeout(45000);
+
+    let realUa = userAgent;
+    try {
+      realUa = await page.evaluate(() => navigator.userAgent);
+    } catch (_) { /* keep profile UA */ }
+
+    Object.defineProperty(context, '_userAgent', { value: realUa });
+    Object.defineProperty(context, '_viewport', { value: viewport });
+    Object.defineProperty(context, '_deviceProfile', { value: profile });
+
+    console.log(`Camoufox browser launched (os=${os}, proxy=${proxy ? proxy.server : 'none'}, geoip=${cfOptions.geoip})`);
+    return { browser, context, page, proxyConfig, deviceProfile: profile };
   }
 
   async createBrowserForAccount(accountId, maxRetries = 2, {
