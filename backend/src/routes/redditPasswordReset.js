@@ -62,6 +62,29 @@ router.post('/run-once/:accountId', async (req, res) => {
   }
 });
 
+/** Logged-in prefs password change — no reset email. Prefer while Hotmail never gets reset mail. */
+router.post('/run-in-session/:accountId', async (req, res) => {
+  try {
+    const accountId = Number(req.params.accountId);
+    const dryRun = !!req.body?.dry_run;
+    const force = req.body?.force !== false; // default force for manual pilots
+
+    const { rows } = await pool.query('SELECT * FROM social_accounts WHERE id = $1', [accountId]);
+    const account = rows[0];
+    if (!account) return res.status(404).json({ error: 'Not found' });
+    if (account.platform !== 'reddit') {
+      return res.status(400).json({ error: 'Not a Reddit account' });
+    }
+
+    res.json(
+      await redditPasswordResetService.runInSessionRotateForAccount(account, { dryRun, force })
+    );
+  } catch (error) {
+    console.error('reddit-password-reset run-in-session error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 router.post('/batch', async (req, res) => {
   try {
     const dryRun = req.body?.dry_run !== false; // default dry-run for safety

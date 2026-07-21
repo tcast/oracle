@@ -575,12 +575,12 @@ class RedditPasswordResetService {
     return { url: page.url(), snippet: body.slice(0, 200) };
   }
 
-  async persistNewPassword(accountId, creds, newPassword) {
+  async persistNewPassword(accountId, creds, newPassword, source = 'reddit_password_reset_loop') {
     const next = {
       ...creds,
       password: newPassword,
       password_rotated_at: new Date().toISOString(),
-      password_rotation_source: 'reddit_password_reset_loop',
+      password_rotation_source: source,
     };
     // Keep one previous password for rollback during pilot — not a full history.
     if (creds.password && creds.password !== newPassword) {
@@ -593,6 +593,474 @@ class RedditPasswordResetService {
        WHERE id = $1`,
       [accountId, JSON.stringify(next)]
     );
+  }
+
+  async loginOldRedditPassword(page, username, password) {
+    await page.goto('https://old.reddit.com/login', {
+      waitUntil: 'domcontentloaded',
+      timeout: 90000,
+    });
+    await playwrightService.humanLikeDelay(2000, 3500);
+    await this.dismissCookieBanners(page);
+
+    const body0 = (await page.locator('body').innerText().catch(() => '')).slice(0, 300);
+    if (/blocked by network security|blocked due to a network policy/i.test(body0)) {
+      return { ok: false, blocked: true, snippet: body0.slice(0, 160) };
+    }
+
+    const user = page.locator('#user_login, input[name="user"]').first();
+    const pass = page.locator('#passwd_login, input[name="passwd"]').first();
+    const userVisible = await user.isVisible().catch(() => false);
+    if (!userVisible) {
+      // New Reddit login shell sometimes serves on /login
+      const user2 = page.locator('input[name="username"], input[autocomplete="username"]').first();
+      const pass2 = page.locator('input[name="password"], input[type="password"]').first();
+      if (!(await user2.isVisible().catch(() => false))) {
+        return { ok: false, reason: 'login_form_missing', snippet: body0.slice(0, 160) };
+      }
+      await user2.fill(username);
+      await pass2.fill(password);
+      const submit2 =
+        (await page.$('button:has-text("Log In")')) ||
+        (await page.$('button[type="submit"]'));
+      if (submit2) await submit2.click();
+      else await page.keyboard.press('Enter');
+    } else {
+      await user.fill(username);
+      await pass.fill(password);
+      const submit =
+        (await page.$('#login_login button[type="submit"], button.btn, input[type="submit"]')) ||
+        (await page.$('button[type="submit"]')) ||
+        (await page.$('input[type="submit"]'));
+      if (submit) await submit.click();
+      else await page.keyboard.press('Enter');
+    }
+    await playwrightService.humanLikeDelay(4500, 7500);
+
+    await page.goto('https://old.reddit.com/', {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000,
+    });
+    await playwrightService.humanLikeDelay(1500, 2500);
+    return page.evaluate(() => {
+      const header = document.querySelector('#header-bottom-right');
+      const logout = header?.querySelector('form.logout, a[href*="logout"]');
+      const userLink = header?.querySelector('.user a, span.user a');
+      const userText = (userLink?.textContent || '').trim();
+      const looksLoggedIn =
+        !!logout && !!userText && !/^log\s*in$/i.test(userText) && !/^sign\s*up$/i.test(userText);
+      const text = (document.body?.innerText || '').slice(0, 500);
+      return {
+        ok: looksLoggedIn,
+        user: looksLoggedIn ? userText : null,
+        snippet: text.slice(0, 160),
+      };
+    });
+  }
+
+  /**
+   * Change password while logged in via old.reddit prefs /api/update_password.
+   * Bound Hotmail often never receives Reddit reset mail even when email matches;
+   * this is the reliable protection path for accounts we can still log into.
+   */
+  async changePasswordInSession(page, currentPassword, newPassword) {
+    // old.reddit prefs needs cookies valid on old.reddit — www session alone may not suffice.
+    await page.goto('https://old.reddit.com/', {
+      waitUntil: 'domcontentloaded',
+      timeout: 90000,
+    });
+    await playwrightService.humanLikeDelay(1500, 2500);
+    await this.dismissCookieBanners(page);
+
+    const oldAuth = await page.evaluate(() => {
+      const userLink = document.querySelector('#header-bottom-right .user a, span.user a');
+      const logout = document.querySelector('form.logout, a[href*="logout"]');
+      return {
+        user: userLink?.textContent?.trim() || null,
+        loggedIn: !!(userLink && logout),
+      };
+    });
+    if (!oldAuth.loggedIn) {
+      throw new Error('Not logged in on old.reddit (www session did not carry over)');
+    }
+
+    await page.goto('https://old.reddit.com/prefs/update/', {
+      waitUntil: 'domcontentloaded',
+      timeout: 90000,
+    });
+    await playwrightService.humanLikeDelay(2000, 3500);
+    await this.dismissCookieBanners(page);
+
+    const body0 = (await page.locator('body').innerText().catch(() => '')).slice(0, 400);
+    if (/blocked by network security/i.test(body0)) {
+      throw new Error('old.reddit prefs blocked by network security');
+    }
+
+    const curVisible = await page.locator('input[name="curpass"]').first().isVisible().catch(() => false);
+    if (!curVisible) {
+      throw new Error(`prefs/update missing curpass field: ${body0.slice(0, 180)}`);
+    }
+
+    const modhash = await page.evaluate(() => {
+      if (window.reddit && window.reddit.modhash) return window.reddit.modhash;
+      const m = document.body.innerHTML.match(/modhash["']\s*:\s*["']([^"']+)/);
+      if (m) return m[1];
+      const inp = document.querySelector('input[name="uh"]');
+      return inp ? inp.value : null;
+    });
+    if (!modhash) throw new Error('Reddit modhash not found on prefs page');
+
+    // Prefer JSON API — form submit is flaky (wrong button / silent validation).
+    // Legacy reddit: POST /api/update_password or /api/update with curpass/newpass/verpass.
+    const postUpdate = async (path) =>
+      page.evaluate(
+        async ({ path, curpass, newpass, verpass, uh }) => {
+          const body = new URLSearchParams({
+            curpass,
+            newpass,
+            verpass,
+            uh,
+            api_type: 'json',
+          });
+          const res = await fetch(path, {
+            method: 'POST',
+            credentials: 'include',
+            headers: {
+              'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
+              'x-modhash': uh,
+            },
+            body: body.toString(),
+          });
+          const text = await res.text();
+          let json = null;
+          try {
+            json = JSON.parse(text);
+          } catch (_) {
+            /* html */
+          }
+          return { path, status: res.status, text: text.slice(0, 800), json };
+        },
+        {
+          path,
+          curpass: currentPassword,
+          newpass: newPassword,
+          verpass: newPassword,
+          uh: modhash,
+        }
+      );
+
+    let apiResult = await postUpdate('/api/update_password');
+    const firstBlob = JSON.stringify(apiResult.json || apiResult.text || '');
+    if (/404|not found|does not exist/i.test(firstBlob) || apiResult.status === 404) {
+      apiResult = await postUpdate('/api/update');
+    }
+
+    // While still logged in, record visible status only — do NOT submit the
+    // prefs form (it often posts to /post/update_email and 403s).
+    const statusBits = await page.evaluate(() => {
+      const statuses = [...document.querySelectorAll('.status, #status, .error, .success')]
+        .map((el) => (el.textContent || '').trim())
+        .filter(Boolean);
+      const body = (document.body?.innerText || '').slice(0, 1200);
+      return { statuses, bodySnippet: body.slice(0, 400), url: location.href };
+    });
+
+    const combinedStatus = `${statusBits.statuses.join(' ')} ${statusBits.bodySnippet}`.toLowerCase();
+    const formOk = /password has been updated|preferences have been updated/i.test(combinedStatus);
+    const formBad = /wrong password|incorrect password|bad password/i.test(combinedStatus);
+
+    const apiJson = apiResult.json;
+    const nested = apiJson?.json || apiJson;
+    const errList = Array.isArray(nested?.errors) ? nested.errors : null;
+    const blob = JSON.stringify(apiJson || apiResult.text || '').toLowerCase();
+    const apiOkEmptyErrors = Array.isArray(errList) && errList.length === 0;
+    const apiOkMessage = /password has been updated|preferences have been updated/i.test(blob);
+    const apiRejected =
+      (Array.isArray(errList) && errList.length > 0) ||
+      /wrong.?password|incorrect password|bad_password|bad password match/i.test(blob);
+
+    if (formBad || (apiRejected && !apiOkMessage && !formOk)) {
+      throw new Error(
+        `In-session password change rejected: status=${combinedStatus.slice(0, 180)} api=${blob.slice(0, 180)}`
+      );
+    }
+
+    if (formOk || apiOkMessage) {
+      return {
+        url: page.url(),
+        method: formOk ? 'prefs_status' : 'api_update_password',
+        snippet: formOk ? combinedStatus.slice(0, 200) : blob.slice(0, 200),
+        apiResult,
+        statusBits,
+      };
+    }
+
+    // Ambiguous: API empty errors without visible status — persist path still
+    // treats this as accepted because wrong curpass returns WRONG_PASSWORD.
+    if (apiOkEmptyErrors) {
+      return {
+        url: page.url(),
+        method: 'api_empty_errors_unverified',
+        snippet: blob.slice(0, 200),
+        apiResult,
+        statusBits,
+      };
+    }
+
+    throw new Error(
+      `In-session password change inconclusive: status=${combinedStatus.slice(0, 200)} api=${blob.slice(0, 200)}`
+    );
+  }
+
+  /**
+   * Login (session or password) → change password in prefs → persist → verify login.
+   * Does not use forgot-password email. Leaves schedule alone.
+   */
+  async runInSessionRotateForAccount(account, { dryRun = false, force = false } = {}) {
+    const settings = await this.getSettings();
+    const creds = parseCreds(account.credentials);
+    const info = await this.classifyAccount(account, settings);
+
+    // In-session only needs Reddit password + healthy proxy — inbox optional.
+    const canRotate =
+      account.status === 'active' &&
+      !account.is_simulated &&
+      !!creds.password &&
+      creds.password !== 'default_password' &&
+      info.proxyHealthy;
+
+    if (!canRotate && !force) {
+      return {
+        success: false,
+        skipped: true,
+        reason: !info.proxyHealthy
+          ? info.ineligibleReason || 'proxy_unhealthy'
+          : 'missing_reddit_password',
+        eligibility: info,
+      };
+    }
+
+    if (dryRun) {
+      return {
+        success: true,
+        dryRun: true,
+        method: 'in_session_prefs',
+        eligibility: info,
+        plan: { proxyId: info.proxyId, username: account.username },
+      };
+    }
+
+    let job = await this.ensureJob(account.id);
+    job = await this.refreshDayState(job, settings);
+    if (!force) {
+      if (!job.enabled) return { skipped: true, reason: 'job_disabled' };
+      if (job.status === 'running') return { skipped: true, reason: 'already_running' };
+      if (job.cooldown_until && new Date(job.cooldown_until) > new Date()) {
+        return { skipped: true, reason: 'cooldown', until: job.cooldown_until };
+      }
+      if (job.resets_today >= (settings.max_per_day || 2)) {
+        return { skipped: true, reason: 'daily_cap' };
+      }
+    }
+
+    await this.markRunning(job.id);
+    let browser;
+    const proxyId = info.proxyId;
+    const currentPassword = creds.password;
+    // Reddit rejects some exotic specials from the general generator.
+    const newPassword = generatePassword(16).replace(/[^A-Za-z0-9!@#$%&*_\-]/g, 'A');
+    if (newPassword.length < 10) {
+      throw new Error('generated password too short');
+    }
+
+    try {
+      const result = await playwrightService.createBrowserForAccount(account.id, 2, {
+        requireProxy: true,
+        forceDesktop: true,
+      });
+      browser = result.browser;
+      const page = result.page;
+
+      const loggedIn = await playwrightService.ensureLoggedIn(
+        page,
+        'reddit',
+        account.id,
+        account.username,
+        currentPassword
+      );
+      if (!loggedIn) throw new Error('Login failed before in-session password change');
+
+      // Ensure old.reddit sees the session (password change form lives there).
+      await page.goto('https://old.reddit.com/', {
+        waitUntil: 'domcontentloaded',
+        timeout: 90000,
+      });
+      await playwrightService.humanLikeDelay(1500, 2500);
+      let oldOk = await page.evaluate(() => {
+        const userLink = document.querySelector('#header-bottom-right .user a, span.user a');
+        const logout = document.querySelector('form.logout, a[href*="logout"]');
+        return !!(userLink && logout);
+      });
+      if (!oldOk) {
+        // Password-login via old.reddit login form
+        await page.goto('https://old.reddit.com/login', {
+          waitUntil: 'domcontentloaded',
+          timeout: 90000,
+        });
+        await playwrightService.humanLikeDelay(2000, 3500);
+        const user = page.locator('input[name="user"], input[name="username"], #user_login').first();
+        const pass = page.locator('input[name="passwd"], input[name="password"], #passwd_login').first();
+        await user.waitFor({ state: 'visible', timeout: 20000 });
+        await user.fill(account.username);
+        await pass.fill(currentPassword);
+        const submit =
+          (await page.$('button[type="submit"]')) ||
+          (await page.$('input[type="submit"]'));
+        if (submit) await submit.click();
+        else await page.keyboard.press('Enter');
+        await playwrightService.humanLikeDelay(4000, 7000);
+        oldOk = await page.evaluate(() => {
+          const userLink = document.querySelector('#header-bottom-right .user a, span.user a');
+          const logout = document.querySelector('form.logout, a[href*="logout"]');
+          return !!(userLink && logout);
+        });
+        if (!oldOk) throw new Error('old.reddit login failed before password change');
+        await playwrightService.persistSession(page, 'reddit', account.id).catch(() => {});
+      }
+
+      const completed = await this.changePasswordInSession(page, currentPassword, newPassword);
+
+      // Persist IMMEDIATELY once Reddit accepts the change.
+      // `/api/update_password` returns WRONG_PASSWORD for bad curpass and
+      // `errors:[]` for success — proven live. Re-login verify often hits
+      // ProxyBase network-policy blocks, so we must not lose the new password.
+      const accepted =
+        completed?.method === 'prefs_form_status' ||
+        completed?.method === 'api_update_password' ||
+        completed?.method === 'api_empty_errors_unverified' ||
+        /errors":\s*\[\]/.test(JSON.stringify(completed?.apiResult || {}));
+      if (!accepted) {
+        throw new Error(`Password change not accepted: ${JSON.stringify(completed).slice(0, 300)}`);
+      }
+      await this.persistNewPassword(
+        account.id,
+        creds,
+        newPassword,
+        'reddit_in_session_prefs'
+      );
+      await playwrightService.persistSession(page, 'reddit', account.id).catch(() => {});
+
+      // Close the logged-in browser before verify — clearing cookies in-place
+      // triggers Reddit "network policy" blocks on the same proxy session.
+      await Promise.race([
+        browser.close().catch(() => {}),
+        new Promise((r) => setTimeout(r, 8000)),
+      ]);
+      playwrightService._untrackBrowser?.(account.id);
+      browser = null;
+      await new Promise((r) => setTimeout(r, 5000));
+
+      let loginOk = false;
+      let oldStillWorks = false;
+      let verifyMeta = {};
+      {
+        // Prefer a direct (skipProxy) verify browser — ProxyBase often network-policy
+        // blocks password login right after update_password on the same sticky IP.
+        let verifyBrowser;
+        try {
+          verifyBrowser = await playwrightService.createBrowserForAccount(account.id, 1, {
+            skipProxy: true,
+            forceDesktop: true,
+          });
+          verifyMeta.verifyVia = 'direct';
+        } catch (directErr) {
+          verifyMeta.directError = String(directErr.message || directErr).slice(0, 160);
+          verifyBrowser = await playwrightService.createBrowserForAccount(account.id, 2, {
+            requireProxy: true,
+            forceDesktop: true,
+          });
+          verifyMeta.verifyVia = 'proxy';
+        }
+        browser = verifyBrowser.browser;
+        const vpage = verifyBrowser.page;
+        try {
+          const neu = await this.loginOldRedditPassword(vpage, account.username, newPassword);
+          loginOk = !!neu.ok;
+          verifyMeta.newLogin = neu;
+          if (!loginOk) {
+            const old = await this.loginOldRedditPassword(vpage, account.username, currentPassword);
+            oldStillWorks = !!old.ok;
+            verifyMeta.oldLogin = old;
+          } else {
+            await playwrightService.persistSession(vpage, 'reddit', account.id).catch(() => {});
+          }
+        } catch (verifyErr) {
+          verifyMeta.verifyError = String(verifyErr.message || verifyErr).slice(0, 240);
+        }
+      }
+
+      await this.markSuccess(job, settings);
+      await this.logAction(
+        account.id,
+        proxyId,
+        loginOk ? 'rotated_verified_in_session' : 'rotated_in_session_unverified',
+        {
+          method: 'in_session_prefs',
+          completed,
+          loginOk,
+          oldStillWorks,
+          verifyMeta,
+        }
+      );
+      if (proxyId) await proxyService.updateProxyStats(proxyId, true).catch(() => {});
+
+      return {
+        success: true,
+        method: 'in_session_prefs',
+        accountId: account.id,
+        username: account.username,
+        loginOk,
+        verified: loginOk,
+        passwordRotatedAt: new Date().toISOString(),
+        warning: loginOk
+          ? null
+          : 'Password persisted after Reddit accepted change; login verify blocked (retry later)',
+      };
+    } catch (err) {
+      const failureClass = await this.markFailure(job, err);
+      await this.logAction(account.id, proxyId, 'failed_in_session', {}, err.message);
+      if (
+        proxyId &&
+        /tunnel|timed_out|timeout|proxy|err_|network.security|blocked by network/i.test(
+          err.message || ''
+        )
+      ) {
+        await proxyService
+          .updateProxyStats(proxyId, false, { reason: err.message })
+          .catch(() => {});
+      }
+      return {
+        success: false,
+        method: 'in_session_prefs',
+        accountId: account.id,
+        username: account.username,
+        error: err.message,
+        failureClass,
+      };
+    } finally {
+      if (browser) await browser.close().catch(() => {});
+      playwrightService._untrackBrowser?.(account.id);
+      await pool
+        .query(
+          `UPDATE reddit_password_reset_jobs
+           SET status = 'idle',
+               last_error = COALESCE(last_error, 'run_interrupted'),
+               updated_at = NOW()
+           WHERE id = $1 AND status = 'running'`,
+          [job.id]
+        )
+        .catch(() => {});
+    }
   }
 
   /**
