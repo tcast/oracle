@@ -86,7 +86,9 @@ class CaptchaSolverService {
    * @returns {Promise<string>} CAPTCHA solution token
    */
   async solveCaptcha(siteKey, pageUrl, captchaType = 'recaptcha_v2', version = null, opts = {}) {
-    console.log(`🧩 Solving ${captchaType} CAPTCHA for ${pageUrl}`);
+    console.log(
+      `🧩 Solving ${captchaType}${opts.enterprise ? ' enterprise' : ''}${opts.invisible ? ' invisible' : ''} CAPTCHA for ${pageUrl}`
+    );
 
     try {
       // Try 2Captcha first (primary solver)
@@ -132,6 +134,9 @@ class CaptchaSolverService {
 
       if (opts.invisible && captchaType === 'recaptcha_v2') {
         submitParams.invisible = 1;
+      }
+      if (opts.enterprise && captchaType.startsWith('recaptcha')) {
+        submitParams.enterprise = 1;
       }
 
       const submitResponse = await axios.get(this.twoCaptchaSubmitUrl, {
@@ -200,11 +205,17 @@ class CaptchaSolverService {
 
       switch (captchaType) {
         case 'recaptcha_v2':
-          taskType = 'ReCaptchaV2TaskProxyLess';
+          if (opts.enterprise) {
+            taskType = 'ReCaptchaV2EnterpriseTaskProxyLess';
+          } else {
+            taskType = 'ReCaptchaV2TaskProxyLess';
+          }
           if (opts.invisible) taskData.isInvisible = true;
           break;
         case 'recaptcha_v3':
-          taskType = 'ReCaptchaV3TaskProxyLess';
+          taskType = opts.enterprise
+            ? 'ReCaptchaV3EnterpriseTaskProxyLess'
+            : 'ReCaptchaV3TaskProxyLess';
           taskData.pageAction = version || 'submit';
           taskData.minScore = 0.3;
           break;
@@ -212,7 +223,9 @@ class CaptchaSolverService {
           taskType = 'HCaptchaTaskProxyLess';
           break;
         default:
-          taskType = 'ReCaptchaV2TaskProxyLess';
+          taskType = opts.enterprise
+            ? 'ReCaptchaV2EnterpriseTaskProxyLess'
+            : 'ReCaptchaV2TaskProxyLess';
           if (opts.invisible) taskData.isInvisible = true;
       }
 
@@ -335,8 +348,17 @@ class CaptchaSolverService {
 
         // Also try enterprise / standard grecaptcha helpers if present
         try {
-          if (window.grecaptcha?.enterprise?.getResponse) {
-            /* no-op: token already injected */
+          if (window.grecaptcha?.enterprise) {
+            const clients = window.___grecaptcha_cfg?.clients || {};
+            const more = findCallbacks(clients);
+            for (const cb of more) {
+              try {
+                cb(token);
+                callbacks += 1;
+              } catch (_) {
+                /* ignore */
+              }
+            }
           }
         } catch (_) {
           /* ignore */

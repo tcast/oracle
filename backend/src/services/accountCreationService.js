@@ -344,73 +344,114 @@ class AccountCreationService {
           size === 'invisible' ||
           el.classList.contains('g-recaptcha-invisible') ||
           !!document.querySelector('.grecaptcha-badge');
-        return { siteKey, type: 'recaptcha_v2', invisible };
+        const enterprise =
+          !!window.grecaptcha?.enterprise ||
+          /enterprise/i.test(el.getAttribute('data-enterprise') || '');
+        return { siteKey, type: 'recaptcha_v2', invisible, enterprise };
       }
 
       const iframe = document.querySelector(
-        'iframe[src*="recaptcha"], iframe[title*="reCAPTCHA"], iframe[src*="hcaptcha"]'
+        'iframe[src*="recaptcha"], iframe[title*="reCAPTCHA"], iframe[src*="hcaptcha"], iframe[src*="enterprise"]'
       );
       if (iframe) {
         const src = iframe.getAttribute('src') || '';
         const m = src.match(/[?&]k=([^&]+)/);
         if (m) {
-          const invisible = /size=invisible/i.test(src) || !!document.querySelector('.grecaptcha-badge');
+          const invisible =
+            /size=invisible/i.test(src) || !!document.querySelector('.grecaptcha-badge');
+          const enterprise = /enterprise/i.test(src) || !!window.grecaptcha?.enterprise;
           return {
             siteKey: decodeURIComponent(m[1]),
             type: src.includes('hcaptcha') ? 'hcaptcha' : 'recaptcha_v2',
             invisible,
+            enterprise,
           };
         }
+      }
+
+      // Reddit phone verify often loads enterprise via script without a static iframe k=
+      if (window.grecaptcha?.enterprise || document.querySelector('script[src*="recaptcha/enterprise"]')) {
+        return {
+          siteKey: null,
+          type: 'recaptcha_v2',
+          invisible: true,
+          enterprise: true,
+          needsNetworkKey: true,
+        };
       }
       return null;
     });
   }
 
-  async maybeSolveCaptcha(page, pageUrl) {
+  async maybeSolveCaptcha(page, pageUrl, opts = {}) {
     const captchaFrame = await page.$(
-      'iframe[title*="recaptcha"], iframe[src*="captcha"], iframe[src*="hcaptcha"], [data-sitekey], .grecaptcha-badge'
+      'iframe[title*="recaptcha"], iframe[src*="captcha"], iframe[src*="hcaptcha"], iframe[src*="enterprise"], [data-sitekey], .grecaptcha-badge, script[src*="recaptcha/enterprise"]'
     );
-    if (!captchaFrame) return { solved: false, reason: 'none' };
+    const forcedEnterprise = opts.enterprise === true;
+    if (!captchaFrame && !forcedEnterprise && !opts.siteKey) {
+      return { solved: false, reason: 'none' };
+    }
 
-    const info = await this.extractCaptchaSiteKey(page);
+    let info = (await this.extractCaptchaSiteKey(page)) || {};
+    if (opts.siteKey) info.siteKey = opts.siteKey;
+    if (forcedEnterprise || info.enterprise) info.enterprise = true;
+    if (opts.invisible != null) info.invisible = opts.invisible;
+    if (!info.type) info.type = 'recaptcha_v2';
+
+    // Fall back to known Reddit register enterprise sitekey if DOM lacks k=
+    if (!info.siteKey && (info.enterprise || forcedEnterprise)) {
+      info.siteKey = opts.siteKey || '6LfirrMoAAAAAHZOipvza4kpp_VtTwLNuXVwURNQ';
+      info.invisible = true;
+      info.enterprise = true;
+    }
+
     if (!info?.siteKey) {
       return { solved: false, reason: 'captcha_present_no_sitekey' };
     }
 
     console.log(
-      `CAPTCHA detected (${info.type}${info.invisible ? '/invisible' : ''}), solving…`
+      `CAPTCHA detected (${info.type}${info.invisible ? '/invisible' : ''}${info.enterprise ? '/enterprise' : ''}), solving…`
     );
     const token = await captchaSolverService.solveCaptcha(
       info.siteKey,
       pageUrl,
       info.type,
       null,
-      { invisible: !!info.invisible }
+      { invisible: !!info.invisible, enterprise: !!info.enterprise }
     );
     await captchaSolverService.injectCaptchaToken(page, token);
-    return { solved: true, type: info.type, invisible: !!info.invisible };
+    return {
+      solved: true,
+      type: info.type,
+      invisible: !!info.invisible,
+      enterprise: !!info.enterprise,
+      siteKey: info.siteKey,
+    };
   }
 
   /**
-   * Click the phone/email auth-modal Continue (not cookie banners / back links).
+   * Click the phone/email auth-modal Continue (not cookie banners / SSO / back links).
    */
   async clickRedditContinue(page) {
     const candidates = [
-      page.locator('auth-flow-modal button:has-text("Continue"):not([disabled])').last(),
-      page.locator('faceplate-tracker button:has-text("Continue"):not([disabled])').last(),
+      page.locator('auth-flow-modal button[type="submit"]:has-text("Continue"):not([disabled])').last(),
+      page.locator('button[type="submit"]:has-text("Continue"):not([disabled])').last(),
       page.getByRole('button', { name: /^Continue$/ }).last(),
-      page.locator('button:has-text("Continue"):not([disabled])').last(),
+      page.locator('auth-flow-modal button:has-text("Continue"):not([disabled])').last(),
     ];
     for (const loc of candidates) {
       const visible = await loc.isVisible().catch(() => false);
       if (!visible) continue;
+      const text = ((await loc.innerText().catch(() => '')) || '').trim();
+      // Never click SSO / email add-ons
+      if (/sso|email|google|apple/i.test(text) && !/^Continue$/i.test(text)) continue;
       const enabled = await loc.isEnabled().catch(() => true);
       if (!enabled) continue;
       await loc.scrollIntoViewIfNeeded().catch(() => {});
       await loc.click({ timeout: 12000 }).catch(async () => {
         await loc.click({ force: true }).catch(() => {});
       });
-      return 'click';
+      return `click:${text.slice(0, 40) || 'Continue'}`;
     }
     // Last resort: submit via Enter on focused phone field
     await page.keyboard.press('Enter').catch(() => {});
@@ -746,9 +787,24 @@ class AccountCreationService {
   async createRedditAccountViaPhone(page, username, password) {
     let smsRequest = null;
     const apiHits = [];
-    const onResponse = (resp) => {
+    let enterpriseSiteKey = null;
+    let verifyPhoneStatus = null;
+    const onResponse = async (resp) => {
       try {
         const url = resp.url();
+        if (/recaptcha\/enterprise\/(?:reload|anchor)/i.test(url)) {
+          const m = url.match(/[?&]k=([^&]+)/);
+          if (m) enterpriseSiteKey = decodeURIComponent(m[1]);
+        }
+        if (/verify_phone_by_code_initialize/i.test(url)) {
+          verifyPhoneStatus = resp.status();
+          apiHits.push({
+            status: resp.status(),
+            url: url.slice(0, 200),
+            kind: 'verify_phone_init',
+          });
+          return;
+        }
         if (
           /phone|otp|sms|verify|register|auth|captcha|check|account/i.test(url) &&
           /reddit\.com|recaptcha|hcaptcha/i.test(url)
@@ -814,9 +870,7 @@ class AccountCreationService {
         );
       }
 
-      // Buy SMS first, then type → captcha → Continue with minimal gap so the
-      // token is fresh for the phone-verify request (prior flow solved captcha
-      // before SMS buy and Continue stayed on phone with a network-security toast).
+      // Buy SMS first, then type → enterprise captcha → Continue with minimal gap.
       smsRequest = await this.acquireRedditSmsNumber();
       const phone = this.formatUsPhoneForReddit(smsRequest.number);
 
@@ -834,7 +888,7 @@ class AccountCreationService {
       // Wait briefly for Continue to enable after valid 10-digit entry
       for (let i = 0; i < 6; i++) {
         const enabled = await page
-          .locator('button:has-text("Continue"):not([disabled])')
+          .locator('button[type="submit"]:has-text("Continue"):not([disabled])')
           .last()
           .isVisible()
           .catch(() => false);
@@ -842,16 +896,22 @@ class AccountCreationService {
         await this.humanLikeDelay(400, 700);
       }
 
-      const preCaptcha = await this.maybeSolveCaptcha(page, page.url());
+      // Reddit phone verify uses reCAPTCHA Enterprise (invisible)
+      const preCaptcha = await this.maybeSolveCaptcha(page, page.url(), {
+        enterprise: true,
+        invisible: true,
+        siteKey: enterpriseSiteKey || undefined,
+      });
       if (preCaptcha.reason === 'captcha_present_no_sitekey') {
         throw new Error(
           'CAPTCHA present but sitekey not extractable on phone form — blocked'
         );
       }
       console.log(
-        `Reddit phone create: using ${phone.e164} via ${smsRequest.provider} (req ${smsRequest.id}) captcha=${JSON.stringify(preCaptcha)}`
+        `Reddit phone create: using ${phone.e164} via ${smsRequest.provider} (req ${smsRequest.id}) captcha=${JSON.stringify(preCaptcha)} enterpriseKey=${enterpriseSiteKey || 'fallback'}`
       );
 
+      verifyPhoneStatus = null;
       const how = await this.clickRedditContinue(page);
       console.log(`Reddit phone Continue via ${how}`);
       await this.humanLikeDelay(2500, 4000);
@@ -863,12 +923,18 @@ class AccountCreationService {
           `blocked by network security / js_challenge on phone verify (snap=${dump.snap}): ${postContinue.snippet}`
         );
       }
+      if (verifyPhoneStatus === 403) {
+        const dump = await this.dumpRedditPhoneStuck(page, 'verify403');
+        throw new Error(
+          `blocked by network security / js_challenge on phone verify (HTTP 403 verify_phone_by_code_initialize, snap=${dump.snap})`
+        );
+      }
       const pageText = postContinue.snippet || '';
       if (/try a different number|invalid phone|not able to verify|couldn't verify|please enter a valid/i.test(pageText)) {
         throw new Error(`Reddit rejected phone number: ${pageText.slice(0, 180)}`);
       }
 
-      // Wait up to ~35s for OTP field (SMS request already purchased)
+      // Wait up to ~40s for OTP field (SMS request already purchased)
       const codeInput = page
         .locator(
           'input[name="code"], input[autocomplete="one-time-code"], input[placeholder*="code" i], faceplate-text-input[name="code"] input, faceplate-text-input[name="otp"] input'
@@ -883,6 +949,12 @@ class AccountCreationService {
             `blocked by network security / js_challenge waiting for phone OTP (snap=${dump.snap}): ${mid.snippet}`
           );
         }
+        if (verifyPhoneStatus === 403) {
+          const dump = await this.dumpRedditPhoneStuck(page, 'verify403-wait');
+          throw new Error(
+            `blocked by network security / js_challenge waiting for phone OTP (HTTP 403 verify_phone, snap=${dump.snap})`
+          );
+        }
         // Only count visible OTP inputs (hidden faceplate inputs exist on earlier steps)
         if (await codeInput.isVisible().catch(() => false)) {
           const box = await codeInput.boundingBox().catch(() => null);
@@ -891,31 +963,32 @@ class AccountCreationService {
             break;
           }
         }
-        if (/verification code|enter the code|6-digit|texted you|sent you a code/i.test(mid.snippet) ||
-            /verification code|enter the code|6-digit|texted you|sent you a code/i.test(
-              await page.evaluate(() => (document.body?.innerText || '').slice(0, 800)).catch(() => '')
-            )) {
-          // Re-query in case OTP field uses a different name after navigation
-          const alt = page
-            .locator(
-              'input[name="code"], input[autocomplete="one-time-code"], faceplate-text-input input'
-            )
-            .first();
-          if (await alt.isVisible().catch(() => false)) {
-            codeVisible = true;
-            break;
-          }
+        const bodyText = await page
+          .evaluate(() => (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 800))
+          .catch(() => '');
+        if (
+          /verification code|enter the code|6-digit|texted you|sent you a code/i.test(mid.snippet) ||
+          /verification code|enter the code|6-digit|texted you|sent you a code/i.test(bodyText)
+        ) {
           codeVisible = true;
           break;
         }
 
-        // If still on phone form with enabled Continue, captcha may have been
-        // consumed — re-solve once and click Continue again.
+        // If still on phone form, re-solve enterprise captcha once and retry Continue
         if (w === 4 || w === 9) {
-          const stillPhone = /sign up or log in with your phone|phone number/i.test(mid.snippet);
+          const stillPhone = /sign up or log in with your phone|phone number/i.test(
+            mid.snippet || bodyText
+          );
           if (stillPhone) {
-            console.warn('Reddit phone still on form — re-solving captcha and retrying Continue');
-            await this.maybeSolveCaptcha(page, page.url()).catch(() => ({}));
+            console.warn(
+              'Reddit phone still on form — re-solving enterprise captcha and retrying Continue'
+            );
+            await this.maybeSolveCaptcha(page, page.url(), {
+              enterprise: true,
+              invisible: true,
+              siteKey: enterpriseSiteKey || undefined,
+            }).catch(() => ({}));
+            verifyPhoneStatus = null;
             await this.clickRedditContinue(page);
             await this.humanLikeDelay(2000, 3000);
           }
@@ -925,9 +998,9 @@ class AccountCreationService {
       if (!codeVisible) {
         const dump = await this.dumpRedditPhoneStuck(page, 'nocode');
         const final = await this.detectRedditNetworkBlock(page);
-        if (final.blocked) {
+        if (final.blocked || verifyPhoneStatus === 403) {
           throw new Error(
-            `blocked by network security / js_challenge on phone verify (snap=${dump.snap}): ${final.snippet}`
+            `blocked by network security / js_challenge on phone verify (snap=${dump.snap} status=${verifyPhoneStatus}): ${final.snippet}`
           );
         }
         const hitSummary = apiHits
@@ -975,17 +1048,18 @@ class AccountCreationService {
         await this.humanLikeDelay();
       }
 
-      const captchaResult = await this.maybeSolveCaptcha(page, page.url());
+      const captchaResult = await this.maybeSolveCaptcha(page, page.url(), {
+        enterprise: true,
+        invisible: true,
+        siteKey: enterpriseSiteKey || undefined,
+      });
       if (captchaResult.reason === 'captcha_present_no_sitekey') {
         throw new Error(
           'CAPTCHA present but sitekey not extractable — blocked (need solver wiring for this challenge type)'
         );
       }
 
-      const submit = await page.$(
-        'button[type="submit"], button:has-text("Sign Up"), button:has-text("Create"), button:has-text("Continue")'
-      );
-      if (submit) await submit.click();
+      await this.clickRedditContinue(page);
       await page.waitForLoadState('domcontentloaded', { timeout: 20000 }).catch(() => {});
       await this.humanLikeDelay(2000, 4000);
 
