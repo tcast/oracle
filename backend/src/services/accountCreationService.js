@@ -678,20 +678,31 @@ class AccountCreationService {
         await phoneLocator.waitFor({ state: 'visible', timeout: 15000 });
       }
 
-      // Prefer national 10-digit when a +1 country prefix is already shown
-      const pageHint = await page
-        .evaluate(() => (document.body?.innerText || '').slice(0, 500))
-        .catch(() => '');
-      const hasUsPrefix = /\+1\b|United States|USA/i.test(pageHint);
-      await this.typeIntoLocator(page, phoneLocator, hasUsPrefix ? phone.national : phone.e164);
-      await this.humanLikeDelay();
+      // Reddit phone form shows a country +1 selector; always type national 10 digits.
+      // Typing 1856… leaves an extra leading 1 and Continue never advances to OTP.
+      await this.typeIntoLocator(page, phoneLocator, phone.national);
+      await this.humanLikeDelay(800, 1500);
 
-      const continueBtn = await page.$(
-        'button:has-text("Continue"), button:has-text("Next"), button:has-text("Send code"), button[type="submit"]'
-      );
-      if (continueBtn) {
-        await continueBtn.click().catch(() => {});
-        await this.humanLikeDelay(1500, 3000);
+      // Confirm value landed as 10 digits
+      const typed = await phoneLocator.inputValue().catch(() => '');
+      const typedDigits = String(typed || '').replace(/\D/g, '');
+      if (typedDigits.length && typedDigits.length !== 10) {
+        console.warn(`Reddit phone field value unexpected: ${typed} — retyping national`);
+        await this.typeIntoLocator(page, phoneLocator, phone.national);
+        await this.humanLikeDelay(500, 1000);
+      }
+
+      const continueBtn = page
+        .locator('button:has-text("Continue"), button[type="submit"]')
+        .filter({ hasText: /^Continue$/i })
+        .first();
+      const continueFallback = page.locator('button:has-text("Continue")').last();
+      const btn = (await continueBtn.isVisible().catch(() => false))
+        ? continueBtn
+        : continueFallback;
+      if (await btn.isVisible().catch(() => false)) {
+        await btn.click().catch(() => {});
+        await this.humanLikeDelay(2500, 4000);
       }
 
       const pageText = await page
@@ -700,26 +711,41 @@ class AccountCreationService {
       if (/blocked by network security|js_challenge/i.test(pageText)) {
         throw new Error('blocked by network security / js_challenge on phone verify');
       }
-      if (/try a different number|invalid phone|not able to verify|couldn't verify/i.test(pageText)) {
+      if (/try a different number|invalid phone|not able to verify|couldn't verify|please enter a valid/i.test(pageText)) {
         throw new Error(`Reddit rejected phone number: ${pageText.replace(/\s+/g, ' ').slice(0, 180)}`);
       }
 
-      const onCodePage = /verification code|enter the code|6-digit|texted you|sent you a code|sms code/i.test(
-        pageText
-      );
+      // Wait up to ~25s for OTP field to appear (SMS request already purchased)
       const codeInput = page
         .locator(
           'input[name="code"], input[autocomplete="one-time-code"], input[placeholder*="code" i], faceplate-text-input[name="code"] input'
         )
         .first();
-      const codeVisible =
-        onCodePage || (await codeInput.isVisible().catch(() => false));
+      let codeVisible = false;
+      for (let w = 0; w < 10; w++) {
+        const midText = await page
+          .evaluate(() => (document.body?.innerText || '').slice(0, 500))
+          .catch(() => '');
+        if (/blocked by network security|js_challenge/i.test(midText)) {
+          throw new Error('blocked by network security / js_challenge waiting for phone OTP');
+        }
+        if (await codeInput.isVisible().catch(() => false)) {
+          codeVisible = true;
+          break;
+        }
+        if (/verification code|enter the code|6-digit|texted you|sent you a code/i.test(midText)) {
+          codeVisible = true;
+          break;
+        }
+        await this.humanLikeDelay(1500, 2500);
+      }
       if (!codeVisible) {
         const snap = `/tmp/reddit-phone-nocode-${Date.now()}.png`;
         await page.screenshot({ path: snap, fullPage: true }).catch(() => {});
-        throw new Error(
-          `Reddit phone: code input not shown after submit (snap=${snap}) ${pageText.replace(/\s+/g, ' ').slice(0, 220)}`
-        );
+        const finalText = await page
+          .evaluate(() => (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 220))
+          .catch(() => '');
+        throw new Error(`Reddit phone: code input not shown after submit (snap=${snap}) ${finalText}`);
       }
 
       const verified = await this.waitRedditSmsCode(smsRequest, 180000);
@@ -1289,7 +1315,7 @@ class AccountCreationService {
             const msg = err.message || String(err);
             const netBlocked = /blocked by network security|js_challenge/i.test(msg);
             const proxyFlake =
-              /ERR_TUNNEL|ERR_TIMED_OUT|ERR_PROXY|ERR_CONNECTION|tunnel_connection|proxy|Phone signup option not found|register UI not ready/i.test(
+              /ERR_TUNNEL|ERR_TIMED_OUT|ERR_PROXY|ERR_CONNECTION|tunnel_connection|proxy|Phone signup option not found|register UI not ready|code input not shown/i.test(
                 msg
               );
             const phoneRejected = /Reddit rejected phone/i.test(msg);
