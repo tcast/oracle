@@ -657,7 +657,31 @@ class RedditPasswordResetService {
         browser = result.browser;
         const page = result.page;
         const triggerEmail = account.email || creds.email || account.username;
-        trigger = await this.triggerForgotPassword(page, triggerEmail);
+        const triggerUsername = account.username;
+        // Bought accounts: try email first, then username — Reddit sometimes only
+        // delivers when the identifier matches how the account was registered.
+        try {
+          trigger = await this.triggerForgotPassword(page, triggerEmail);
+        } catch (emailTriggerErr) {
+          console.warn(
+            `Forgot via email failed for ${account.username}: ${emailTriggerErr.message}; trying username`
+          );
+          trigger = await this.triggerForgotPassword(page, triggerUsername);
+        }
+        // If email "succeeded" but we later find no mail, callers poll; also fire
+        // a second username trigger when email !== username (cheap, same session).
+        if (
+          triggerEmail &&
+          triggerUsername &&
+          String(triggerEmail).toLowerCase() !== String(triggerUsername).toLowerCase()
+        ) {
+          try {
+            await this.triggerForgotPassword(page, triggerUsername);
+            trigger = { ...trigger, alsoTriggeredUsername: true };
+          } catch (userTriggerErr) {
+            console.warn(`Username forgot follow-up failed: ${userTriggerErr.message}`);
+          }
+        }
         console.log(
           `Password-reset phase1 trigger ok account=${account.id}:`,
           (trigger?.confirmationSnippet || '').slice(0, 120)
