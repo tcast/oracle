@@ -935,7 +935,7 @@ class RedditPasswordResetService {
       // `errors:[]` for success — proven live. Re-login verify often hits
       // ProxyBase network-policy blocks, so we must not lose the new password.
       const accepted =
-        completed?.method === 'prefs_form_status' ||
+        completed?.method === 'prefs_status' ||
         completed?.method === 'api_update_password' ||
         completed?.method === 'api_empty_errors_unverified' ||
         /errors":\s*\[\]/.test(JSON.stringify(completed?.apiResult || {}));
