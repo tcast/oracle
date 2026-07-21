@@ -16,7 +16,7 @@ const smsManService = require('../services/smsManService');
 const fiveSimService = require('../services/fiveSimService');
 
 const LOG = process.env.PILOT_LOG || '/tmp/reddit-phone-pilot.log';
-const forcedProxyIds = String(process.env.PILOT_PROXY_IDS || '104,90')
+const forcedProxyIds = String(process.env.PILOT_PROXY_IDS || '115,89,194,181,90,104')
   .split(',')
   .map((s) => parseInt(s.trim(), 10))
   .filter((n) => Number.isFinite(n) && n > 0);

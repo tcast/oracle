@@ -562,19 +562,64 @@ class AccountCreationService {
   }
 
   async clickRedditSignupMethod(page, method) {
-    const label = method === 'phone' ? /phone/i : /email/i;
-    const exact = method === 'phone' ? 'Phone' : 'Email';
-    const choice =
-      (await page.$(`button:has-text("${exact}")`)) ||
-      (await page.$(`a:has-text("${exact}")`)) ||
-      (await page.getByRole('button', { name: label }).first().elementHandle().catch(() => null)) ||
-      (await page.getByText(exact, { exact: true }).first().elementHandle().catch(() => null));
-    if (choice) {
-      await choice.click().catch(() => {});
+    const phoneRe = /continue with phone|phone number|^phone$/i;
+    const emailRe = /continue with email|^email$/i;
+    const label = method === 'phone' ? phoneRe : emailRe;
+    // Prefer the full Reddit CTA labels seen on /register
+    const preferredTexts =
+      method === 'phone'
+        ? ['Continue with Phone Number', 'Continue with Phone', 'Phone']
+        : ['Continue with Email', 'Email'];
+
+    for (const exact of preferredTexts) {
+      const choice =
+        (await page.$(`button:has-text("${exact}")`)) ||
+        (await page.$(`a:has-text("${exact}")`)) ||
+        (await page.getByRole('button', { name: exact }).elementHandle().catch(() => null));
+      if (choice) {
+        await choice.click().catch(() => {});
+        await this.humanLikeDelay(1000, 2000);
+        return true;
+      }
+    }
+
+    const byRole = await page
+      .getByRole('button', { name: label })
+      .first()
+      .elementHandle()
+      .catch(() => null);
+    if (byRole) {
+      await byRole.click().catch(() => {});
       await this.humanLikeDelay(1000, 2000);
       return true;
     }
     return false;
+  }
+
+  async waitForRedditRegisterReady(page, timeoutMs = 45000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const state = await page
+        .evaluate(() => {
+          const text = document.body?.innerText || '';
+          return {
+            blocked: /blocked by network security|js_challenge/i.test(text),
+            ready: /Continue with Phone|Continue with Email|Sign Up|Email\*|Phone Number/i.test(text),
+            snippet: text.replace(/\s+/g, ' ').slice(0, 220),
+          };
+        })
+        .catch(() => ({ blocked: false, ready: false, snippet: '' }));
+      if (state.blocked) {
+        throw new Error(
+          `blocked by network security / js_challenge on register: ${state.snippet}`
+        );
+      }
+      if (state.ready) return state;
+      await this.humanLikeDelay(1200, 2000);
+    }
+    const snap = `/tmp/reddit-register-notready-${Date.now()}.png`;
+    await page.screenshot({ path: snap, fullPage: true }).catch(() => {});
+    throw new Error(`Reddit register UI not ready (snap=${snap})`);
   }
 
   /**
@@ -583,6 +628,8 @@ class AccountCreationService {
   async createRedditAccountViaPhone(page, username, password) {
     let smsRequest = null;
     try {
+      await this.waitForRedditRegisterReady(page);
+
       const clicked = await this.clickRedditSignupMethod(page, 'phone');
       if (!clicked) {
         // Some builds land directly on a phone field
@@ -592,8 +639,20 @@ class AccountCreationService {
           )
           .first();
         if (!(await telProbe.isVisible().catch(() => false))) {
-          throw new Error('Reddit register: Phone signup option not found');
+          const body = await page
+            .evaluate(() => (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 240))
+            .catch(() => '');
+          throw new Error(`Reddit register: Phone signup option not found (${body})`);
         }
+      }
+
+      await this.humanLikeDelay(1500, 3000);
+      // Re-check block after clicking phone (Reddit often banners then)
+      const afterClick = await page
+        .evaluate(() => (document.body?.innerText || '').slice(0, 500))
+        .catch(() => '');
+      if (/blocked by network security|js_challenge/i.test(afterClick)) {
+        throw new Error('blocked by network security / js_challenge after phone click');
       }
 
       smsRequest = await this.acquireRedditSmsNumber();
@@ -725,7 +784,6 @@ class AccountCreationService {
       }
 
       const cookies = await page.context().cookies();
-      // Number consumed successfully — finish/cancel not needed for SMS-Man after code; best-effort finish for 5SIM already done in getVerificationCode
       return {
         success: true,
         username,
@@ -767,6 +825,11 @@ class AccountCreationService {
       await this.humanLikeDelay(2500, 4500);
 
       await this.dismissRedditCookieBanners(page);
+      // Give shreddit auth modal time to hydrate before choosing phone/email
+      await this.waitForRedditRegisterReady(page).catch((err) => {
+        if (/blocked by network security|js_challenge/i.test(err.message)) throw err;
+        console.warn(`register ready wait soft-fail: ${err.message}`);
+      });
 
       if (verifyMode === 'phone' || verifyMode === 'phone_only') {
         return await this.createRedditAccountViaPhone(page, username, password);
@@ -1227,7 +1290,7 @@ class AccountCreationService {
             const netBlocked = /blocked by network security|js_challenge/i.test(msg);
             const proxyFlake =
               /ERR_TUNNEL|ERR_TIMED_OUT|ERR_PROXY|ERR_CONNECTION|tunnel_connection|proxy/i.test(msg);
-            const phoneRejected = /Reddit rejected phone|Phone signup option not found/i.test(msg);
+            const phoneRejected = /Reddit rejected phone/i.test(msg);
             if (proxyId) {
               await proxyService.updateProxyStats(proxyId, false, {
                 reason: netBlocked ? 'reddit_network_security' : msg.slice(0, 120),
