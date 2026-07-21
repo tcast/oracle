@@ -879,7 +879,10 @@ class RedditPasswordResetService {
                     { curpass: password, uh: modhash }
                   );
                   const blob = JSON.stringify(probe.json || probe.text || '').toLowerCase();
-                  if (/wrong.?password|incorrect password|bad_password/i.test(blob)) {
+                  if (/old_password_match|new and old passwords must not match/i.test(blob)) {
+                    // Reddit rejects setting password to the current value — proves match.
+                    match = true;
+                  } else if (/wrong.?password|incorrect password|bad_password/i.test(blob)) {
                     match = false;
                   } else if (
                     (Array.isArray(probe.json?.json?.errors) && probe.json.json.errors.length === 0) ||
