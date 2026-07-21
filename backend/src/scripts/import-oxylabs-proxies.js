@@ -1,171 +1,166 @@
 #!/usr/bin/env node
-
+/**
+ * Import Oxylabs residential/mobile proxies as per-account sticky sessions.
+ *
+ * Oxylabs gateway: pr.oxylabs.io:7777 (HTTP). Real US carrier/home ASNs
+ * (AT&T, T-Mobile, Verizon, Frontier). Sticky IP is held per session via
+ * username params: customer-<user>-cc-US-sessid-<id>-sesstime-<minutes>.
+ *
+ * One proxy row per account => each account keeps a stable carrier IP
+ * (platforms distrust session IP hopping).
+ *
+ * Credentials via env (never commit):
+ *   OXYLABS_USERNAME   e.g. customer-whisper_1gCLR   (or bare whisper_1gCLR)
+ *   OXYLABS_PASSWORD
+ *   OXYLABS_HOST       default pr.oxylabs.io
+ *   OXYLABS_PORT       default 7777
+ *   OXYLABS_COUNTRY    default US
+ *   OXYLABS_SESSTIME   default 30 (minutes the sticky IP is held)
+ *
+ * Usage:
+ *   OXYLABS_USERNAME=... OXYLABS_PASSWORD=... \
+ *     node src/scripts/import-oxylabs-proxies.js --accounts 588,589,590 [--platform x] [--replace]
+ *   ... --accounts-platform x   (bind one sticky session to every active X account)
+ */
 require('dotenv').config();
-const proxyService = require('../services/proxyService');
-const OxylabsProxyFormatter = require('../services/oxylabsProxyFormatter');
 const pool = require('../services/db');
+const proxyService = require('../services/proxyService');
 
-async function importOxylabsProxies() {
-  console.log('🔷 Oxylabs Proxy Import Tool\n');
+const PROVIDER = 'Oxylabs';
 
-  // Check for Oxylabs credentials in environment
-  const oxylabsUsername = process.env.OXYLABS_USERNAME;
-  const oxylabsPassword = process.env.OXYLABS_PASSWORD;
-
-  if (!oxylabsUsername || !oxylabsPassword) {
-    console.error('❌ Missing Oxylabs credentials!');
-    console.log('\nPlease add to your .env file:');
-    console.log('OXYLABS_USERNAME=your_username');
-    console.log('OXYLABS_PASSWORD=your_password\n');
-    process.exit(1);
-  }
-
-  try {
-    // Generate proxy configurations
-    console.log('📋 Generating proxy configurations...\n');
-    
-    const proxies = OxylabsProxyFormatter.generateImportConfig({
-      username: oxylabsUsername,
-      password: oxylabsPassword
-    });
-
-    console.log(`Generated ${proxies.length} proxy configurations:`);
-    console.log('- US proxies: 10 (5 cities × 2 sessions)');
-    console.log('- UK proxies: 3');
-    console.log('- CA proxies: 2\n');
-
-    // Import proxies
-    console.log('💾 Importing proxies to database...\n');
-    
-    const results = await proxyService.bulkImportProxies(proxies);
-    
-    const successful = results.filter(r => r.success).length;
-    const failed = results.filter(r => !r.success).length;
-    
-    console.log(`✅ Import complete:`);
-    console.log(`- Successful: ${successful}`);
-    console.log(`- Failed: ${failed}`);
-    
-    if (failed > 0) {
-      console.log('\n❌ Failed imports:');
-      results.filter(r => !r.success).forEach(r => {
-        console.log(`  - ${r.data.name}: ${r.error}`);
-      });
-    }
-
-    // Show proxy distribution
-    console.log('\n📊 Proxy Distribution:');
-    const stats = await proxyService.getProxyStats();
-    stats.byCountry.forEach(country => {
-      console.log(`  - ${country.country}: ${country.count} proxies`);
-    });
-
-    // Suggest account assignment
-    console.log('\n💡 Next Steps:');
-    console.log('1. Test a proxy:');
-    console.log('   curl -x pr.oxylabs.io:7777 -U "customer-USERNAME-cc-US:PASSWORD" https://ip.oxylabs.io\n');
-    
-    console.log('2. Assign proxies to accounts:');
-    console.log('   - US accounts → US proxies');
-    console.log('   - UK accounts → UK proxies');
-    console.log('   - Each account should have 2-3 proxies for rotation\n');
-
-    // Optional: Auto-assign to accounts
-    const autoAssign = process.argv.includes('--auto-assign');
-    if (autoAssign) {
-      console.log('🔄 Auto-assigning proxies to accounts...\n');
-      await autoAssignProxies();
-    } else {
-      console.log('Run with --auto-assign to automatically assign proxies to accounts');
-    }
-
-  } catch (error) {
-    console.error('❌ Import failed:', error.message);
-  } finally {
-    await pool.end();
-  }
+function arg(name, def = null) {
+  const idx = process.argv.indexOf(name);
+  if (idx === -1) return def;
+  const v = process.argv[idx + 1];
+  return v && !v.startsWith('--') ? v : true;
 }
 
-async function autoAssignProxies() {
-  try {
-    // Get all accounts
-    const accountsResult = await pool.query(
-      'SELECT id, username, platform FROM social_accounts WHERE is_active = true'
+function buildUsername(base, country, sessid, sesstime) {
+  const b = base.startsWith('customer-') ? base : `customer-${base}`;
+  return `${b}-cc-${country}-sessid-${sessid}-sesstime-${sesstime}`;
+}
+
+async function resolveAccountIds() {
+  const explicit = arg('--accounts');
+  if (typeof explicit === 'string') {
+    return explicit.split(',').map((s) => Number(s.trim())).filter(Boolean);
+  }
+  const plat = arg('--accounts-platform') || arg('--platform');
+  if (typeof plat === 'string') {
+    const { rows } = await pool.query(
+      `SELECT id FROM social_accounts
+       WHERE platform = $1 AND COALESCE(is_simulated,false) = false
+       ORDER BY id ASC`,
+      [plat]
     );
-    
-    const accounts = accountsResult.rows;
-    console.log(`Found ${accounts.length} active accounts\n`);
+    return rows.map((r) => r.id);
+  }
+  throw new Error('Provide --accounts <ids> or --accounts-platform <platform>');
+}
 
-    // Get all proxies grouped by country
-    const usProxies = await proxyService.getActiveProxies({ country: 'US' });
-    const ukProxies = await proxyService.getActiveProxies({ country: 'GB' });
-    const caProxies = await proxyService.getActiveProxies({ country: 'CA' });
+async function main() {
+  const username = process.env.OXYLABS_USERNAME;
+  const password = process.env.OXYLABS_PASSWORD;
+  if (!username || !password) throw new Error('Missing OXYLABS_USERNAME / OXYLABS_PASSWORD');
 
-    let assignmentCount = 0;
+  const host = process.env.OXYLABS_HOST || 'pr.oxylabs.io';
+  const port = Number(process.env.OXYLABS_PORT || 7777);
+  const country = process.env.OXYLABS_COUNTRY || 'US';
+  const sesstime = Number(process.env.OXYLABS_SESSTIME || 30);
+  const server = `${host}:${port}`;
+  const replace = process.argv.includes('--replace');
 
-    for (const account of accounts) {
-      // Assign 3 proxies per account (round-robin from available pool)
-      let availableProxies = usProxies; // Default to US
-      
-      // You can add logic here to match accounts to specific regions
-      // For now, we'll use US proxies for all accounts
-      
-      if (availableProxies.length >= 3) {
-        // Take 3 proxies from the pool
-        const selectedProxies = availableProxies.slice(0, 3);
-        const proxyIds = selectedProxies.map(p => p.id);
-        
-        await proxyService.assignProxiesToAccount(account.id, proxyIds);
-        
-        console.log(`✅ Assigned 3 proxies to ${account.username} (${account.platform})`);
-        assignmentCount++;
-        
-        // Remove used proxies from pool to ensure distribution
-        availableProxies = availableProxies.slice(3);
-      }
+  const accountIds = await resolveAccountIds();
+  console.log(`Binding ${accountIds.length} account(s) to Oxylabs sticky sessions @ ${server} (cc=${country}, sesstime=${sesstime}m)`);
+
+  let created = 0;
+  let updated = 0;
+  let assigned = 0;
+
+  for (const accountId of accountIds) {
+    const acct = await pool.query(
+      `SELECT id, username, platform FROM social_accounts WHERE id = $1`,
+      [accountId]
+    );
+    if (!acct.rows[0]) {
+      console.warn(`  account ${accountId} not found, skipping`);
+      continue;
+    }
+    const { username: acctName, platform } = acct.rows[0];
+
+    // Stable sessid keyed to account so the same IP returns across restarts.
+    const sessid = `acct${accountId}`;
+    const proxyUsername = buildUsername(username, country, sessid, sesstime);
+    const name = `Oxylabs ${country} sticky ${sessid}`;
+
+    const existing = await pool.query(
+      `SELECT id FROM proxies WHERE provider = $1 AND username = $2 AND server = $3 LIMIT 1`,
+      [PROVIDER, proxyUsername, server]
+    );
+
+    let proxyId;
+    const metadata = {
+      provider: PROVIDER,
+      product: 'residential',
+      sticky: true,
+      sessid,
+      sesstime_min: sesstime,
+      country,
+      host,
+      port,
+      bound_account_id: accountId,
+      bound_platform: platform,
+    };
+
+    if (existing.rows[0]) {
+      proxyId = existing.rows[0].id;
+      await pool.query(
+        `UPDATE proxies SET name=$1, type='http', password=$2, country=$3,
+           is_residential=true, metadata=$4::jsonb, is_active=true,
+           cooldown_until=NULL, consecutive_failures=0, last_health_ok=NULL,
+           updated_at=NOW()
+         WHERE id=$5`,
+        [name, password, country, JSON.stringify(metadata), proxyId]
+      );
+      updated++;
+    } else {
+      const proxy = await proxyService.createProxy({
+        name,
+        type: 'http',
+        server,
+        username: proxyUsername,
+        password,
+        country,
+        city: null,
+        provider: PROVIDER,
+        is_residential: true,
+        metadata,
+      });
+      proxyId = proxy.id;
+      created++;
     }
 
-    console.log(`\n✅ Assigned proxies to ${assignmentCount} accounts`);
-
-  } catch (error) {
-    console.error('❌ Auto-assignment failed:', error.message);
+    // Bind to account (deactivate its other proxies if replace).
+    if (replace) {
+      await pool.query(
+        `UPDATE social_account_proxies SET is_active=false WHERE social_account_id=$1`,
+        [accountId]
+      );
+    }
+    await proxyService.assignProxiesToAccount(accountId, [proxyId]);
+    assigned++;
+    console.log(`  ${platform}:${acctName} (#${accountId}) -> proxy #${proxyId} ${name}`);
   }
+
+  console.log(`Done. created=${created} updated=${updated} assigned=${assigned}`);
+
+  const stats = await pool.query(
+    `SELECT COUNT(*) FILTER (WHERE is_active AND provider=$1) AS oxylabs_active FROM proxies`,
+    [PROVIDER]
+  );
+  console.log('Oxylabs active proxies:', stats.rows[0].oxylabs_active);
 }
 
-// Show usage examples
-function showUsageExamples() {
-  console.log('\n📚 Oxylabs Integration Examples:\n');
-  
-  console.log('1. Basic Connection Test:');
-  console.log('```bash');
-  console.log('curl -x pr.oxylabs.io:7777 \\');
-  console.log('  -U "customer-USERNAME-cc-US:PASSWORD" \\');
-  console.log('  https://ip.oxylabs.io');
-  console.log('```\n');
-
-  console.log('2. With City Targeting:');
-  console.log('```bash');
-  console.log('curl -x pr.oxylabs.io:7777 \\');
-  console.log('  -U "customer-USERNAME-cc-US-city-new_york:PASSWORD" \\');
-  console.log('  https://ip.oxylabs.io');
-  console.log('```\n');
-
-  console.log('3. Sticky Session (30 min):');
-  console.log('```bash');
-  console.log('curl -x pr.oxylabs.io:7777 \\');
-  console.log('  -U "customer-USERNAME-cc-US-sessid-123-sesstime-30:PASSWORD" \\');
-  console.log('  https://ip.oxylabs.io');
-  console.log('```\n');
-
-  console.log('4. In Your Code:');
-  console.log('```javascript');
-  console.log('// Proxies are automatically used when posting!');
-  console.log('await playwrightService.createRedditPost(accountId, subreddit, title, content);');
-  console.log('// The system will use the assigned Oxylabs proxy');
-  console.log('```');
-}
-
-// Run the import
-importOxylabsProxies().then(() => {
-  showUsageExamples();
-});
+main()
+  .catch((err) => { console.error(err); process.exitCode = 1; })
+  .finally(async () => { await pool.end().catch(() => {}); });
