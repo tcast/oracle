@@ -2982,6 +2982,52 @@ class PlaywrightService {
     }
   }
 
+  /**
+   * LIVE X profile edit skeleton — GUARDED.
+   *
+   * URL: https://x.com/settings/profile
+   * Safe v1 fields: display name, bio, location, website, avatar.
+   * Do NOT rename handle in v1 (opt-in/risky).
+   *
+   * Prerequisites before enabling:
+   *   - Cookie-verify batch (e.g. accounts 620–669) still healthy
+   *   - Oxylabs sticky proxy bound to the account
+   *   - Session restore with allowLogin:false (cookie_only)
+   *   - process.env.X_PERSONA_LIVE === '1'
+   *
+   * Offline assignment: node src/scripts/update-x-personas.js (DB only).
+   *
+   * @param {import('playwright').Page} page — already cookie-restored session
+   * @param {{ display_name: string, bio: string, location?: string|null, website?: string|null }} persona
+   * @param {{ accountId?: number }} [options]
+   */
+  async updateXPersona(page, persona, { accountId } = {}) {
+    if (process.env.X_PERSONA_LIVE !== '1') {
+      throw new Error(
+        'X profile live edits disabled. Set X_PERSONA_LIVE=1 only after cookie-verify ' +
+          '(e.g. 620–669) and Oxylabs proxy are confirmed. Offline: update-x-personas.js'
+      );
+    }
+
+    // TODO(live): implement after cookie-verify pilot. Suggested flow:
+    // 1. await page.goto('https://x.com/settings/profile', { waitUntil: 'domcontentloaded' });
+    // 2. Display name: input[name="displayName"] or input[data-testid="DisplayNameInput"]
+    // 3. Bio: textarea[name="description"] or textarea[data-testid="Account_description"]
+    // 4. Location: input[name="location"]
+    // 5. Website: input[name="url"] / input[name="website"]
+    // 6. Avatar: input[type="file"][data-testid="fileInput"] (or profile photo button → file chooser)
+    // 7. Save: button[data-testid="settingsDetailSave"] or button with text /Save/
+    // 8. NEVER touch username / handle fields in v1
+    // 9. Persist credentials.x_persona.applied_live = true + updateEnrichment({ headline, about, photo? })
+    void page;
+    void persona;
+    void accountId;
+    throw new Error(
+      'updateXPersona live implementation not wired yet — skeleton only. ' +
+        'See TODO in playwrightService.updateXPersona'
+    );
+  }
+
   async dismissLinkedInModals(page) {
     await page.evaluate(() => {
       const buttons = [...document.querySelectorAll('button, [role="button"]')];

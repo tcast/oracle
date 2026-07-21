@@ -4,7 +4,8 @@
  * Assumptions:
  * - LinkedIn "built out" ≈ profile photo + hiring persona (headline/about/experience).
  * - LinkedIn banner/background upload is not implemented; banner stays false.
- * - Reddit/X/IG: no photo/banner tracking yet; category from persona_traits.expertise when present.
+ * - X: credentials.x_persona ⇒ headline (display_name) + about (bio); photo/banner when uploaded.
+ * - Reddit/IG: no photo/banner tracking yet; category from persona_traits.expertise when present.
  */
 
 const pool = require('./db');
@@ -146,6 +147,20 @@ function deriveEnrichment({
     }
     // Banner not supported yet
     patch.banner = false;
+  } else if (platform === 'x') {
+    const xp = creds.x_persona && typeof creds.x_persona === 'object' ? creds.x_persona : null;
+    if (xp) {
+      patch.headline = !!(xp.display_name || xp.name);
+      patch.about = !!xp.bio;
+      patch.experience = false;
+      patch.category = patch.category || 'general';
+    }
+    if (creds.profile_enrichment?.photo || hasPhotoFile) {
+      patch.photo = true;
+    }
+    patch.banner = !!(creds.profile_enrichment?.banner || xp?.banner);
+    const cat = categoryFromExpertise(traits);
+    if (cat && !patch.category) patch.category = cat;
   } else {
     const cat = categoryFromExpertise(traits);
     if (cat) patch.category = cat;
