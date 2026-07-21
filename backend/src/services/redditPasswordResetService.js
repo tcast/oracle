@@ -662,7 +662,15 @@ class RedditPasswordResetService {
           `Password-reset phase1 trigger ok account=${account.id}:`,
           (trigger?.confirmationSnippet || '').slice(0, 120)
         );
-        await browser.close().catch(() => {});
+        await Promise.race([
+          browser.close().catch(() => {}),
+          new Promise((r) => setTimeout(r, 8000)),
+        ]);
+        try {
+          browser.process?.()?.kill?.('SIGKILL');
+        } catch (_) {
+          /* ignore */
+        }
         playwrightService._untrackBrowser?.(account.id);
         browser = null;
       }
@@ -670,24 +678,22 @@ class RedditPasswordResetService {
       // Hotmail/Outlook: skip IMAP (always fails basic auth) — go straight to web scrape.
       // Reddit mail often takes 1–3+ minutes and lands in Junk/Other.
       const SEARCH_QUERIES = [
-        'from:reddit',
-        'reddit password',
+        'from:reddit password',
+        'subject:password reddit',
+        'reddit password reset',
         'password reset',
-        'reddit',
-        'password',
-        'reset',
+        'from:reddit',
       ];
-      const SUBJECT_NEEDLES = ['password', 'reset', 'recover', 'reddit'];
+      const SUBJECT_NEEDLES = ['password', 'reset', 'recover'];
       const FROM_NEEDLES = ['reddit', 'redditmail', 'noreply'];
 
       const pollInbox = async (opts) => {
         if (emailInboxService.isMicrosoftAccount(inboxAccount)) {
-          // Give Reddit time to deliver before first Outlook scrape (and avoid OOM thrash).
-          await new Promise((r) => setTimeout(r, opts.initialDelayMs || 90000));
+          await new Promise((r) => setTimeout(r, opts.initialDelayMs || 60000));
           const start = Date.now();
           let last = null;
           let attempt = 0;
-          const maxAttempts = opts.maxAttempts || 5;
+          const maxAttempts = opts.maxAttempts || 6;
           while (attempt < maxAttempts && Date.now() - start < (opts.timeoutMs || 420000)) {
             const searchQuery = SEARCH_QUERIES[attempt % SEARCH_QUERIES.length];
             attempt += 1;
@@ -702,7 +708,7 @@ class RedditPasswordResetService {
               console.warn(
                 `Outlook reset scrape failed attempt ${attempt} for ${inboxAccount.email}: ${scrapeErr.message}`
               );
-              await new Promise((r) => setTimeout(r, opts.intervalMs || 50000));
+              await new Promise((r) => setTimeout(r, opts.intervalMs || 45000));
               continue;
             }
             last = emailInboxService.pickLatestFromMessages(messages, {
@@ -710,26 +716,20 @@ class RedditPasswordResetService {
               subjectIncludes: opts.subjectIncludes || SUBJECT_NEEDLES,
               linkIncludes: opts.linkIncludes,
               afterDate: opts.afterDate,
+              requirePasswordReset: true,
             });
-            // If subject filter is too strict but we have a reddit.com reset link, take it.
             if (!last.found && messages?.length) {
               const loose = emailInboxService.pickLatestFromMessages(messages, {
+                requirePasswordReset: true,
                 linkIncludes: 'reddit.com',
               });
-              if (
-                loose.found &&
-                /password|reset|recover|change|account/i.test(
-                  `${loose.message?.subject || ''} ${loose.message?.preview || ''} ${loose.link || ''}`
-                )
-              ) {
-                last = loose;
-              }
+              if (loose.found) last = loose;
             }
             if (last.found) return last;
             console.warn(
               `Outlook reset poll attempt ${attempt} for ${inboxAccount.email}: scanned ${last?.scanned || 0} (query=${searchQuery})`
             );
-            await new Promise((r) => setTimeout(r, opts.intervalMs || 50000));
+            await new Promise((r) => setTimeout(r, opts.intervalMs || 45000));
           }
           throw new Error(
             `Verification email not received within ${opts.timeoutMs || 420000}ms` +
@@ -741,9 +741,9 @@ class RedditPasswordResetService {
 
       const verified = await pollInbox({
         timeoutMs: 420000,
-        intervalMs: 50000,
-        initialDelayMs: 90000,
-        maxAttempts: 5,
+        intervalMs: 45000,
+        initialDelayMs: 60000,
+        maxAttempts: 6,
         fromIncludes: FROM_NEEDLES,
         subjectIncludes: SUBJECT_NEEDLES,
         linkIncludes: 'reddit.com',

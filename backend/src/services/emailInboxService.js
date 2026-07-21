@@ -57,7 +57,33 @@ function providerFromEmail(email, providerHint) {
 
 function extractUrls(text) {
   const matches = String(text || '').match(/https?:\/\/[^\s"'<>]+/gi) || [];
-  return matches.map((u) => u.replace(/[),.;]+$/, ''));
+  return matches
+    .map((u) => u.replace(/[),.;]+$/, ''))
+    .map((u) => unwrapTrackedUrl(u))
+    .filter((u, i, arr) => u && arr.indexOf(u) === i);
+}
+
+/** Reddit wraps destinations in click.redditmail.com/CL0/https:%2F%2F... */
+function unwrapTrackedUrl(url) {
+  const raw = String(url || '');
+  try {
+    if (/click\.redditmail\.com\/CL0\//i.test(raw)) {
+      const encoded = raw.split(/click\.redditmail\.com\/CL0\//i)[1]?.split('/')[0];
+      if (encoded) {
+        const decoded = decodeURIComponent(encoded);
+        if (/^https?:/i.test(decoded)) return decoded;
+      }
+    }
+  } catch (_) {
+    /* keep original */
+  }
+  return raw;
+}
+
+function isPasswordResetUrl(url) {
+  const u = unwrapTrackedUrl(url).toLowerCase();
+  if (!/reddit\.com/i.test(u)) return false;
+  return /password|reset|recover|change.?password|accountrecovery|forgot/i.test(u);
 }
 
 /** Strip transport headers — non-MIME bodies often lack Content-Type. */
@@ -124,7 +150,10 @@ function messageMentionsAddress(msg, address) {
 }
 
 function pickVerificationLinks(urls) {
-  return urls.filter((u) =>
+  const unwrapped = (urls || []).map(unwrapTrackedUrl);
+  const reset = unwrapped.filter(isPasswordResetUrl);
+  if (reset.length) return reset;
+  return unwrapped.filter((u) =>
     VERIFY_LINK_HINTS.some((h) => u.toLowerCase().includes(h))
   );
 }
@@ -969,7 +998,7 @@ class EmailInboxService {
   /**
    * Latest verification code/link across recent messages, optionally filtered by sender/subject.
    */
-  pickLatestFromMessages(messages, { fromIncludes, subjectIncludes, afterDate, linkIncludes } = {}) {
+  pickLatestFromMessages(messages, { fromIncludes, subjectIncludes, afterDate, linkIncludes, requirePasswordReset = false } = {}) {
     const afterMs = afterDate ? new Date(afterDate).getTime() : null;
     const subjectNeedles = subjectIncludes
       ? (Array.isArray(subjectIncludes) ? subjectIncludes : [subjectIncludes]).map((s) =>
@@ -990,38 +1019,52 @@ class EmailInboxService {
       const hay = `${(m.from || []).join(' ')} ${m.subject || ''} ${m.preview || ''}`.toLowerCase();
       if (fromNeedles.length && !fromNeedles.some((n) => hay.includes(n))) return false;
       if (subjectNeedles.length && !subjectNeedles.some((n) => hay.includes(n))) return false;
-      const links = m.verifyLinks || m.urls || [];
+      const links = [...(m.verifyLinks || []), ...(m.urls || [])].map(unwrapTrackedUrl);
+      const resetLinks = links.filter(isPasswordResetUrl);
+      if (requirePasswordReset) {
+        const subjectOk = /password|reset|recover|change.?password/i.test(hay);
+        if (!resetLinks.length && !subjectOk) return false;
+        if (!resetLinks.length && subjectOk && !links.length) return false;
+      }
       if (linkIncludes) {
         const needle = String(linkIncludes).toLowerCase();
-        const hasLink = links.some((u) => String(u).toLowerCase().includes(needle));
+        const hasLink =
+          resetLinks.length > 0 ||
+          links.some((u) => String(u).toLowerCase().includes(needle));
         if (!hasLink && !(m.codes && m.codes.length)) return false;
       }
       return (m.codes && m.codes.length) || (links && links.length);
     });
 
-    // Prefer reset-ish subjects when multiple match.
     filtered.sort((a, b) => {
       const score = (m) => {
         const t = `${m.subject || ''} ${m.preview || ''}`.toLowerCase();
+        const links = [...(m.verifyLinks || []), ...(m.urls || [])].map(unwrapTrackedUrl);
         let s = 0;
-        if (/password|reset|recover/i.test(t)) s += 3;
-        if (/reddit/i.test(t)) s += 2;
-        if ((m.verifyLinks || []).length) s += 2;
-        if ((m.urls || []).length) s += 1;
+        if (/password|reset|recover/i.test(t)) s += 8;
+        if (links.some(isPasswordResetUrl)) s += 10;
+        if (/reddit/i.test(t)) s += 1;
+        if ((m.verifyLinks || []).length) s += 1;
         return s;
       };
       return score(b) - score(a);
     });
 
     const best = filtered[0] || null;
-    const links = best?.verifyLinks?.length ? best.verifyLinks : best?.urls || [];
+    const links = [
+      ...(best?.verifyLinks || []),
+      ...(best?.urls || []),
+    ].map(unwrapTrackedUrl);
     const resetLink =
-      links.find((u) => /reddit\.com.*(password|reset|change|account|recover)/i.test(u)) ||
-      links.find((u) => /reddit\.com/i.test(u)) ||
-      links[0] ||
+      links.find(isPasswordResetUrl) ||
+      (requirePasswordReset ? null : links.find((u) => /reddit\.com/i.test(u))) ||
+      (requirePasswordReset ? null : links[0]) ||
       null;
+    const found = requirePasswordReset
+      ? !!(best && resetLink && isPasswordResetUrl(resetLink))
+      : !!best;
     return {
-      found: !!best,
+      found,
       code: best?.codes?.[0] || null,
       link: resetLink,
       codes: best?.codes || [],
