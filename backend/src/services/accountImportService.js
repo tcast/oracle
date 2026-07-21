@@ -13,6 +13,9 @@ const SUPPORTED = ['x', 'instagram', 'tiktok', 'linkedin'];
 
 const FORMAT_HELP = {
   x:
+    'COOKIE-ONLY (recommended): username----auth_token----ct0 [----guest_id] ' +
+    'OR JSON array [{"username","auth_token","ct0","guest_id"}]. ' +
+    'Legacy password dumps still work: ' +
     'username----password----email|email_password|auth_token|batch_uuid----totp_secret----ct0 ' +
     'OR username----password----email----email_password----totp----auth_token[----ct0]',
   instagram: 'username:password:totp_secret:email:email_password',
@@ -24,39 +27,110 @@ function looksLikeXAuthToken(token) {
   const t = String(token || '').trim();
   if (!t) return false;
   if (t.startsWith('M.')) return true;
-  // Fresh dumps often ship 40+ hex auth_token without the AccsMarket M. prefix
+  // Fresh dumps / DevTools exports ship 40+ hex auth_token without the AccsMarket M. prefix
   return /^[0-9a-f]{40,}$/i.test(t);
 }
 
-function buildXCookies(authToken, ct0) {
+// Modern X ct0 (CSRF) cookies are 40 hex historically but now commonly 160 hex.
+function looksLikeCt0(token) {
+  return /^[0-9a-f]{32,}$/i.test(String(token || '').trim());
+}
+
+// guest_id looks like "v1%3A123456789012345678" (URL-encoded) or the decoded "v1:...".
+function looksLikeGuestId(token) {
+  const t = String(token || '').trim();
+  return /^v1(%3A|:)\d{8,}$/i.test(t) || /^\d{15,}$/.test(t);
+}
+
+/**
+ * Build the Playwright cookie array X expects. Emits each cookie on BOTH
+ * `.x.com` and `.twitter.com` so restoreSession/verifySessionAlive/posting all
+ * see a live session regardless of which host X redirects to. auth_token stays
+ * httpOnly; ct0 (CSRF) is readable by JS; guest_id optional.
+ */
+function buildXCookies(authToken, ct0, guestId) {
   const base = { path: '/', secure: true };
-  const cookies = [
-    {
-      ...base,
-      name: 'auth_token',
-      value: authToken,
-      domain: '.x.com',
-      httpOnly: true,
-      sameSite: 'None',
-    },
-  ];
-  if (ct0 && /^[0-9a-f]{40}$/i.test(ct0)) {
+  const domains = ['.x.com', '.twitter.com'];
+  const cookies = [];
+  for (const domain of domains) {
     cookies.push({
       ...base,
-      name: 'ct0',
-      value: ct0,
-      domain: '.x.com',
-      httpOnly: false,
-      sameSite: 'Lax',
+      name: 'auth_token',
+      value: String(authToken).trim(),
+      domain,
+      httpOnly: true,
+      sameSite: 'None',
     });
+    if (ct0 && looksLikeCt0(ct0)) {
+      cookies.push({
+        ...base,
+        name: 'ct0',
+        value: String(ct0).trim(),
+        domain,
+        httpOnly: false,
+        sameSite: 'Lax',
+      });
+    }
+    if (guestId) {
+      cookies.push({
+        ...base,
+        name: 'guest_id',
+        value: String(guestId).trim(),
+        domain,
+        httpOnly: false,
+        sameSite: 'None',
+      });
+    }
   }
   return cookies;
+}
+
+/**
+ * Cookie-only X row: no password / TOTP. The user logged in manually on a clean
+ * IP and exported auth_token + ct0 (+ optional guest_id). We never automate
+ * X password login for these — cookies are the whole credential.
+ *
+ * Accepted line shapes (2–4 `----` fields, auth_token in field 2):
+ *   username----auth_token
+ *   username----auth_token----ct0
+ *   username----auth_token----ct0----guest_id   (extra fields tolerated)
+ * The ct0 / guest_id fields are classified by shape, not position, so order is forgiving.
+ */
+function parseXCookieOnlyRow(username, extras) {
+  let ct0 = '';
+  let guest_id = '';
+  for (const field of extras) {
+    const v = String(field || '').trim();
+    if (!v) continue;
+    if (!ct0 && looksLikeCt0(v)) ct0 = v;
+    else if (!guest_id && looksLikeGuestId(v)) guest_id = v;
+  }
+  return {
+    username: String(username || '').trim(),
+    auth_token: undefined, // set by caller
+    ct0,
+    guest_id,
+    cookieOnly: true,
+  };
 }
 
 function parseXLine(line) {
   const raw = String(line || '').trim();
   if (!raw || raw.startsWith('#')) return null;
-  const dash = raw.split('----');
+  const dash = raw.split('----').map((s) => s.trim());
+
+  // Cookie-only path: short line (2–4 fields) with the auth_token in field 2.
+  // Distinguishes cleanly from the 5/6/7-field password dumps (password in field 2).
+  if (dash.length >= 2 && dash.length <= 4 && looksLikeXAuthToken(dash[1])) {
+    const username = dash[0];
+    if (!username) throw new Error('Missing username');
+    const row = parseXCookieOnlyRow(username, dash.slice(2));
+    row.auth_token = dash[1];
+    if (row.ct0 && !looksLikeCt0(row.ct0)) {
+      throw new Error(`ct0 must be 32+ hex when present, got len=${row.ct0.length}`);
+    }
+    return row;
+  }
 
   let username;
   let password;
@@ -101,8 +175,8 @@ function parseXLine(line) {
   if (!looksLikeXAuthToken(auth_token)) {
     throw new Error('auth_token does not look like X cookie (need M.* or 40+ hex)');
   }
-  if (ct0 && !/^[0-9a-f]{40}$/i.test(ct0)) {
-    throw new Error(`ct0 must be 40-hex when present, got len=${ct0.length}`);
+  if (ct0 && !looksLikeCt0(ct0)) {
+    throw new Error(`ct0 must be 32+ hex when present, got len=${ct0.length}`);
   }
   const row = {
     username,
@@ -268,35 +342,52 @@ class AccountImportService {
   }
 
   async upsertX(row, proxyId) {
-    const credentials = {
-      password: row.password,
-      email: row.email,
-      email_password: row.email_password,
-      totp_secret: row.totp_secret,
-      auth_token: row.auth_token,
-      ct0: row.ct0,
-      batch_uuid: row.batch_uuid,
-      source: 'api_import',
-      has_cookies: true,
-    };
+    // Cookie-only imports carry no password/TOTP — the exported cookies ARE the
+    // credential. Merge (don't clobber) with any credentials already on file so
+    // re-importing fresh cookies for an existing password account keeps both.
+    const cookieOnly = !!row.cookieOnly;
     const existing = await pool.query(
-      `SELECT id FROM social_accounts
+      `SELECT id, credentials FROM social_accounts
        WHERE platform = 'x' AND lower(username) = lower($1) LIMIT 1`,
       [row.username]
     );
+    const prior = existing.rows[0]
+      ? (typeof existing.rows[0].credentials === 'string'
+          ? JSON.parse(existing.rows[0].credentials)
+          : existing.rows[0].credentials) || {}
+      : {};
+
+    const credentials = {
+      ...prior,
+      auth_token: row.auth_token || prior.auth_token,
+      ct0: row.ct0 || prior.ct0,
+      guest_id: row.guest_id || prior.guest_id,
+      source: cookieOnly ? 'api_import_cookie_only' : 'api_import',
+      has_cookies: true,
+      cookie_only: cookieOnly || prior.cookie_only === true,
+    };
+    if (!cookieOnly) {
+      credentials.password = row.password;
+      credentials.email = row.email;
+      credentials.email_password = row.email_password;
+      credentials.totp_secret = row.totp_secret;
+      credentials.batch_uuid = row.batch_uuid;
+    }
+    const email = cookieOnly ? (row.email || prior.email || null) : row.email;
+
     let accountId;
     if (existing.rows[0]) {
       accountId = existing.rows[0].id;
       await pool.query(
         `UPDATE social_accounts
-         SET email = $2, credentials = $3::jsonb, status = 'active',
+         SET email = COALESCE($2, email), credentials = $3::jsonb, status = 'active',
              is_simulated = false,
              warmup_status = CASE
                WHEN warmup_status IN ('new', 'failed') THEN 'pending'
                ELSE warmup_status END,
              updated_at = NOW()
          WHERE id = $1`,
-        [accountId, row.email, JSON.stringify(credentials)]
+        [accountId, email, JSON.stringify(credentials)]
       );
     } else {
       const inserted = await pool.query(
@@ -304,12 +395,16 @@ class AccountImportService {
            (platform, username, email, credentials, status, is_simulated, warmup_status)
          VALUES ('x', $1, $2, $3::jsonb, 'active', false, 'pending')
          RETURNING id`,
-        [row.username, row.email, JSON.stringify(credentials)]
+        [row.username, email, JSON.stringify(credentials)]
       );
       accountId = inserted.rows[0].id;
     }
     await this.assignProxy(accountId, proxyId);
-    const cookies = buildXCookies(row.auth_token, row.ct0);
+    const cookies = buildXCookies(
+      credentials.auth_token,
+      credentials.ct0,
+      credentials.guest_id
+    );
     if (cookies.length) {
       await pool.query(
         `INSERT INTO browser_sessions (account_id, platform, cookies, session_data, user_agent)
@@ -515,16 +610,61 @@ class AccountImportService {
     if (!SUPPORTED.includes(platform)) {
       throw new Error(`Platform must be one of: ${SUPPORTED.join(', ')}`);
     }
-    const lines = String(text || '').split(/\r?\n/);
     const rows = [];
     const parseErrors = [];
-    for (let i = 0; i < lines.length; i++) {
+    const trimmed = String(text || '').trim();
+    const looksJson = trimmed.startsWith('[') || trimmed.startsWith('{');
+
+    if (platform === 'x' && looksJson) {
+      // JSON array/object of cookie-only entries: {username, auth_token, ct0, guest_id}
+      let entries;
       try {
-        const parsed = parseLine(platform, lines[i]);
-        if (parsed) rows.push({ line: i + 1, ...parsed });
+        const parsedJson = JSON.parse(trimmed);
+        entries = Array.isArray(parsedJson) ? parsedJson : [parsedJson];
       } catch (err) {
-        if (String(lines[i] || '').trim()) {
-          parseErrors.push({ line: i + 1, error: err.message });
+        return {
+          success: false,
+          imported: [],
+          failed: [{ line: 0, error: `Invalid JSON: ${err.message}` }],
+          message: `Could not parse JSON. Expected format: ${FORMAT_HELP.x}`,
+          format: FORMAT_HELP.x,
+        };
+      }
+      entries.forEach((entry, idx) => {
+        try {
+          const username = String(entry.username || entry.screen_name || '').trim();
+          const auth_token = String(entry.auth_token || entry.authToken || '').trim();
+          const ct0 = String(entry.ct0 || entry.csrf || '').trim();
+          const guest_id = String(entry.guest_id || entry.guestId || '').trim();
+          if (!username) throw new Error('Missing username');
+          if (!looksLikeXAuthToken(auth_token)) {
+            throw new Error('auth_token missing/invalid (need M.* or 40+ hex)');
+          }
+          if (ct0 && !looksLikeCt0(ct0)) {
+            throw new Error(`ct0 must be 32+ hex when present, got len=${ct0.length}`);
+          }
+          rows.push({
+            line: idx + 1,
+            username,
+            auth_token,
+            ct0,
+            guest_id: looksLikeGuestId(guest_id) ? guest_id : '',
+            cookieOnly: true,
+          });
+        } catch (err) {
+          parseErrors.push({ line: idx + 1, error: err.message, username: entry.username });
+        }
+      });
+    } else {
+      const lines = String(text || '').split(/\r?\n/);
+      for (let i = 0; i < lines.length; i++) {
+        try {
+          const parsed = parseLine(platform, lines[i]);
+          if (parsed) rows.push({ line: i + 1, ...parsed });
+        } catch (err) {
+          if (String(lines[i] || '').trim()) {
+            parseErrors.push({ line: i + 1, error: err.message });
+          }
         }
       }
     }
@@ -630,3 +770,4 @@ module.exports = new AccountImportService();
 module.exports.SUPPORTED = SUPPORTED;
 module.exports.FORMAT_HELP = FORMAT_HELP;
 module.exports.parseLine = parseLine;
+module.exports.buildXCookies = buildXCookies;

@@ -655,6 +655,12 @@ class PlaywrightService {
       throw new Error(`no_live_session for ${platform}/${username} — refusing password login`);
     }
 
+    // Cookie-only accounts carry no password. Never attempt (and never "burn") a
+    // password login when there's nothing to submit — the cookies are the credential.
+    if (!password || !String(password).trim()) {
+      throw new Error(`no_live_session for ${platform}/${username} — cookie-only account, no password to log in with`);
+    }
+
     const loginSuccess = await this.performLogin(page, platform, username, password, extras);
     if (loginSuccess) {
       await this.persistSession(page, platform, accountId);
