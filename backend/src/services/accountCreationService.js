@@ -1289,7 +1289,9 @@ class AccountCreationService {
             const msg = err.message || String(err);
             const netBlocked = /blocked by network security|js_challenge/i.test(msg);
             const proxyFlake =
-              /ERR_TUNNEL|ERR_TIMED_OUT|ERR_PROXY|ERR_CONNECTION|tunnel_connection|proxy/i.test(msg);
+              /ERR_TUNNEL|ERR_TIMED_OUT|ERR_PROXY|ERR_CONNECTION|tunnel_connection|proxy|Phone signup option not found|register UI not ready/i.test(
+                msg
+              );
             const phoneRejected = /Reddit rejected phone/i.test(msg);
             if (proxyId) {
               await proxyService.updateProxyStats(proxyId, false, {
