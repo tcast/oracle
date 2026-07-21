@@ -102,10 +102,20 @@ class CaptchaSolverService {
     };
 
     // Enterprise: CapSolver first (2Captcha often returns ERROR_CAPTCHA_UNSOLVABLE for Reddit)
+    // When action/data-s present, prefer 2Captcha — CapSolver proxy enterprise often 400s on Reddit.
     if (opts.proxyConfig?.server) {
       console.log('   Using session proxy for captcha solve (IP match)');
     }
-    const order = opts.enterprise ? [tryCapSolver, try2Captcha] : [try2Captcha, tryCapSolver];
+    const hasEnterpriseExtras = !!(
+      opts.action ||
+      opts.dataS ||
+      opts.enterprisePayload?.s
+    );
+    const order = opts.enterprise
+      ? hasEnterpriseExtras
+        ? [try2Captcha, tryCapSolver]
+        : [tryCapSolver, try2Captcha]
+      : [try2Captcha, tryCapSolver];
     let lastErr;
     for (const fn of order) {
       try {
@@ -136,8 +146,8 @@ class CaptchaSolverService {
 
       if (captchaType === 'recaptcha_v3') {
         submitParams.version = 'v3';
-        submitParams.action = version || 'submit';
-        submitParams.min_score = 0.3;
+        submitParams.action = opts.action || version || 'submit';
+        submitParams.min_score = opts.minScore || 0.7;
       } else if (captchaType === 'hcaptcha') {
         submitParams.method = 'hcaptcha';
       }
@@ -147,6 +157,18 @@ class CaptchaSolverService {
       }
       if (opts.enterprise && captchaType.startsWith('recaptcha')) {
         submitParams.enterprise = 1;
+      }
+      // Enterprise session binding (data-s / s) — required by some sites including Reddit
+      const dataS =
+        opts.dataS ||
+        opts.enterprisePayload?.s ||
+        (typeof opts.enterprisePayload === 'string' ? opts.enterprisePayload : null);
+      if (dataS) {
+        submitParams['data-s'] = dataS;
+      }
+      if (opts.action && captchaType === 'recaptcha_v2') {
+        // Some Enterprise invisible flows still pass action into execute()
+        submitParams.action = opts.action;
       }
       if (opts.proxyConfig?.server) {
         const raw = String(opts.proxyConfig.server)
@@ -238,6 +260,12 @@ class CaptchaSolverService {
               : 'ReCaptchaV2TaskProxyLess';
           }
           if (opts.invisible) taskData.isInvisible = true;
+          if (opts.enterprisePayload && typeof opts.enterprisePayload === 'object') {
+            taskData.enterprisePayload = opts.enterprisePayload;
+          } else if (opts.dataS) {
+            taskData.enterprisePayload = { s: opts.dataS };
+          }
+          if (opts.action) taskData.pageAction = opts.action;
           break;
         case 'recaptcha_v3':
           taskType = opts.enterprise
@@ -247,8 +275,13 @@ class CaptchaSolverService {
             : opts.proxyConfig?.server
               ? 'ReCaptchaV3Task'
               : 'ReCaptchaV3TaskProxyLess';
-          taskData.pageAction = version || 'submit';
-          taskData.minScore = 0.3;
+          taskData.pageAction = opts.action || version || 'submit';
+          taskData.minScore = opts.minScore || 0.7;
+          if (opts.enterprisePayload && typeof opts.enterprisePayload === 'object') {
+            taskData.enterprisePayload = opts.enterprisePayload;
+          } else if (opts.dataS) {
+            taskData.enterprisePayload = { s: opts.dataS };
+          }
           break;
         case 'hcaptcha':
           taskType = 'HCaptchaTaskProxyLess';
@@ -327,6 +360,11 @@ class CaptchaSolverService {
 
       throw new Error('CapSolver timeout - solution not ready after 120s');
     } catch (error) {
+      if (error.response?.status) {
+        const detail = JSON.stringify(error.response.data || {}).slice(0, 240);
+        console.error(`CapSolver error: HTTP ${error.response.status} ${detail}`);
+        throw new Error(`CapSolver HTTP ${error.response.status}: ${detail || error.message}`);
+      }
       console.error('CapSolver error:', error.message);
       throw error;
     }

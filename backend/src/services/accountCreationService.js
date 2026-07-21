@@ -383,6 +383,163 @@ class AccountCreationService {
     });
   }
 
+  /**
+   * Hook grecaptcha.enterprise.execute so the token is solved ON DEMAND with
+   * Reddit's real siteKey / action / s (enterprisePayload). Pre-solving without
+   * those fields produces tokens Reddit rejects as Error 56a391.
+   */
+  async installRedditEnterpriseExecuteSolver(page, pageUrl, opts = {}) {
+    const proxyConfig = opts.proxyConfig || null;
+    const siteKeyFallback = opts.siteKey || '6LfirrMoAAAAAHZOipvza4kpp_VtTwLNuXVwURNQ';
+    const solveState = { calls: [], lastError: null };
+
+    const bindingName = `__oracleSolveRedditRecaptcha_${Date.now()}`;
+    let inFlight = null;
+    await page.exposeFunction(bindingName, async (payload) => {
+      // Serialize solves — overlapping Continue retries must not spam 2Captcha
+      if (inFlight) {
+        console.log('Reddit execute-solve: awaiting in-flight solve');
+        return inFlight;
+      }
+      inFlight = (async () => {
+      const siteKey = payload?.siteKey || siteKeyFallback;
+      const action = payload?.action || null;
+      const dataS = payload?.s || payload?.dataS || null;
+      // Reddit calls execute(siteKey, { action: 'v1/web/verify_phone' }) — Enterprise v3.
+      const useV3 = !!(action && (/^v\d+\//i.test(action) || action.includes('/')));
+      console.log(
+        `Reddit enterprise.execute → solve siteKey=${siteKey.slice(0, 12)}… action=${action || '-'} sLen=${dataS ? String(dataS).length : 0} type=${useV3 ? 'v3' : 'v2'}`
+      );
+      solveState.calls.push({
+        siteKey,
+        action,
+        sLen: dataS ? String(dataS).length : 0,
+        type: useV3 ? 'v3' : 'v2',
+        at: Date.now(),
+      });
+      try {
+        const token = await captchaSolverService.solveCaptcha(
+          siteKey,
+          pageUrl || page.url(),
+          useV3 ? 'recaptcha_v3' : 'recaptcha_v2',
+          action,
+          {
+            enterprise: true,
+            invisible: !useV3,
+            action: action || undefined,
+            dataS: dataS || undefined,
+            enterprisePayload: dataS ? { s: dataS } : undefined,
+            minScore: 0.9,
+            proxyConfig,
+          }
+        );
+        // Keep fetch-patch token in sync
+        await page.evaluate((tok) => {
+          window.__oracleRecaptchaToken = tok;
+        }, token);
+        return token;
+      } catch (err) {
+        solveState.lastError = err.message;
+        console.warn(`Reddit execute-solve failed: ${err.message}`);
+        throw err;
+      } finally {
+        inFlight = null;
+      }
+      })();
+      return inFlight;
+    });
+
+    await page.evaluate(
+      ({ bindingName, siteKeyFallback }) => {
+        window.__oracleRecaptchaSolveBinding = bindingName;
+        window.__oracleRecaptchaSiteKeyFallback = siteKeyFallback;
+        const install = () => {
+          const g = window.grecaptcha;
+          if (!g?.enterprise) return false;
+          if (g.enterprise.__oracleExecuteSolverHooked) return true;
+          g.enterprise.__oracleExecuteSolverHooked = true;
+          const origExec = g.enterprise.execute?.bind(g.enterprise);
+          g.enterprise.execute = async (siteKey, options = {}) => {
+            const sk = siteKey || window.__oracleRecaptchaSiteKeyFallback;
+            const opts = options && typeof options === 'object' ? options : {};
+            const fn = window[window.__oracleRecaptchaSolveBinding];
+            if (typeof fn === 'function') {
+              try {
+                const token = await fn({
+                  siteKey: sk,
+                  action: opts.action || null,
+                  s: opts.s || opts.dataS || null,
+                });
+                if (token) {
+                  window.__oracleRecaptchaToken = token;
+                  return token;
+                }
+              } catch (e) {
+                console.warn('oracle execute solver error', e);
+              }
+            }
+            // Fallback: native execute (may fail under automation)
+            if (origExec) return origExec(siteKey, options);
+            throw new Error('grecaptcha.enterprise.execute unavailable');
+          };
+          return true;
+        };
+        if (!install()) {
+          const t = setInterval(() => {
+            if (install()) clearInterval(t);
+          }, 200);
+          setTimeout(() => clearInterval(t), 90000);
+        }
+
+        // Fetch patch: ensure verify_phone body carries latest token
+        if (!window.__oracleFetchCaptchaPatched) {
+          window.__oracleFetchCaptchaPatched = true;
+          const origFetch = window.fetch.bind(window);
+          window.fetch = async (input, init = {}) => {
+            const url = typeof input === 'string' ? input : input?.url || '';
+            const tok = window.__oracleRecaptchaToken;
+            if (
+              /verify_phone_by_code_initialize/i.test(url) &&
+              init &&
+              typeof init.body === 'string' &&
+              tok
+            ) {
+              try {
+                const j = JSON.parse(init.body);
+                const inject = (obj) => {
+                  if (!obj || typeof obj !== 'object') return false;
+                  let found = false;
+                  for (const k of Object.keys(obj)) {
+                    if (/recaptcha|captcha|g-recaptcha/i.test(k)) {
+                      obj[k] = tok;
+                      found = true;
+                    }
+                  }
+                  if (obj.variables && typeof obj.variables === 'object') {
+                    found = inject(obj.variables) || found;
+                  }
+                  if (obj.input && typeof obj.input === 'object') {
+                    found = inject(obj.input) || found;
+                  }
+                  if (!found) obj.recaptcha_token = tok;
+                  return found;
+                };
+                inject(j);
+                init = { ...init, body: JSON.stringify(j) };
+              } catch (_) {
+                /* non-JSON */
+              }
+            }
+            return origFetch(input, init);
+          };
+        }
+      },
+      { bindingName, siteKeyFallback }
+    );
+
+    return solveState;
+  }
+
   async maybeSolveCaptcha(page, pageUrl, opts = {}) {
     const captchaFrame = await page.$(
       'iframe[title*="recaptcha"], iframe[src*="captcha"], iframe[src*="hcaptcha"], iframe[src*="enterprise"], [data-sitekey], .grecaptcha-badge, script[src*="recaptcha/enterprise"]'
@@ -964,26 +1121,49 @@ class AccountCreationService {
         await this.humanLikeDelay(400, 700);
       }
 
-      // Reddit phone verify uses reCAPTCHA Enterprise (invisible); solve via same proxy IP
-      const preCaptcha = await this.maybeSolveCaptcha(page, page.url(), {
-        enterprise: true,
-        invisible: true,
-        siteKey: enterpriseSiteKey || undefined,
-        proxyConfig,
-      });
-      if (preCaptcha.reason === 'captcha_present_no_sitekey') {
-        throw new Error(
-          'CAPTCHA present but sitekey not extractable on phone form — blocked'
-        );
+      // Solve ON execute() so we get Reddit's real action / s enterprisePayload.
+      // Pre-solving without those fields → Error 56a391 (query-bad-response).
+      // NATIVE_RECAPTCHA=1: do not hook — let browser grecaptcha.enterprise.execute run
+      // (diagnostic: if native tokens also 403, it's hard-blocked automation/proxy).
+      const useNative = process.env.NATIVE_RECAPTCHA === '1';
+      let executeSolve = { calls: [], lastError: null };
+      if (!useNative) {
+        executeSolve = await this.installRedditEnterpriseExecuteSolver(page, page.url(), {
+          siteKey: enterpriseSiteKey || undefined,
+          proxyConfig,
+        });
+      } else {
+        console.warn('NATIVE_RECAPTCHA=1 — using browser grecaptcha.enterprise.execute (no solver)');
       }
       console.log(
-        `Reddit phone create: using ${phone.e164} via ${smsRequest.provider} (req ${smsRequest.id}) captcha=${JSON.stringify(preCaptcha)} enterpriseKey=${enterpriseSiteKey || 'fallback'}`
+        `Reddit phone create: using ${phone.e164} via ${smsRequest.provider} (req ${smsRequest.id}) executeSolver=${useNative ? 'native' : 'on'} enterpriseKey=${enterpriseSiteKey || 'fallback'}`
       );
 
       verifyPhoneStatus = null;
       const how = await this.clickRedditContinue(page);
       console.log(`Reddit phone Continue via ${how}`);
-      await this.humanLikeDelay(2500, 4000);
+      // Wait for execute-solve to finish (2Captcha v3 often 20–45s) then for verify response
+      for (let w = 0; w < 20; w++) {
+        if (executeSolve.calls.length && verifyPhoneStatus != null) break;
+        if (executeSolve.lastError) break;
+        await this.humanLikeDelay(2000, 2500);
+      }
+      if (executeSolve.calls.length) {
+        console.log(`Reddit execute-solve calls: ${JSON.stringify(executeSolve.calls)}`);
+      } else if (!useNative) {
+        console.warn(
+          'Reddit enterprise.execute was not called after Continue — falling back to pre-solve inject'
+        );
+        await this.maybeSolveCaptcha(page, page.url(), {
+          enterprise: true,
+          invisible: true,
+          siteKey: enterpriseSiteKey || undefined,
+          proxyConfig,
+        }).catch(() => ({}));
+        verifyPhoneStatus = null;
+        await this.clickRedditContinue(page);
+        await this.humanLikeDelay(8000, 12000);
+      }
 
       const postContinue = await this.detectRedditNetworkBlock(page);
       if (postContinue.blocked) {
@@ -996,7 +1176,7 @@ class AccountCreationService {
         const dump = await this.dumpRedditPhoneStuck(page, 'verify403');
         const hit = [...apiHits].reverse().find((h) => h.kind === 'verify_phone_init');
         const body = hit?.body || '';
-        if (/56a391|query-bad-response|Something went wrong/i.test(body)) {
+        if (/56a391|e213f7|query-bad-response|Something went wrong/i.test(body)) {
           throw new Error(
             `Reddit phone verify rejected (Error 56a391 / bad response, snap=${dump.snap}): ${body.slice(0, 180)}`
           );
@@ -1029,7 +1209,7 @@ class AccountCreationService {
           const dump = await this.dumpRedditPhoneStuck(page, 'verify403-wait');
           const hit = [...apiHits].reverse().find((h) => h.kind === 'verify_phone_init');
           const body = hit?.body || '';
-          if (/56a391|query-bad-response|Something went wrong/i.test(body)) {
+          if (/56a391|e213f7|query-bad-response|Something went wrong/i.test(body)) {
             throw new Error(
               `Reddit phone verify rejected waiting for OTP (Error 56a391, snap=${dump.snap}): ${body.slice(0, 180)}`
             );
@@ -1057,24 +1237,17 @@ class AccountCreationService {
           break;
         }
 
-        // If still on phone form, re-solve enterprise captcha once and retry Continue
-        if (w === 4 || w === 9) {
+        // If still on phone form after a completed solve+403, do not burn more SMS/solves here
+        if (w === 6) {
           const stillPhone = /sign up or log in with your phone|phone number/i.test(
             mid.snippet || bodyText
           );
-          if (stillPhone) {
+          if (stillPhone && executeSolve.calls.length && !verifyPhoneStatus) {
             console.warn(
-              'Reddit phone still on form — re-solving enterprise captcha and retrying Continue'
+              'Reddit phone still on form after execute-solve — one more Continue'
             );
-            await this.maybeSolveCaptcha(page, page.url(), {
-              enterprise: true,
-              invisible: true,
-              siteKey: enterpriseSiteKey || undefined,
-              proxyConfig,
-            }).catch(() => ({}));
-            verifyPhoneStatus = null;
             await this.clickRedditContinue(page);
-            await this.humanLikeDelay(2000, 3000);
+            await this.humanLikeDelay(8000, 12000);
           }
         }
         await this.humanLikeDelay(1500, 2500);
