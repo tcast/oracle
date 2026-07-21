@@ -478,30 +478,81 @@ class RedditPasswordResetService {
     };
   }
 
+  normalizeResetLink(resetLink) {
+    try {
+      const u = new URL(resetLink);
+      if (!/reddit\.com$/i.test(u.hostname) && !/\.reddit\.com$/i.test(u.hostname)) {
+        return [resetLink];
+      }
+      const path = `${u.pathname}${u.search}${u.hash}`;
+      // www/new reddit password pages are often network-security blocked on
+      // residential proxies; old.reddit usually still serves the form.
+      return [
+        `https://old.reddit.com${path}`,
+        `https://www.reddit.com${path}`,
+        resetLink,
+      ].filter((v, i, arr) => arr.indexOf(v) === i);
+    } catch {
+      return [resetLink];
+    }
+  }
+
   async completePasswordReset(page, resetLink, newPassword) {
-    await page.goto(resetLink, { waitUntil: 'domcontentloaded', timeout: 90000 });
-    await playwrightService.humanLikeDelay(2000, 4000);
-    await this.dismissCookieBanners(page);
+    const candidates = this.normalizeResetLink(resetLink);
+    let lastSnippet = '';
+    let landed = false;
+
+    for (const url of candidates) {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 90000 });
+      await playwrightService.humanLikeDelay(2000, 4000);
+      await this.dismissCookieBanners(page);
+      const body = (await page.locator('body').innerText().catch(() => '')).slice(0, 400);
+      lastSnippet = body;
+      if (/blocked by network security/i.test(body)) {
+        console.warn(`Reset page network-security block on ${url}; trying next host`);
+        continue;
+      }
+      landed = true;
+      break;
+    }
+    if (!landed) {
+      throw new Error(`Password fields not found on reset page: ${lastSnippet.slice(0, 280)}`);
+    }
 
     const pwInputs = page.locator(
       'input[type="password"], faceplate-text-input[name*="password" i] input, input[name*="password" i]'
     );
-    const count = await pwInputs.count();
+    let count = await pwInputs.count();
     if (count < 1) {
-      const snippet = (await page.locator('body').innerText().catch(() => '')).slice(0, 300);
-      throw new Error(`Password fields not found on reset page: ${snippet}`);
-    }
-
-    await pwInputs.nth(0).click({ clickCount: 3 }).catch(() => {});
-    await pwInputs.nth(0).fill('');
-    await pwInputs.nth(0).type(newPassword, { delay: 45 });
-    await playwrightService.humanLikeDelay(400, 900);
-
-    if (count >= 2) {
-      await pwInputs.nth(1).click({ clickCount: 3 }).catch(() => {});
-      await pwInputs.nth(1).fill('');
-      await pwInputs.nth(1).type(newPassword, { delay: 45 });
+      // old.reddit sometimes uses name=new_password / verify_password
+      const alt = page.locator('input[name*="pass" i], input[id*="pass" i]');
+      count = await alt.count();
+      if (count < 1) {
+        const snippet = (await page.locator('body').innerText().catch(() => '')).slice(0, 300);
+        throw new Error(`Password fields not found on reset page: ${snippet}`);
+      }
+      await alt.nth(0).click({ clickCount: 3 }).catch(() => {});
+      await alt.nth(0).fill('');
+      await alt.nth(0).type(newPassword, { delay: 45 });
       await playwrightService.humanLikeDelay(400, 900);
+      if (count >= 2) {
+        await alt.nth(1).click({ clickCount: 3 }).catch(() => {});
+        await alt.nth(1).fill('');
+        await alt.nth(1).type(newPassword, { delay: 45 });
+        await playwrightService.humanLikeDelay(400, 900);
+      }
+    } else {
+      await pwInputs.nth(0).click({ clickCount: 3 }).catch(() => {});
+      await pwInputs.nth(0).fill('');
+      await pwInputs.nth(0).type(newPassword, { delay: 45 });
+      await playwrightService.humanLikeDelay(400, 900);
+
+      if (count >= 2) {
+        await pwInputs.nth(1).click({ clickCount: 3 }).catch(() => {});
+        await pwInputs.nth(1).fill('');
+        await pwInputs.nth(1).type(newPassword, { delay: 45 });
+        await playwrightService.humanLikeDelay(400, 900);
+      }
     }
 
     const save =
@@ -509,14 +560,15 @@ class RedditPasswordResetService {
       (await page.$('button:has-text("Save")')) ||
       (await page.$('button:has-text("Set")')) ||
       (await page.$('button:has-text("Change")')) ||
-      (await page.$('button:has-text("Continue")'));
+      (await page.$('button:has-text("Continue")')) ||
+      (await page.$('input[type="submit"]'));
     if (!save) throw new Error('Save-password button not found');
     await save.click();
     await playwrightService.humanLikeDelay(3000, 5500);
 
     const body = (await page.locator('body').innerText().catch(() => '')).slice(0, 500);
     const failed = /invalid|expired|error|try again|incorrect/i.test(body) &&
-      !/success|updated|changed|logged in|home/i.test(body);
+      !/success|updated|changed|logged in|home|password has been/i.test(body);
     if (failed) {
       throw new Error(`Password save may have failed: ${body.slice(0, 200)}`);
     }
