@@ -708,8 +708,8 @@ class RedditPasswordResetService {
   }
 
   /**
-   * Prefer BrightData (or known-good provider) for password login verify.
-   * ProxyBase sticky IPs often hit "network policy" right after update_password.
+   * Prefer BrightData, then account sticky proxy, then direct — for password login verify.
+   * ProxyBase alone often hits network-policy right after update_password.
    */
   async openVerifyBrowser(accountId) {
     const meta = {};
@@ -724,16 +724,19 @@ class RedditPasswordResetService {
     };
 
     try {
-      return { browserResult: await tryOpen({ preferProvider: 'BrightData', requireProxy: true }, 'brightdata'), meta };
+      return {
+        browserResult: await tryOpen({ preferProvider: 'BrightData', requireProxy: true }, 'brightdata'),
+        meta,
+      };
     } catch (bdErr) {
       meta.brightdataError = String(bdErr.message || bdErr).slice(0, 160);
     }
     try {
-      return { browserResult: await tryOpen({ skipProxy: true }, 'direct'), meta };
-    } catch (directErr) {
-      meta.directError = String(directErr.message || directErr).slice(0, 160);
+      return { browserResult: await tryOpen({ requireProxy: true }, 'account_proxy'), meta };
+    } catch (acctErr) {
+      meta.accountProxyError = String(acctErr.message || acctErr).slice(0, 160);
     }
-    const browserResult = await tryOpen({ requireProxy: true }, 'account_proxy');
+    const browserResult = await tryOpen({ skipProxy: true }, 'direct');
     return { browserResult, meta };
   }
 
@@ -782,7 +785,8 @@ class RedditPasswordResetService {
 
   /**
    * Determine whether DB password still logs into Reddit (for password_rotate_risk audit).
-   * Prefers BrightData for the login attempt.
+   * Order: account sticky proxy session → account proxy password login → BrightData → direct.
+   * Only marks locked on clear credential failure (not network/guest ambiguity).
    */
   async auditPasswordMatchForAccount(account) {
     const creds = parseCreds(account.credentials);
@@ -792,106 +796,295 @@ class RedditPasswordResetService {
       return { accountId: account.id, username: account.username, status: 'missing_password' };
     }
 
-    let browser;
-    let meta = {};
-    try {
-      const opened = await this.openVerifyBrowser(account.id);
-      browser = opened.browserResult.browser;
-      meta = opened.meta;
-      const page = opened.browserResult.page;
+    const attempts = [];
+    const tryModes = [
+      { label: 'account_proxy', opts: { requireProxy: true } },
+      { label: 'brightdata', opts: { preferProvider: 'BrightData', requireProxy: true } },
+      { label: 'direct', opts: { skipProxy: true } },
+    ];
 
-      const current = await this.loginOldRedditPassword(page, account.username, password);
-      if (current.ok) {
-        await this.clearPasswordRotateRisk(account.id, {
-          password_verified_at: new Date().toISOString(),
-          password_verify_via: meta.verifyVia || null,
+    for (const mode of tryModes) {
+      let browser;
+      try {
+        const opened = await playwrightService.createBrowserForAccount(account.id, 2, {
+          forceDesktop: true,
+          ...mode.opts,
         });
-        await playwrightService.persistSession(page, 'reddit', account.id).catch(() => {});
-        await this.logAction(account.id, meta.proxyId, 'password_match_ok', {
-          via: meta.verifyVia,
-          riskCleared: true,
-        });
-        return {
-          accountId: account.id,
-          username: account.username,
-          status: 'match',
-          via: meta.verifyVia,
-          login: current,
-        };
-      }
+        browser = opened.browser;
+        const page = opened.page;
+        const proxyId = opened.proxyConfig?._proxyId || null;
 
-      if (previous && previous !== password) {
-        const prevLogin = await this.loginOldRedditPassword(page, account.username, previous);
-        if (prevLogin.ok) {
-          await this.persistNewPassword(
-            account.id,
-            creds,
-            previous,
-            'reddit_restore_previous_password'
-          );
+        // Prefer live session first on sticky proxy — proves account still usable.
+        if (mode.label === 'account_proxy') {
+          const restored = await playwrightService.restoreSession(page, 'reddit', account.id);
+          if (restored) {
+            await page.goto('https://old.reddit.com/', {
+              waitUntil: 'domcontentloaded',
+              timeout: 90000,
+            });
+            await playwrightService.humanLikeDelay(1500, 2500);
+            const sess = await page.evaluate(() => {
+              const header = document.querySelector('#header-bottom-right');
+              const logout = header?.querySelector('form.logout, a[href*="logout"]');
+              const userLink = header?.querySelector('.user a, span.user a');
+              const userText = (userLink?.textContent || '').trim();
+              return {
+                ok: !!(logout && userText && !/^log\s*in$/i.test(userText)),
+                user: userText || null,
+              };
+            });
+            attempts.push({ mode: mode.label, session: sess });
+            if (sess.ok) {
+              // Probe whether DB password matches without changing it.
+              let match = null;
+              try {
+                await page.goto('https://old.reddit.com/prefs/update/', {
+                  waitUntil: 'domcontentloaded',
+                  timeout: 90000,
+                });
+                await playwrightService.humanLikeDelay(1500, 2500);
+                const modhash = await page.evaluate(() => {
+                  if (window.reddit?.modhash) return window.reddit.modhash;
+                  const m = document.body.innerHTML.match(/modhash["']\s*:\s*["']([^"']+)/);
+                  return m?.[1] || document.querySelector('input[name="uh"]')?.value || null;
+                });
+                if (modhash) {
+                  const probe = await page.evaluate(
+                    async ({ curpass, uh }) => {
+                      const body = new URLSearchParams({
+                        curpass,
+                        newpass: curpass,
+                        verpass: curpass,
+                        uh,
+                        api_type: 'json',
+                      });
+                      const res = await fetch('/api/update_password', {
+                        method: 'POST',
+                        credentials: 'include',
+                        headers: {
+                          'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                          'x-modhash': uh,
+                        },
+                        body: body.toString(),
+                      });
+                      const text = await res.text();
+                      let json = null;
+                      try {
+                        json = JSON.parse(text);
+                      } catch (_) {
+                        /* ignore */
+                      }
+                      return { status: res.status, json, text: text.slice(0, 300) };
+                    },
+                    { curpass: password, uh: modhash }
+                  );
+                  const blob = JSON.stringify(probe.json || probe.text || '').toLowerCase();
+                  if (/wrong.?password|incorrect password|bad_password/i.test(blob)) {
+                    match = false;
+                  } else if (
+                    (Array.isArray(probe.json?.json?.errors) && probe.json.json.errors.length === 0) ||
+                    /password has been updated|preferences have been updated/i.test(blob)
+                  ) {
+                    match = true;
+                  }
+                  attempts.push({ mode: 'session_probe', match, probe: blob.slice(0, 160) });
+                }
+              } catch (probeErr) {
+                attempts.push({
+                  mode: 'session_probe_error',
+                  error: String(probeErr.message || probeErr).slice(0, 160),
+                });
+              }
+
+              if (match === true) {
+                await this.clearPasswordRotateRisk(account.id, {
+                  password_verified_at: new Date().toISOString(),
+                  password_verify_via: 'session_probe',
+                });
+                await this.logAction(account.id, proxyId, 'password_match_ok', {
+                  via: 'session_probe',
+                  attempts,
+                });
+                return {
+                  accountId: account.id,
+                  username: account.username,
+                  status: 'match',
+                  via: 'session_probe',
+                  attempts,
+                };
+              }
+              if (match === false) {
+                // Session alive but DB password wrong — try previous, else lock.
+                if (previous && previous !== password) {
+                  const prevProbe = await page.evaluate(
+                    async ({ curpass, uh }) => {
+                      const body = new URLSearchParams({
+                        curpass,
+                        newpass: curpass,
+                        verpass: curpass,
+                        uh,
+                        api_type: 'json',
+                      });
+                      const res = await fetch('/api/update_password', {
+                        method: 'POST',
+                        credentials: 'include',
+                        headers: {
+                          'content-type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                          'x-modhash': uh,
+                        },
+                        body: body.toString(),
+                      });
+                      const text = await res.text();
+                      let json = null;
+                      try {
+                        json = JSON.parse(text);
+                      } catch (_) {
+                        /* ignore */
+                      }
+                      return JSON.stringify(json || text).toLowerCase();
+                    },
+                    {
+                      curpass: previous,
+                      uh: await page.evaluate(() => window.reddit?.modhash || null),
+                    }
+                  );
+                  if (
+                    /errors":\s*\[\]/.test(prevProbe) ||
+                    /password has been updated|preferences have been updated/i.test(prevProbe)
+                  ) {
+                    await this.persistNewPassword(
+                      account.id,
+                      creds,
+                      previous,
+                      'reddit_restore_previous_password'
+                    );
+                    await this.clearPasswordRotateRisk(account.id, {
+                      password_verified_at: new Date().toISOString(),
+                      password_verify_via: 'session_probe_previous',
+                      password_restored_from_previous: true,
+                    });
+                    return {
+                      accountId: account.id,
+                      username: account.username,
+                      status: 'restored_previous',
+                      via: 'session_probe',
+                      attempts,
+                    };
+                  }
+                }
+                await this.markPasswordLocked(
+                  account.id,
+                  'session alive but DB password rejected by update_password'
+                );
+                return {
+                  accountId: account.id,
+                  username: account.username,
+                  status: 'locked',
+                  via: 'session_probe',
+                  attempts,
+                };
+              }
+
+              // Session OK but probe inconclusive — keep usable, leave risk flag.
+              await this.logAction(account.id, proxyId, 'session_alive_password_unverified', {
+                attempts,
+              });
+              return {
+                accountId: account.id,
+                username: account.username,
+                status: 'session_alive_unverified',
+                via: mode.label,
+                attempts,
+              };
+            }
+          }
+        }
+
+        const login = await this.loginOldRedditPassword(page, account.username, password);
+        attempts.push({ mode: mode.label, login });
+        if (login.ok) {
           await this.clearPasswordRotateRisk(account.id, {
             password_verified_at: new Date().toISOString(),
-            password_verify_via: meta.verifyVia || null,
-            password_restored_from_previous: true,
+            password_verify_via: mode.label,
           });
           await playwrightService.persistSession(page, 'reddit', account.id).catch(() => {});
-          await this.logAction(account.id, meta.proxyId, 'password_restored_previous', {
-            via: meta.verifyVia,
+          await this.logAction(account.id, proxyId, 'password_match_ok', {
+            via: mode.label,
+            attempts,
           });
           return {
             accountId: account.id,
             username: account.username,
-            status: 'restored_previous',
-            via: meta.verifyVia,
-            login: prevLogin,
+            status: 'match',
+            via: mode.label,
+            login,
+            attempts,
           };
         }
-        meta.previousLogin = prevLogin;
-      }
 
-      const blocked = !!(current.blocked || meta.previousLogin?.blocked);
-      if (blocked) {
-        return {
-          accountId: account.id,
-          username: account.username,
-          status: 'blocked_retry',
-          via: meta.verifyVia,
-          login: current,
-          meta,
-        };
-      }
+        if (login.blocked) {
+          attempts.push({ mode: mode.label, blocked: true });
+          continue;
+        }
 
-      await this.markPasswordLocked(
-        account.id,
-        `DB password login failed; previous=${!!previous && previous !== password}`
-      );
-      await this.logAction(
-        account.id,
-        meta.proxyId,
-        'password_locked',
-        { via: meta.verifyVia, current, meta },
-        'password_mismatch'
-      );
+        // Wrong-password UI signal
+        const wrongPw = /wrong password|incorrect password|invalid password|user not found/i.test(
+          login.snippet || ''
+        );
+        if (wrongPw && previous && previous !== password) {
+          const prevLogin = await this.loginOldRedditPassword(page, account.username, previous);
+          attempts.push({ mode: `${mode.label}_previous`, login: prevLogin });
+          if (prevLogin.ok) {
+            await this.persistNewPassword(
+              account.id,
+              creds,
+              previous,
+              'reddit_restore_previous_password'
+            );
+            await this.clearPasswordRotateRisk(account.id, {
+              password_verified_at: new Date().toISOString(),
+              password_verify_via: mode.label,
+              password_restored_from_previous: true,
+            });
+            await playwrightService.persistSession(page, 'reddit', account.id).catch(() => {});
+            return {
+              accountId: account.id,
+              username: account.username,
+              status: 'restored_previous',
+              via: mode.label,
+              attempts,
+            };
+          }
+        }
+      } catch (err) {
+        attempts.push({ mode: mode.label, error: String(err.message || err).slice(0, 200) });
+      } finally {
+        if (browser) await browser.close().catch(() => {});
+        playwrightService._untrackBrowser?.(account.id);
+      }
+    }
+
+    // Ambiguous network failures — do NOT lock.
+    const anyWrong = attempts.some((a) =>
+      /wrong password|incorrect password|invalid password/i.test(a.login?.snippet || '')
+    );
+    if (anyWrong) {
+      await this.markPasswordLocked(account.id, 'password login rejected across verify modes');
       return {
         accountId: account.id,
         username: account.username,
         status: 'locked',
-        via: meta.verifyVia,
-        login: current,
-        meta,
+        attempts,
       };
-    } catch (err) {
-      return {
-        accountId: account.id,
-        username: account.username,
-        status: 'error',
-        error: err.message,
-        meta,
-      };
-    } finally {
-      if (browser) await browser.close().catch(() => {});
-      playwrightService._untrackBrowser?.(account.id);
     }
+
+    await this.logAction(account.id, null, 'password_audit_inconclusive', { attempts });
+    return {
+      accountId: account.id,
+      username: account.username,
+      status: 'inconclusive_retry',
+      attempts,
+    };
   }
 
   /**

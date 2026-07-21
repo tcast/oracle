@@ -419,7 +419,13 @@ class ProxyService {
     );
 
     for (const row of rows) {
-      if (this.isAssignableProxy(row)) return row;
+      if (this.isAssignableProxy(row)) {
+        await pool.query('UPDATE proxies SET last_used_at = NOW() WHERE id = $1', [row.id]).catch(() => {});
+        return row;
+      }
+    }
+    if (rows[0]) {
+      await pool.query('UPDATE proxies SET last_used_at = NOW() WHERE id = $1', [rows[0].id]).catch(() => {});
     }
     return rows[0] || null;
   }
