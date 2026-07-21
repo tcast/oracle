@@ -2993,49 +2993,456 @@ class PlaywrightService {
   }
 
   /**
-   * LIVE X profile edit skeleton — GUARDED.
+   * LIVE X profile edit (cookie session only — no password login).
    *
-   * URL: https://x.com/settings/profile
-   * Safe v1 fields: display name, bio, location, website, avatar.
-   * Do NOT rename handle in v1 (opt-in/risky).
+   * URL: https://x.com/settings/profile (fallback: Edit profile modal)
+   * Safe v1 fields: display name, bio, location, website.
+   * Do NOT rename handle in v1.
    *
-   * Prerequisites before enabling:
-   *   - Cookie-verify batch (e.g. accounts 620–669) still healthy
-   *   - Oxylabs sticky proxy bound to the account
-   *   - Session restore with allowLogin:false (cookie_only)
-   *   - process.env.X_PERSONA_LIVE === '1'
-   *
-   * Offline assignment: node src/scripts/update-x-personas.js (DB only).
+   * Requires process.env.X_PERSONA_LIVE === '1'
    *
    * @param {import('playwright').Page} page — already cookie-restored session
    * @param {{ display_name: string, bio: string, location?: string|null, website?: string|null }} persona
    * @param {{ accountId?: number }} [options]
    */
-  async updateXPersona(page, persona, { accountId } = {}) {
+  async updateXPersona(page, persona, { accountId, username, photoPath = null } = {}) {
     if (process.env.X_PERSONA_LIVE !== '1') {
       throw new Error(
         'X profile live edits disabled. Set X_PERSONA_LIVE=1 only after cookie-verify ' +
-          '(e.g. 620–669) and Oxylabs proxy are confirmed. Offline: update-x-personas.js'
+          'and Oxylabs proxy are confirmed. Offline: update-x-personas.js'
       );
     }
+    if (!persona?.display_name || !persona?.bio) {
+      throw new Error('persona.display_name and persona.bio are required');
+    }
 
-    // TODO(live): implement after cookie-verify pilot. Suggested flow:
-    // 1. await page.goto('https://x.com/settings/profile', { waitUntil: 'domcontentloaded' });
-    // 2. Display name: input[name="displayName"] or input[data-testid="DisplayNameInput"]
-    // 3. Bio: textarea[name="description"] or textarea[data-testid="Account_description"]
-    // 4. Location: input[name="location"]
-    // 5. Website: input[name="url"] / input[name="website"]
-    // 6. Avatar: input[type="file"][data-testid="fileInput"] (or profile photo button → file chooser)
-    // 7. Save: button[data-testid="settingsDetailSave"] or button with text /Save/
-    // 8. NEVER touch username / handle fields in v1
-    // 9. Persist credentials.x_persona.applied_live = true + updateEnrichment({ headline, about, photo? })
-    void page;
-    void persona;
-    void accountId;
-    throw new Error(
-      'updateXPersona live implementation not wired yet — skeleton only. ' +
-        'See TODO in playwrightService.updateXPersona'
+    const fs = require('fs');
+    const tag = accountId ? `#${accountId}` : '';
+    const setupField = '[data-testid="ocfEnterTextTextInput"]';
+    const editBtnSel =
+      '[data-testid="editProfileButton"], [aria-label="Edit profile"], [aria-label="Set up profile"]';
+
+    const dialogText = async () =>
+      page.evaluate(() => {
+        const d = document.querySelector('[role="dialog"]');
+        return ((d || document.body).innerText || '').slice(0, 400);
+      }).catch(() => '');
+
+    const clickTextButton = async (...labels) => {
+      for (const label of labels) {
+        const el = await page
+          .locator(`button:has-text("${label}"), [role="button"]:has-text("${label}")`)
+          .first()
+          .elementHandle()
+          .catch(() => null);
+        if (!el) continue;
+        const visible = await el.isVisible().catch(() => false);
+        if (!visible) continue;
+        await el.click().catch(() => {});
+        await this.humanLikeDelay(1800, 3000);
+        return label;
+      }
+      return null;
+    };
+
+    const advanceSetupStep = async () => {
+      const next =
+        (await page.$('[data-testid="ocfEnterTextNextButton"]')) ||
+        (await page.$('[data-testid="ocfSettingsListNextButton"]')) ||
+        (await page.locator('[role="dialog"] button:has-text("Next")').first().elementHandle().catch(() => null));
+      if (next) {
+        await next.click().catch(() => {});
+        await this.humanLikeDelay(1800, 3000);
+        return 'next';
+      }
+      return clickTextButton('Skip for now');
+    };
+
+    const fillSetupField = async (value, maxLen) => {
+      if (value == null || value === '') return false;
+      const el = await page.waitForSelector(setupField, { timeout: 8000 }).catch(() => null);
+      if (!el) return false;
+      await el.click({ clickCount: 3 }).catch(() => {});
+      await el.fill('').catch(() => {});
+      await el.type(String(value).slice(0, maxLen), { delay: 18 });
+      await this.humanLikeDelay(400, 800);
+      return true;
+    };
+
+    // Direct /settings/profile and /{user} often hang on spinner — use home → Profile click.
+    console.log(`X persona ${tag}: opening profile via sidebar`);
+    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForSelector('[data-testid="AppTabBar_Profile_Link"]', { timeout: 30000 });
+    await this.humanLikeDelay(1500, 2500);
+    await page.click('[data-testid="AppTabBar_Profile_Link"]');
+    await this.humanLikeDelay(3000, 4500);
+    await page.waitForSelector(editBtnSel, { timeout: 45000 }).catch(() => null);
+
+    let editBtn =
+      (await page.$(editBtnSel)) ||
+      (await page
+        .locator('button:has-text("Set up profile"), button:has-text("Edit profile")')
+        .first()
+        .elementHandle()
+        .catch(() => null));
+    if (!editBtn) {
+      await page.screenshot({ path: `/tmp/x-persona-noform-${accountId || 'x'}.png` }).catch(() => {});
+      throw new Error('X Set up / Edit profile button not found');
+    }
+    await editBtn.click();
+    await this.humanLikeDelay(2500, 4000);
+
+    // --- setup_profile onboarding (warmed / incomplete accounts) ---
+    const onSetup = /\/i\/flow\/setup_profile/i.test(page.url()) ||
+      /Pick a profile picture|Describe yourself|Where do you live/i.test(await dialogText());
+
+    let photoOk = false;
+    if (onSetup) {
+      console.log(`X persona ${tag}: setup_profile flow`);
+
+      // Photo
+      let text = await dialogText();
+      if (/profile picture|selfie/i.test(text)) {
+        const fileInput = await page.$('input[data-testid="fileInput"], input[type="file"]');
+        if (photoPath && fs.existsSync(photoPath) && fileInput) {
+          await fileInput.setInputFiles(photoPath);
+          await this.humanLikeDelay(2500, 4000);
+          const apply =
+            (await page.$('[data-testid="applyButton"]')) ||
+            (await page.locator('button:has-text("Apply")').first().elementHandle().catch(() => null));
+          if (apply) {
+            await apply.click().catch(() => {});
+            await this.humanLikeDelay(1500, 2500);
+          }
+          // After crop, flow usually advances; otherwise Next
+          await advanceSetupStep();
+          photoOk = true;
+          console.log(`X persona ${tag}: photo uploaded in setup`);
+        } else {
+          await clickTextButton('Skip for now');
+        }
+      }
+
+      // Header
+      text = await dialogText();
+      if (/Pick a header|header/i.test(text)) {
+        await clickTextButton('Skip for now');
+      }
+
+      // Bio
+      text = await dialogText();
+      if (/Describe yourself|Your bio/i.test(text) || (await page.$(`textarea${setupField}`))) {
+        await fillSetupField(persona.bio, 160);
+        await advanceSetupStep();
+      }
+
+      // Location
+      text = await dialogText();
+      if (/Where do you live|Location/i.test(text) || (await page.$(`input${setupField}`))) {
+        if (persona.location) {
+          await fillSetupField(persona.location, 30);
+          await advanceSetupStep();
+        } else {
+          await clickTextButton('Skip for now');
+        }
+      }
+
+      // Save
+      text = await dialogText();
+      const saved = await clickTextButton('Save');
+      if (!saved) {
+        const saveBtn =
+          (await page.$('[data-testid="Profile_Save_Button"]')) ||
+          (await page.locator('[role="dialog"] button:has-text("Save")').first().elementHandle().catch(() => null));
+        if (saveBtn) {
+          await saveBtn.click().catch(() => {});
+          await this.humanLikeDelay(2500, 4000);
+        }
+      }
+      await page.screenshot({ path: `/tmp/x-persona-saved-${accountId || 'x'}.png` }).catch(() => {});
+      console.log(`X persona ${tag}: setup saved bio/location (display_name may need Edit pass)`);
+
+      // Second pass: Edit profile for display_name if button now says Edit
+      await this.humanLikeDelay(2000, 3000);
+      await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+      await page.waitForSelector('[data-testid="AppTabBar_Profile_Link"]', { timeout: 20000 }).catch(() => null);
+      await page.click('[data-testid="AppTabBar_Profile_Link"]').catch(() => {});
+      await this.humanLikeDelay(2500, 4000);
+      const editAgain =
+        (await page.$('[data-testid="editProfileButton"]')) ||
+        (await page.locator('button:has-text("Edit profile")').first().elementHandle().catch(() => null));
+      if (editAgain) {
+        const label = (await editAgain.innerText().catch(() => '')).trim();
+        if (/edit profile/i.test(label)) {
+          await editAgain.click();
+          await this.humanLikeDelay(2000, 3500);
+          const nameEl =
+            (await page.$('input[name="displayName"], input[name="name"]')) ||
+            (await page.locator('[role="dialog"] input[type="text"]').first().elementHandle().catch(() => null));
+          if (nameEl) {
+            await nameEl.click({ clickCount: 3 }).catch(() => {});
+            await nameEl.fill('');
+            await nameEl.type(persona.display_name.slice(0, 50), { delay: 18 });
+            await this.humanLikeDelay(300, 600);
+            await clickTextButton('Save');
+            console.log(`X persona ${tag}: display_name set via Edit profile`);
+          }
+        }
+      }
+
+      return { photoOk };
+    }
+
+    // --- Classic Edit profile modal ---
+    console.log(`X persona ${tag}: classic edit modal`);
+    const fillField = async (selectors, value, label) => {
+      if (value == null || value === '') return false;
+      for (const sel of selectors) {
+        const el = await page.$(sel);
+        if (!el) continue;
+        const visible = await el.isVisible().catch(() => false);
+        if (!visible) continue;
+        await el.click({ clickCount: 3 }).catch(() => {});
+        await el.fill('');
+        await el.type(String(value).slice(0, label === 'bio' ? 160 : 50), { delay: 18 });
+        await this.humanLikeDelay(300, 700);
+        return true;
+      }
+      console.warn(`X persona ${tag}: could not fill ${label}`);
+      return false;
+    };
+
+    const nameOk = await fillField(
+      [
+        'input[name="displayName"]',
+        'input[data-testid="DisplayNameInput"]',
+        'input[name="name"]',
+        'div[role="dialog"] input[type="text"]',
+      ],
+      persona.display_name.slice(0, 50),
+      'display_name'
     );
+    if (!nameOk) {
+      await page.screenshot({ path: `/tmp/x-persona-noform-${accountId || 'x'}.png` }).catch(() => {});
+      throw new Error('X profile edit form not found (display name input)');
+    }
+    await fillField(
+      [
+        'textarea[name="description"]',
+        'textarea[data-testid="Account_description"]',
+        'textarea[name="bio"]',
+        'textarea[data-testid="ocfEnterTextTextInput"]',
+      ],
+      persona.bio.slice(0, 160),
+      'bio'
+    );
+    await fillField(
+      ['input[name="location"]', 'input[data-testid="LocationInput"]'],
+      persona.location,
+      'location'
+    );
+    await fillField(
+      ['input[name="url"]', 'input[name="website"]', 'input[data-testid="URLInput"]'],
+      persona.website,
+      'website'
+    );
+
+    if (photoPath && fs.existsSync(photoPath)) {
+      const fileInput = await page.$('input[data-testid="fileInput"], input[type="file"]');
+      if (fileInput) {
+        await fileInput.setInputFiles(photoPath);
+        await this.humanLikeDelay(2500, 4000);
+        const apply =
+          (await page.$('[data-testid="applyButton"]')) ||
+          (await page.locator('button:has-text("Apply")').first().elementHandle().catch(() => null));
+        if (apply) {
+          await apply.click().catch(() => {});
+          await this.humanLikeDelay(1500, 2500);
+        }
+        photoOk = true;
+      }
+    }
+
+    const save =
+      (await page.$('[data-testid="settingsDetailSave"]')) ||
+      (await page.$('[data-testid="Profile_Save_Button"]')) ||
+      (await page.locator('button:has-text("Save")').first().elementHandle().catch(() => null));
+    if (!save) {
+      await page.screenshot({ path: `/tmp/x-persona-nosave-${accountId || 'x'}.png` }).catch(() => {});
+      throw new Error('X profile Save button not found');
+    }
+    await save.click();
+    await this.humanLikeDelay(2500, 4000);
+    await page.screenshot({ path: `/tmp/x-persona-saved-${accountId || 'x'}.png` }).catch(() => {});
+    console.log(`X persona ${tag}: saved display_name="${persona.display_name}"`);
+    return { photoOk };
+  }
+
+  /**
+   * Upload X avatar from a local image (cookie session, allowLogin=false).
+   */
+  async updateXProfilePhoto(page, photoPath, { accountId, username } = {}) {
+    const fs = require('fs');
+    if (!photoPath || !fs.existsSync(photoPath)) {
+      throw new Error(`Photo not found: ${photoPath}`);
+    }
+    const tag = accountId ? `#${accountId}` : '';
+
+    const openEditForPhoto = async (url) => {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+      await this.humanLikeDelay(2000, 3500);
+      const editBtn =
+        (await page.$('[data-testid="editProfileButton"]')) ||
+        (await page.$('[aria-label="Edit profile"]'));
+      if (editBtn) {
+        await editBtn.click().catch(() => {});
+        await this.humanLikeDelay(1500, 2500);
+      }
+      return page.$('input[type="file"][accept*="image"], input[type="file"], input[data-testid="fileInput"]');
+    };
+
+    // Prefer own profile Edit modal (avatar control lives there)
+    let fileInput = null;
+    if (username) {
+      fileInput = await openEditForPhoto(`https://x.com/${username}`);
+    }
+    if (!fileInput) {
+      fileInput = await openEditForPhoto('https://x.com/settings/profile');
+    }
+    if (!fileInput) {
+      const avatarBtn = await page.$(
+        '[aria-label*="Add avatar" i], [aria-label*="Edit avatar" i], [aria-label*="profile photo" i], [data-testid="UserAvatar-Container-unknown"]'
+      );
+      if (avatarBtn) {
+        await avatarBtn.click().catch(() => {});
+        await this.humanLikeDelay(1000, 2000);
+      }
+      fileInput = await page.$('input[type="file"]');
+    }
+    if (!fileInput) {
+      await page.screenshot({ path: `/tmp/x-avatar-nofile-${accountId || 'x'}.png` }).catch(() => {});
+      throw new Error('X avatar file input not found');
+    }
+
+    await fileInput.setInputFiles(photoPath);
+    await this.humanLikeDelay(2500, 4000);
+
+    // Apply / Save in crop modal if present
+    const apply =
+      (await page.$('[data-testid="applyButton"]')) ||
+      (await page.locator('button:has-text("Apply")').first().elementHandle().catch(() => null));
+    if (apply) {
+      await apply.click().catch(() => {});
+      await this.humanLikeDelay(1500, 2500);
+    }
+    const save =
+      (await page.$('[data-testid="settingsDetailSave"]')) ||
+      (await page.$('[data-testid="Profile_Save_Button"]')) ||
+      (await page.locator('button:has-text("Save")').first().elementHandle().catch(() => null));
+    if (save) {
+      await save.click().catch(() => {});
+      await this.humanLikeDelay(2500, 4000);
+    }
+    await page.screenshot({ path: `/tmp/x-avatar-done-${accountId || 'x'}.png` }).catch(() => {});
+    console.log(`X persona ${tag}: avatar uploaded from ${photoPath}`);
+    return true;
+  }
+
+  /**
+   * End-to-end: restore cookie session → apply x_persona fields (+ optional photo).
+   * Never password-logs in.
+   */
+  async applyXPersonaLive(accountId, { photoPath = null, requireProxy = true } = {}) {
+    if (process.env.X_PERSONA_LIVE !== '1') {
+      throw new Error('Set X_PERSONA_LIVE=1 to run live X persona edits');
+    }
+    let browser;
+    try {
+      const account = await this.getAccount(accountId);
+      if (account.platform !== 'x') {
+        throw new Error(`Account ${accountId} is ${account.platform}, expected x`);
+      }
+      const creds =
+        typeof account.credentials === 'string'
+          ? JSON.parse(account.credentials)
+          : account.credentials || {};
+      const persona = creds.x_persona;
+      if (!persona?.display_name || !persona?.bio) {
+        throw new Error(`Account ${accountId} missing credentials.x_persona — run update-x-personas.js first`);
+      }
+
+      await this.requireProxyForLive(accountId);
+      const result = await this.createBrowserForAccount(accountId, 2, { requireProxy });
+      browser = result.browser;
+      const page = result.page;
+
+      const loggedIn = await this.ensureLoggedIn(
+        page,
+        'x',
+        accountId,
+        account.username,
+        creds.password,
+        { allowLogin: false, totpSecret: creds.totp_secret }
+      );
+      if (!loggedIn) throw new Error(`no_live_session for x/${account.username}`);
+
+      const personaResult = await this.updateXPersona(page, persona, {
+        accountId,
+        username: account.username,
+        photoPath,
+      });
+      let photoOk = !!(personaResult && personaResult.photoOk);
+      // Fallback photo upload if setup flow skipped photo or classic modal had no file input
+      if (photoPath && !photoOk) {
+        try {
+          await this.updateXProfilePhoto(page, photoPath, {
+            accountId,
+            username: account.username,
+          });
+          photoOk = true;
+        } catch (photoErr) {
+          console.warn(`X #${accountId} photo failed (text fields may still be saved): ${photoErr.message}`);
+        }
+      }
+
+      await this.persistSession(page, 'x', accountId);
+
+      const nextPersona = {
+        ...persona,
+        applied_live: true,
+        applied_live_at: new Date().toISOString(),
+        photo_applied: photoOk,
+      };
+      await pool.query(
+        `UPDATE social_accounts
+         SET credentials = jsonb_set(COALESCE(credentials, '{}'::jsonb), '{x_persona}', $2::jsonb),
+             updated_at = NOW()
+         WHERE id = $1`,
+        [accountId, JSON.stringify(nextPersona)]
+      );
+      const { updateEnrichment } = require('./profileEnrichment');
+      await updateEnrichment(
+        accountId,
+        {
+          headline: true,
+          about: true,
+          photo: photoOk,
+          category: 'general',
+        },
+        { source: 'x_persona_live' }
+      );
+
+      return {
+        success: true,
+        accountId,
+        username: account.username,
+        display_name: persona.display_name,
+        photo: photoOk,
+      };
+    } finally {
+      if (browser) await browser.close().catch(() => {});
+      this._untrackBrowser(accountId);
+    }
   }
 
   async dismissLinkedInModals(page) {
