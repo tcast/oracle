@@ -26,8 +26,9 @@ function classifyFailure(message = '') {
   ) {
     return 'challenge';
   }
-  if (/no_live_session/i.test(msg)) {
-    return 'login_failed';
+  // Cookie dumps cannot be refreshed — treat as terminal, not a retryable login miss.
+  if (/no_live_session|session_not_logged_in|cookie_session_dead|session_dead/i.test(msg)) {
+    return 'session_dead';
   }
   if (/login failed/i.test(msg)) {
     return 'login_failed';
@@ -46,6 +47,7 @@ function cooldownHoursFor(failureClass, consecutiveFailures = 1) {
   const base = {
     security_block: 48,
     bad_credentials: 72,
+    session_dead: 8760, // ~1 year — terminal until replaced
     challenge: 24,
     proxy_error: 6,
     login_failed: 12,

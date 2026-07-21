@@ -147,9 +147,11 @@ async function smokeTestXCookieSession(accountId) {
     }
 
     if (!loggedIn || challenge === 'login_wall') {
-      if (proxyId) {
-        await proxyService.updateProxyStats(proxyId, false, { reason: 'cookie_session_dead' }).catch(() => {});
-      }
+      // Dead cookies cannot be refreshed — retire the account, do not burn the proxy.
+      const organicCommentService = require('../services/organicCommentService');
+      await organicCommentService
+        .markDeadSessionAccount(accountId, 'cookie_session_dead: session_not_logged_in')
+        .catch(() => {});
       return {
         success: false,
         accountId,
@@ -164,6 +166,7 @@ async function smokeTestXCookieSession(accountId) {
         proxyServer,
         screenshot: shotPath,
         error: 'session_not_logged_in',
+        accountMarkedDead: true,
       };
     }
 

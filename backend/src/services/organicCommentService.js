@@ -352,7 +352,7 @@ Write only the comment text.`;
          AND COALESCE(sa.credentials->>'password', '') NOT IN ('', 'default_password')
          AND COALESCE(sa.credentials->>'needs_signup', 'false') != 'true'
          AND (j.cooldown_until IS NULL OR j.cooldown_until <= NOW())
-         AND COALESCE(j.failure_class, '') NOT IN ('bad_credentials')
+         AND COALESCE(j.failure_class, '') NOT IN ('bad_credentials', 'session_dead')
          AND EXISTS (
            SELECT 1 FROM social_account_proxies sap
            JOIN proxies p ON p.id = sap.proxy_id
@@ -370,12 +370,59 @@ Write only the comment text.`;
     return result.rows;
   }
 
+  /**
+   * Cookie sessions cannot be refreshed. Mark the account inactive, disable
+   * organic, and free its dedicated proxy so working accounts keep capacity.
+   */
+  async markDeadSessionAccount(accountId, reason = 'session_dead') {
+    const msg = String(reason || 'session_dead');
+    await pool.query(
+      `UPDATE social_accounts
+       SET status = 'inactive',
+           warmup_status = 'failed',
+           credentials = COALESCE(credentials, '{}'::jsonb)
+             || jsonb_build_object(
+                  'session_dead', true,
+                  'session_dead_at', NOW()::text,
+                  'session_dead_reason', $2::text
+                ),
+           updated_at = NOW()
+       WHERE id = $1`,
+      [accountId, msg.slice(0, 500)]
+    );
+    await pool.query(
+      `UPDATE organic_comment_jobs
+       SET enabled = false,
+           status = 'error',
+           failure_class = 'session_dead',
+           last_error = $2,
+           cooldown_until = NOW() + INTERVAL '365 days',
+           next_due_at = NOW() + INTERVAL '365 days',
+           updated_at = NOW()
+       WHERE social_account_id = $1`,
+      [accountId, msg.slice(0, 1000)]
+    );
+    await pool.query(
+      `UPDATE social_account_proxies
+       SET is_active = false
+       WHERE social_account_id = $1 AND is_active = true`,
+      [accountId]
+    );
+    console.warn(`Account ${accountId} marked session_dead — ${msg.slice(0, 120)}`);
+    return { accountId, status: 'inactive', failureClass: 'session_dead' };
+  }
+
   async applyFailureQuarantine(job, errorMessage) {
     const failureClass = classifyFailure(errorMessage);
     const consecutive = (job.consecutive_failures || 0) + 1;
     const until = cooldownUntil(failureClass, consecutive);
-    // bad_credentials: disable until manually fixed
-    const disable = failureClass === 'bad_credentials';
+    // Terminal: bad password or dead cookies — disable until manually replaced
+    const disable = failureClass === 'bad_credentials' || failureClass === 'session_dead';
+
+    if (failureClass === 'session_dead') {
+      await this.markDeadSessionAccount(job.social_account_id, errorMessage);
+      return { failureClass, consecutive, until, disable: true };
+    }
 
     await pool.query(
       `UPDATE organic_comment_jobs
@@ -394,7 +441,7 @@ Write only the comment text.`;
     console.warn(
       `Account job ${job.social_account_id} quarantined as ${failureClass} ` +
         `until ${until.toISOString()} (failures=${consecutive})` +
-        (disable ? ' — disabled for bad credentials' : '')
+        (disable ? ' — disabled' : '')
     );
 
     return { failureClass, consecutive, until, disable };
