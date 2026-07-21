@@ -371,6 +371,96 @@ class CaptchaSolverService {
   }
 
   /**
+   * Solve an Arkose Labs FunCaptcha (used by X/Twitter login).
+   * @param {string} publicKey - Arkose public key (e.g. X login: BF5FA6C8-...)
+   * @param {string} pageUrl - page hosting the challenge
+   * @param {Object} opts - { blob, surl (arkose service subdomain), proxyConfig }
+   * @returns {Promise<string>} FunCaptcha solution token
+   */
+  async solveFunCaptcha(publicKey, pageUrl, opts = {}) {
+    const surl = opts.surl || 'https://client-api.arkoselabs.com';
+    console.log(`🧩 Solving FunCaptcha (arkose) pk=${publicKey} for ${pageUrl}${opts.blob ? ' [blob]' : ''}`);
+
+    const tryCapSolver = async () => {
+      if (!this.capSolverKey || this.capSolverIssue) throw new Error('CapSolver unavailable');
+      const task = {
+        type: opts.proxyConfig?.server ? 'FunCaptchaTask' : 'FunCaptchaTaskProxyLess',
+        websiteURL: pageUrl,
+        websitePublicKey: publicKey,
+        funcaptchaApiJSSubdomain: surl,
+      };
+      if (opts.blob) task.data = JSON.stringify({ blob: opts.blob });
+      if (opts.proxyConfig?.server && task.type === 'FunCaptchaTask') {
+        const raw = String(opts.proxyConfig.server).replace(/^https?:\/\//i, '').replace(/^socks5:\/\//i, '');
+        const [host, portStr] = raw.split(':');
+        task.proxyType = String(opts.proxyConfig.server).startsWith('socks5') ? 'socks5' : 'http';
+        task.proxyAddress = host;
+        task.proxyPort = parseInt(portStr, 10) || 80;
+        if (opts.proxyConfig.username) {
+          task.proxyLogin = opts.proxyConfig.username;
+          task.proxyPassword = opts.proxyConfig.password || '';
+        }
+      }
+      const create = await axios.post(this.capSolverUrl, { clientKey: this.capSolverKey, task }, { timeout: 15000 });
+      if (create.data.errorId !== 0) throw new Error(`CapSolver: ${create.data.errorDescription || create.data.errorCode}`);
+      const taskId = create.data.taskId;
+      const getUrl = this.capSolverUrl.replace('/createTask', '/getTaskResult');
+      for (let i = 0; i < 40; i++) {
+        await new Promise((r) => setTimeout(r, 3000));
+        const res = await axios.post(getUrl, { clientKey: this.capSolverKey, taskId }, { timeout: 10000 });
+        if (res.data.errorId !== 0) throw new Error(`CapSolver: ${res.data.errorDescription}`);
+        if (res.data.status === 'ready') {
+          console.log(`   ✅ CapSolver FunCaptcha solved in ${(i + 1) * 3}s`);
+          return res.data.solution.token;
+        }
+      }
+      throw new Error('CapSolver FunCaptcha timeout');
+    };
+
+    const try2Captcha = async () => {
+      if (!this.twoCaptchaKey || this.twoCaptchaIssue) throw new Error('2Captcha unavailable');
+      const submitParams = {
+        key: this.twoCaptchaKey,
+        method: 'funcaptcha',
+        publickey: publicKey,
+        surl,
+        pageurl: pageUrl,
+        json: 1,
+      };
+      if (opts.blob) submitParams['data[blob]'] = opts.blob;
+      if (opts.proxyConfig?.server) {
+        const raw = String(opts.proxyConfig.server).replace(/^https?:\/\//i, '').replace(/^socks5:\/\//i, '');
+        const user = opts.proxyConfig.username || '';
+        const pass = opts.proxyConfig.password || '';
+        submitParams.proxy = user ? `${encodeURIComponent(user)}:${encodeURIComponent(pass)}@${raw}` : raw;
+        submitParams.proxytype = String(opts.proxyConfig.server).startsWith('socks5') ? 'SOCKS5' : 'HTTP';
+      }
+      const submit = await axios.get(this.twoCaptchaSubmitUrl, { params: submitParams, timeout: 15000 });
+      if (submit.data.status !== 1) throw new Error(`2Captcha submit: ${submit.data.request}`);
+      const id = submit.data.request;
+      for (let i = 0; i < 40; i++) {
+        await new Promise((r) => setTimeout(r, 3000));
+        const res = await axios.get(this.twoCaptchaResultUrl, {
+          params: { key: this.twoCaptchaKey, action: 'get', id, json: 1 }, timeout: 10000,
+        });
+        if (res.data.status === 1) {
+          console.log(`   ✅ 2Captcha FunCaptcha solved in ${(i + 1) * 3}s`);
+          return res.data.request;
+        }
+        if (res.data.request !== 'CAPCHA_NOT_READY') throw new Error(`2Captcha: ${res.data.request}`);
+      }
+      throw new Error('2Captcha FunCaptcha timeout');
+    };
+
+    // CapSolver tends to be stronger on Arkose; try it first, then 2Captcha.
+    let lastErr;
+    for (const fn of [tryCapSolver, try2Captcha]) {
+      try { return await fn(); } catch (e) { lastErr = e; console.warn(`   FunCaptcha solver failed: ${e.message}`); }
+    }
+    throw lastErr || new Error('No FunCaptcha solver available');
+  }
+
+  /**
    * Inject CAPTCHA token into page
    * @param {Object} page - Playwright page object
    * @param {string} token - CAPTCHA solution token
