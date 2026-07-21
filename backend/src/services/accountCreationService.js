@@ -462,8 +462,8 @@ class AccountCreationService {
       return proxy_id;
     }
 
-    // Prefer proxies that recently loaded Reddit successfully, then healthy ProxyBase
-    // (BrightData ISP is currently network-blocked on /register). Never two Reddit
+    // Prefer phone-gate allowlisted proxies (register→phone→Continue cleared),
+    // then recent Reddit successes, then healthy ProxyBase. Never two Reddit
     // accounts on same proxy. Skip cooled / degraded / unhealthy.
     const pick = await pool.query(
       `SELECT p.id FROM proxies p
@@ -472,6 +472,8 @@ class AccountCreationService {
          AND (p.cooldown_until IS NULL OR p.cooldown_until <= NOW())
          AND COALESCE(p.consecutive_failures, 0) < 3
          AND COALESCE(p.last_health_ok, true) = true
+         AND COALESCE(p.metadata->>'reddit_phone_gate', '') IS DISTINCT FROM 'network_security'
+         AND COALESCE(p.metadata->>'reddit_phone_gate', '') IS DISTINCT FROM 'js_challenge'
          AND NOT EXISTS (
            SELECT 1 FROM social_account_proxies sap
            JOIN social_accounts sa ON sa.id = sap.social_account_id
@@ -479,16 +481,19 @@ class AccountCreationService {
          )
        ORDER BY
          CASE
+           WHEN COALESCE(p.metadata->>'reddit_phone_gate', '') = 'ok_register'
+             OR COALESCE(p.metadata->>'reddit_register_ok', '') = 'true'
+             THEN 0
            WHEN p.last_success_at IS NOT NULL
              AND p.last_success_at > NOW() - INTERVAL '2 hours'
              AND COALESCE(p.last_error, '') NOT ILIKE '%network_security%'
-             THEN 0
+             THEN 1
            WHEN p.provider ILIKE '%proxybase%'
-             AND p.name ILIKE '%residential%' THEN 1
-           WHEN p.provider ILIKE '%proxybase%' THEN 2
+             AND p.name ILIKE '%residential%' THEN 2
+           WHEN p.provider ILIKE '%proxybase%' THEN 3
            WHEN p.provider ILIKE '%brightdata%'
-             AND COALESCE(p.metadata->>'zone', '') IN ('isp_proxy3', 'isp_proxy4') THEN 3
-           ELSE 4
+             AND COALESCE(p.metadata->>'zone', '') IN ('isp_proxy3', 'isp_proxy4') THEN 4
+           ELSE 5
          END,
          CASE WHEN EXISTS (
            SELECT 1 FROM social_account_proxies sap
@@ -563,14 +568,15 @@ class AccountCreationService {
 
   async detectRedditNetworkBlock(page) {
     return page.evaluate(() => {
-      const text = `${document.body?.innerText || ''} ${document.documentElement?.innerHTML || ''}`;
+      const snippet = (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 220);
+      // Only treat explicit Reddit block UI as blocked — do NOT scan full HTML for
+      // loose "network security" / "js_challenge" tokens (false positives on /register).
       const blocked =
-        /blocked by network security|you.?ve been blocked by network security|js_challenge|network security/i.test(
-          text
-        );
+        /you.?ve been blocked by network security|blocked by network security/i.test(snippet) ||
+        (/js_challenge/i.test(snippet) && /blocked/i.test(snippet));
       return {
         blocked,
-        snippet: (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 220),
+        snippet,
       };
     });
   }
@@ -617,7 +623,7 @@ class AccountCreationService {
         .evaluate(() => {
           const text = document.body?.innerText || '';
           return {
-            blocked: /blocked by network security|js_challenge/i.test(text),
+            blocked: /you.?ve been blocked by network security|blocked by network security/i.test(text),
             ready: /Continue with Phone|Continue with Email|Sign Up|Email\*|Phone Number/i.test(text),
             snippet: text.replace(/\s+/g, ' ').slice(0, 220),
           };

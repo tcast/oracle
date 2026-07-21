@@ -1,0 +1,33 @@
+{
+  "updated_at": "2026-07-21T02:40:00Z",
+  "dummy_phone": "2025550147",
+  "clean_proxy_ids": [
+    81,
+    107,
+    118
+  ],
+  "results": [
+    {
+      "id": 118,
+      "provider": "ProxyBase",
+      "zone": null,
+      "classification": "ok_register",
+      "stage": "after_continue"
+    }
+  ],
+  "notes": "ProxyBase residential 81/107/118 cleared /register\u2192phone\u2192Continue without network_security (dummy then real). Prefer metadata reddit_phone_gate=ok_register in claimProxyForNewAccount. Organic left enabled.",
+  "preferred_for_reddit_create": [
+    81,
+    107,
+    118
+  ],
+  "probe_summary": {
+    "providers_tried": [
+      "ProxyBase residential",
+      "BrightData ISP (skipped after target met)"
+    ],
+    "clean": 3,
+    "create_attempt": "NO \u2014 cleared network gate + captcha + SMS buy on proxy 81; Continue did not show OTP; SMS cancelled",
+    "false_positive_fix": "detectRedditNetworkBlock no longer scans full HTML for loose network security / js_challenge"
+  }
+}
