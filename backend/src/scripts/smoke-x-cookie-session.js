@@ -72,21 +72,57 @@ async function smokeTestXCookieSession(accountId) {
       };
     }
 
-    // verifySessionAlive already navigates to x.com/home and checks selectors
-    const alive = await playwrightService.verifySessionAlive(page, 'x');
-    await playwrightService.humanLikeDelay(800, 1500);
+    // Cookie restores hydrate slowly — wait for logged-in chrome once (no second goto).
+    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page
+      .waitForSelector(
+        '[data-testid="SideNav_AccountSwitcher_Button"], [data-testid="AppTabBar_Profile_Link"], [data-testid="primaryColumn"]',
+        { timeout: 30000 }
+      )
+      .catch(() => null);
+    // Give the account row at bottom-left time to paint (often after primaryColumn).
+    await playwrightService.humanLikeDelay(4000, 6000);
 
     const url = page.url();
-    const bodyText = await page.evaluate(() => (document.body?.innerText || '').slice(0, 5000)).catch(() => '');
-    const challenge = detectChallenge(url, bodyText);
-
-    const homeFeedVisible = await page.evaluate(() => {
-      return !!(
+    const identity = await page.evaluate((expectedUser) => {
+      const text = (document.body?.innerText || '').slice(0, 8000);
+      const switcher = document.querySelector('[data-testid="SideNav_AccountSwitcher_Button"]');
+      const switcherText = (switcher?.innerText || '').replace(/\s+/g, ' ').trim();
+      const handleHit = expectedUser
+        ? new RegExp(`@${expectedUser}\\b`, 'i').test(text) ||
+          new RegExp(`/${expectedUser}(?:\\b|/|$)`, 'i').test(location.href) ||
+          !!document.querySelector(`a[href="/${expectedUser}"], a[href*="/${expectedUser}"]`)
+        : false;
+      const homeFeedVisible = !!(
         document.querySelector('[data-testid="primaryColumn"], [aria-label="Home timeline"]') ||
-        document.querySelector('[data-testid="SideNav_AccountSwitcher_Button"]') ||
+        switcher ||
         document.querySelector('[data-testid="AppTabBar_Home_Link"], a[href="/home"]')
       );
-    }).catch(() => false);
+      const loggedOutWall =
+        /Sign in to X|Create account|Already have an account\?/i.test(text) &&
+        !switcher &&
+        !handleHit;
+      return {
+        switcherText,
+        homeFeedVisible,
+        hasSwitcher: !!switcher,
+        handleHit,
+        bodySnippet: text.slice(0, 500),
+        loggedOutWall,
+      };
+    }, account.username).catch(() => ({
+      switcherText: '',
+      homeFeedVisible: false,
+      hasSwitcher: false,
+      handleHit: false,
+      bodySnippet: '',
+      loggedOutWall: true,
+    }));
+    const { switcherText, homeFeedVisible, hasSwitcher, handleHit, bodySnippet, loggedOutWall } =
+      identity;
+    const bodyText = bodySnippet || '';
+    const challenge = loggedOutWall ? 'login_wall' : detectChallenge(url, bodyText);
+    const loggedIn = !!(hasSwitcher || handleHit) && !loggedOutWall;
 
     await page.screenshot({ path: shotPath, fullPage: true }).catch(() => {});
 
@@ -110,7 +146,7 @@ async function smokeTestXCookieSession(accountId) {
       };
     }
 
-    if (!alive || challenge === 'login_wall') {
+    if (!loggedIn || challenge === 'login_wall') {
       if (proxyId) {
         await proxyService.updateProxyStats(proxyId, false, { reason: 'cookie_session_dead' }).catch(() => {});
       }
@@ -121,6 +157,7 @@ async function smokeTestXCookieSession(accountId) {
         restored: true,
         loggedIn: false,
         homeFeedVisible,
+        switcherText,
         url,
         challenge: challenge || 'not_logged_in',
         stopBatch: false,
@@ -151,6 +188,7 @@ async function smokeTestXCookieSession(accountId) {
       restored: true,
       loggedIn: true,
       homeFeedVisible: !!homeFeedVisible,
+      switcherText,
       url,
       challenge: null,
       stopBatch: false,

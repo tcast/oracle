@@ -568,8 +568,15 @@ class PlaywrightService {
           });
           return !!redditLoggedIn;
         case 'x':
-          await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 });
-          await this.humanLikeDelay(800, 1500);
+          await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 45000 });
+          // Account switcher paints after the shell; short waits false-negative live cookies.
+          await page
+            .waitForSelector(
+              '[data-testid="SideNav_AccountSwitcher_Button"], [data-testid="UserAvatar-Container-unknown"], [data-testid^="UserAvatar-Container-"]',
+              { timeout: 20000 }
+            )
+            .catch(() => null);
+          await this.humanLikeDelay(1500, 2500);
           const xUser = await page.$(
             '[data-testid="SideNav_AccountSwitcher_Button"], [data-testid="AppTabBar_Home_Link"], [data-testid="BottomBar_Home_Link"], a[href="/home"]'
           );
@@ -579,6 +586,8 @@ class PlaywrightService {
             if (/Sign in|Create account|Already have an account/i.test(text) && !/Home|Notifications|Messages/i.test(text)) {
               return false;
             }
+            if (document.querySelector('[data-testid="SideNav_AccountSwitcher_Button"]')) return true;
+            if (document.querySelector('[data-testid^="UserAvatar-Container-"]')) return true;
             return !!document.querySelector('[data-testid="primaryColumn"], [aria-label="Home timeline"]');
           });
         case 'linkedin':
