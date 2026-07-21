@@ -642,7 +642,12 @@ class PlaywrightService {
         default:
           return false;
       }
-    } catch {
+    } catch (error) {
+      // Network/proxy failures must not be treated as dead sessions.
+      const msg = error?.message || String(error);
+      if (/ERR_TUNNEL|ERR_TIMED_OUT|ERR_PROXY|ERR_CONNECTION|net::ERR_|Timeout/i.test(msg)) {
+        throw error;
+      }
       return false;
     }
   }

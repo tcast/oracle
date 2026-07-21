@@ -416,13 +416,15 @@ Write only the comment text.`;
     const failureClass = classifyFailure(errorMessage);
     const consecutive = (job.consecutive_failures || 0) + 1;
     const until = cooldownUntil(failureClass, consecutive);
-    // Terminal: bad password or dead cookies — disable until manually replaced
+    // Terminal: bad password or confirmed dead cookies — disable until replaced
     const disable = failureClass === 'bad_credentials' || failureClass === 'session_dead';
 
     if (failureClass === 'session_dead') {
       await this.markDeadSessionAccount(job.social_account_id, errorMessage);
       return { failureClass, consecutive, until, disable: true };
     }
+
+    // Transient login/proxy flakes: quarantine only, do not permanently kill.
 
     await pool.query(
       `UPDATE organic_comment_jobs
