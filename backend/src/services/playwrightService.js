@@ -2033,13 +2033,12 @@ class PlaywrightService {
       await startPostBtn.click({ force: true });
       await this.humanLikeDelay(1000, 2000);
 
-      const editor = await page.waitForSelector('.ql-editor', { timeout: 10000 });
-      const eBox = await editor.boundingBox();
-      if (eBox) {
-        await this.simulateMouseMovement(page, 0, 0, eBox.x + eBox.width / 2, eBox.y + eBox.height / 2);
-      }
-
-      await this.humanLikeTyping(page, '.ql-editor', content);
+      const editor = await page.waitForSelector('.ql-editor, div[role="textbox"]', { timeout: 15000 });
+      await editor.click({ force: true });
+      await this.humanLikeDelay(300, 600);
+      // LinkedIn share box needs real input events to enable Post.
+      await page.keyboard.type(content, { delay: 25 });
+      await this.humanLikeDelay(1000, 2000);
 
       if (mediaPath) {
         const mediaBtn = await page.$('[aria-label="Add media"]');
