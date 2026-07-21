@@ -417,7 +417,11 @@ class AccountCreationService {
       pageUrl,
       info.type,
       null,
-      { invisible: !!info.invisible, enterprise: !!info.enterprise }
+      {
+        invisible: !!info.invisible,
+        enterprise: !!info.enterprise,
+        proxyConfig: opts.proxyConfig || null,
+      }
     );
     await captchaSolverService.injectCaptchaToken(page, token);
     // Patch fetch so verify_phone payloads carry the token even if execute isn't used
@@ -826,7 +830,7 @@ class AccountCreationService {
   /**
    * Phone OTP path for Reddit /register (SMS-Man USA preferred).
    */
-  async createRedditAccountViaPhone(page, username, password) {
+  async createRedditAccountViaPhone(page, username, password, proxyConfig = null) {
     let smsRequest = null;
     const apiHits = [];
     let enterpriseSiteKey = null;
@@ -840,11 +844,23 @@ class AccountCreationService {
         }
         if (/verify_phone_by_code_initialize/i.test(url)) {
           verifyPhoneStatus = resp.status();
+          let bodySnippet = '';
+          try {
+            bodySnippet = (await resp.text()).replace(/\s+/g, ' ').slice(0, 240);
+          } catch (_) {
+            /* ignore */
+          }
           apiHits.push({
             status: resp.status(),
             url: url.slice(0, 200),
             kind: 'verify_phone_init',
+            body: bodySnippet,
           });
+          if (resp.status() >= 400) {
+            console.warn(
+              `Reddit verify_phone_by_code_initialize → ${resp.status()} ${bodySnippet}`
+            );
+          }
           return;
         }
         if (
@@ -948,11 +964,12 @@ class AccountCreationService {
         await this.humanLikeDelay(400, 700);
       }
 
-      // Reddit phone verify uses reCAPTCHA Enterprise (invisible)
+      // Reddit phone verify uses reCAPTCHA Enterprise (invisible); solve via same proxy IP
       const preCaptcha = await this.maybeSolveCaptcha(page, page.url(), {
         enterprise: true,
         invisible: true,
         siteKey: enterpriseSiteKey || undefined,
+        proxyConfig,
       });
       if (preCaptcha.reason === 'captcha_present_no_sitekey') {
         throw new Error(
@@ -1039,6 +1056,7 @@ class AccountCreationService {
               enterprise: true,
               invisible: true,
               siteKey: enterpriseSiteKey || undefined,
+              proxyConfig,
             }).catch(() => ({}));
             verifyPhoneStatus = null;
             await this.clickRedditContinue(page);
@@ -1104,6 +1122,7 @@ class AccountCreationService {
         enterprise: true,
         invisible: true,
         siteKey: enterpriseSiteKey || undefined,
+        proxyConfig,
       });
       if (captchaResult.reason === 'captcha_present_no_sitekey') {
         throw new Error(
@@ -1183,12 +1202,12 @@ class AccountCreationService {
       });
 
       if (verifyMode === 'phone' || verifyMode === 'phone_only') {
-        return await this.createRedditAccountViaPhone(page, username, password);
+        return await this.createRedditAccountViaPhone(page, username, password, proxyConfig);
       }
 
       if (verifyMode === 'phone_first') {
         try {
-          return await this.createRedditAccountViaPhone(page, username, password);
+          return await this.createRedditAccountViaPhone(page, username, password, proxyConfig);
         } catch (phoneErr) {
           console.warn(
             `Reddit phone create failed (${phoneErr.message}); falling back to email…`

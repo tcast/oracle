@@ -102,6 +102,9 @@ class CaptchaSolverService {
     };
 
     // Enterprise: CapSolver first (2Captcha often returns ERROR_CAPTCHA_UNSOLVABLE for Reddit)
+    if (opts.proxyConfig?.server) {
+      console.log('   Using session proxy for captcha solve (IP match)');
+    }
     const order = opts.enterprise ? [tryCapSolver, try2Captcha] : [try2Captcha, tryCapSolver];
     let lastErr;
     for (const fn of order) {
@@ -144,6 +147,19 @@ class CaptchaSolverService {
       }
       if (opts.enterprise && captchaType.startsWith('recaptcha')) {
         submitParams.enterprise = 1;
+      }
+      if (opts.proxyConfig?.server) {
+        const raw = String(opts.proxyConfig.server)
+          .replace(/^https?:\/\//i, '')
+          .replace(/^socks5:\/\//i, '');
+        const user = opts.proxyConfig.username || '';
+        const pass = opts.proxyConfig.password || '';
+        submitParams.proxy = user
+          ? `${encodeURIComponent(user)}:${encodeURIComponent(pass)}@${raw}`
+          : raw;
+        submitParams.proxytype = String(opts.proxyConfig.server).startsWith('socks5')
+          ? 'SOCKS5'
+          : 'HTTP';
       }
 
       const submitResponse = await axios.get(this.twoCaptchaSubmitUrl, {
@@ -213,16 +229,24 @@ class CaptchaSolverService {
       switch (captchaType) {
         case 'recaptcha_v2':
           if (opts.enterprise) {
-            taskType = 'ReCaptchaV2EnterpriseTaskProxyLess';
+            taskType = opts.proxyConfig?.server
+              ? 'ReCaptchaV2EnterpriseTask'
+              : 'ReCaptchaV2EnterpriseTaskProxyLess';
           } else {
-            taskType = 'ReCaptchaV2TaskProxyLess';
+            taskType = opts.proxyConfig?.server
+              ? 'ReCaptchaV2Task'
+              : 'ReCaptchaV2TaskProxyLess';
           }
           if (opts.invisible) taskData.isInvisible = true;
           break;
         case 'recaptcha_v3':
           taskType = opts.enterprise
-            ? 'ReCaptchaV3EnterpriseTaskProxyLess'
-            : 'ReCaptchaV3TaskProxyLess';
+            ? opts.proxyConfig?.server
+              ? 'ReCaptchaV3EnterpriseTask'
+              : 'ReCaptchaV3EnterpriseTaskProxyLess'
+            : opts.proxyConfig?.server
+              ? 'ReCaptchaV3Task'
+              : 'ReCaptchaV3TaskProxyLess';
           taskData.pageAction = version || 'submit';
           taskData.minScore = 0.3;
           break;
@@ -231,9 +255,27 @@ class CaptchaSolverService {
           break;
         default:
           taskType = opts.enterprise
-            ? 'ReCaptchaV2EnterpriseTaskProxyLess'
+            ? opts.proxyConfig?.server
+              ? 'ReCaptchaV2EnterpriseTask'
+              : 'ReCaptchaV2EnterpriseTaskProxyLess'
             : 'ReCaptchaV2TaskProxyLess';
           if (opts.invisible) taskData.isInvisible = true;
+      }
+
+      if (opts.proxyConfig?.server && !/ProxyLess$/i.test(taskType)) {
+        const raw = String(opts.proxyConfig.server)
+          .replace(/^https?:\/\//i, '')
+          .replace(/^socks5:\/\//i, '');
+        const [host, portStr] = raw.split(':');
+        taskData.proxyType = String(opts.proxyConfig.server).startsWith('socks5')
+          ? 'socks5'
+          : 'http';
+        taskData.proxyAddress = host;
+        taskData.proxyPort = parseInt(portStr, 10) || 80;
+        if (opts.proxyConfig.username) {
+          taskData.proxyLogin = opts.proxyConfig.username;
+          taskData.proxyPassword = opts.proxyConfig.password || '';
+        }
       }
 
       const createResponse = await axios.post(this.capSolverUrl, {
