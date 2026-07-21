@@ -12,15 +12,25 @@ const { assertImportCredentials } = require('../utils/credentialGate');
 const SUPPORTED = ['x', 'instagram', 'tiktok', 'linkedin'];
 
 const FORMAT_HELP = {
-  x: 'username----password----email|email_password|auth_token|batch_uuid----totp_secret----ct0',
+  x:
+    'username----password----email|email_password|auth_token|batch_uuid----totp_secret----ct0 ' +
+    'OR username----password----email----email_password----totp----auth_token[----ct0]',
   instagram: 'username:password:totp_secret:email:email_password',
   tiktok: 'username,password[,email]',
   linkedin: 'email:linkedin_password:email_password:totp_secret:profile_url',
 };
 
+function looksLikeXAuthToken(token) {
+  const t = String(token || '').trim();
+  if (!t) return false;
+  if (t.startsWith('M.')) return true;
+  // Fresh dumps often ship 40+ hex auth_token without the AccsMarket M. prefix
+  return /^[0-9a-f]{40,}$/i.test(t);
+}
+
 function buildXCookies(authToken, ct0) {
   const base = { path: '/', secure: true };
-  return [
+  const cookies = [
     {
       ...base,
       name: 'auth_token',
@@ -29,40 +39,71 @@ function buildXCookies(authToken, ct0) {
       httpOnly: true,
       sameSite: 'None',
     },
-    {
+  ];
+  if (ct0 && /^[0-9a-f]{40}$/i.test(ct0)) {
+    cookies.push({
       ...base,
       name: 'ct0',
       value: ct0,
       domain: '.x.com',
       httpOnly: false,
       sameSite: 'Lax',
-    },
-  ];
+    });
+  }
+  return cookies;
 }
 
 function parseXLine(line) {
   const raw = String(line || '').trim();
   if (!raw || raw.startsWith('#')) return null;
   const dash = raw.split('----');
-  if (dash.length !== 5) {
-    throw new Error(`Expected 5 ---- fields, got ${dash.length}`);
+
+  let username;
+  let password;
+  let email;
+  let email_password;
+  let auth_token;
+  let batch_uuid = '';
+  let totp_secret;
+  let ct0 = '';
+
+  if (dash.length === 5 && dash[2].includes('|')) {
+    // AccsMarket: username----password----email|email_pass|auth_token|batch----totp----ct0
+    username = dash[0].trim();
+    password = dash[1].trim();
+    const mid = dash[2].split('|');
+    if (mid.length !== 4) {
+      throw new Error(`Expected email|email_pass|auth_token|batch_uuid, got ${mid.length} pipe fields`);
+    }
+    email = mid[0].trim();
+    email_password = mid[1].trim();
+    auth_token = mid[2].trim();
+    batch_uuid = mid[3].trim();
+    totp_secret = dash[3].trim();
+    ct0 = dash[4].trim();
+  } else if (dash.length === 6 || dash.length === 7) {
+    // Flat: username----password----email----email_password----totp----auth_token[----ct0]
+    username = dash[0].trim();
+    password = dash[1].trim();
+    email = dash[2].trim();
+    email_password = dash[3].trim();
+    totp_secret = dash[4].trim();
+    auth_token = dash[5].trim();
+    ct0 = (dash[6] || '').trim();
+  } else {
+    throw new Error(
+      `Expected 5 (pipe mid) or 6–7 ---- fields, got ${dash.length}`
+    );
   }
-  const username = dash[0].trim();
-  const password = dash[1].trim();
-  const mid = dash[2].split('|');
-  if (mid.length !== 4) {
-    throw new Error(`Expected email|email_pass|auth_token|batch_uuid, got ${mid.length} pipe fields`);
-  }
-  const email = mid[0].trim();
-  const email_password = mid[1].trim();
-  const auth_token = mid[2].trim();
-  const batch_uuid = mid[3].trim();
-  const totp_secret = dash[3].trim();
-  const ct0 = dash[4].trim();
+
   if (!username || !password) throw new Error('Missing username/password');
   if (!/@/.test(email)) throw new Error(`Invalid email: ${email}`);
-  if (!auth_token.startsWith('M.')) throw new Error('auth_token does not look like X cookie');
-  if (!/^[0-9a-f]{40}$/i.test(ct0)) throw new Error(`ct0 must be 40-hex, got len=${ct0.length}`);
+  if (!looksLikeXAuthToken(auth_token)) {
+    throw new Error('auth_token does not look like X cookie (need M.* or 40+ hex)');
+  }
+  if (ct0 && !/^[0-9a-f]{40}$/i.test(ct0)) {
+    throw new Error(`ct0 must be 40-hex when present, got len=${ct0.length}`);
+  }
   const row = {
     username,
     password,
@@ -183,20 +224,35 @@ class AccountImportService {
     return proxyIds;
   }
 
-  async takeFreeProxies(needed) {
+  async takeFreeProxies(needed, { preferIspProxy4 = true } = {}) {
     if (needed <= 0) return [];
+    // Prefer free healthy BrightData isp_proxy4; skip cooled / degraded.
     const free = await pool.query(
       `SELECT p.id
        FROM proxies p
        WHERE p.is_active = true
          AND (p.cooldown_until IS NULL OR p.cooldown_until <= NOW())
+         AND COALESCE(p.consecutive_failures, 0) < 3
+         AND COALESCE(p.last_health_ok, true) = true
          AND NOT EXISTS (
            SELECT 1 FROM social_account_proxies sap
            WHERE sap.proxy_id = p.id AND sap.is_active = true
          )
-       ORDER BY p.id
+       ORDER BY
+         CASE
+           WHEN $2::boolean
+             AND p.provider ILIKE '%brightdata%'
+             AND COALESCE(p.metadata->>'zone', '') = 'isp_proxy4'
+             THEN 0
+           WHEN p.provider ILIKE '%brightdata%'
+             AND COALESCE(p.metadata->>'zone', '') IN ('isp_proxy3', 'isp_proxy4')
+             THEN 1
+           ELSE 2
+         END,
+         p.failure_count ASC NULLS FIRST,
+         p.id
        LIMIT $1`,
-      [needed]
+      [needed, preferIspProxy4]
     );
     return free.rows.map((r) => r.id);
   }
@@ -254,14 +310,16 @@ class AccountImportService {
     }
     await this.assignProxy(accountId, proxyId);
     const cookies = buildXCookies(row.auth_token, row.ct0);
-    await pool.query(
-      `INSERT INTO browser_sessions (account_id, platform, cookies, session_data, user_agent)
-       VALUES ($1, 'x', $2::jsonb, '{}'::jsonb, NULL)
-       ON CONFLICT (account_id, platform)
-       DO UPDATE SET cookies = $2::jsonb, updated_at = NOW()`,
-      [accountId, JSON.stringify(cookies)]
-    );
-    return { accountId, username: row.username };
+    if (cookies.length) {
+      await pool.query(
+        `INSERT INTO browser_sessions (account_id, platform, cookies, session_data, user_agent)
+         VALUES ($1, 'x', $2::jsonb, '{}'::jsonb, NULL)
+         ON CONFLICT (account_id, platform)
+         DO UPDATE SET cookies = $2::jsonb, updated_at = NOW()`,
+        [accountId, JSON.stringify(cookies)]
+      );
+    }
+    return { accountId, username: row.username, cookieCount: cookies.length };
   }
 
   async upsertInstagram(row, proxyId) {
@@ -482,10 +540,20 @@ class AccountImportService {
 
     const capped = rows.slice(0, Math.min(max, 50));
     const needed = capped.length;
-    let proxyIds = await this.takeProxiesFromPendingShells(needed);
-    if (proxyIds.length < needed) {
-      const free = await this.takeFreeProxies(needed - proxyIds.length);
-      proxyIds = proxyIds.concat(free);
+    let proxyIds = [];
+    if (platform === 'x') {
+      // X: prefer unused healthy BrightData isp_proxy4 (1:1). Avoid burning cooled proxies.
+      proxyIds = await this.takeFreeProxies(needed, { preferIspProxy4: true });
+      if (proxyIds.length < needed) {
+        const more = await this.takeProxiesFromPendingShells(needed - proxyIds.length);
+        proxyIds = proxyIds.concat(more);
+      }
+    } else {
+      proxyIds = await this.takeProxiesFromPendingShells(needed);
+      if (proxyIds.length < needed) {
+        const free = await this.takeFreeProxies(needed - proxyIds.length);
+        proxyIds = proxyIds.concat(free);
+      }
     }
 
     const imported = [];
