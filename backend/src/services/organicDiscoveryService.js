@@ -14,6 +14,9 @@ const EXPERTISE_SUBS = {
 
 const SAFE_GENERAL = ['AskReddit', 'CasualConversation', 'NoStupidQuestions', 'todayilearned', 'LifeProTips'];
 
+/** Platforms with organic comment discovery + posting wired. */
+const ORGANIC_PLATFORMS = ['reddit', 'linkedin', 'x', 'instagram'];
+
 function normalizeSub(name) {
   return String(name || '').replace(/^r\//i, '').trim();
 }
@@ -32,6 +35,10 @@ function shuffle(arr) {
 }
 
 class OrganicDiscoveryService {
+  getSupportedPlatforms() {
+    return [...ORGANIC_PLATFORMS];
+  }
+
   async getSubsForAccount(account) {
     let traits = account.persona_traits;
     if (typeof traits === 'string') {
@@ -103,8 +110,17 @@ class OrganicDiscoveryService {
     });
   }
 
-  async findCommentableThread(account) {
-    const used = await this.getUsedPostUrls();
+  filterUnused(posts, used) {
+    return (posts || []).filter((p) => {
+      const url = p?.post_url || p?.url;
+      if (!url || used.has(url)) return false;
+      const bare = url.replace(/\/$/, '');
+      if (used.has(bare) || used.has(`${bare}/`)) return false;
+      return true;
+    });
+  }
+
+  async findRedditThread(account, used) {
     const subs = shuffle(await this.getSubsForAccount(account));
     const tried = [];
 
@@ -113,14 +129,8 @@ class OrganicDiscoveryService {
       try {
         const sort = Math.random() > 0.45 ? 'hot' : 'new';
         const posts = await this.fetchSubredditListing(account.id, sub, sort);
-        const candidates = (posts || [])
-          .filter((p) => {
-            if (!p?.post_url || used.has(p.post_url)) return false;
-            // Normalize trailing slash variants
-            const bare = p.post_url.replace(/\/$/, '');
-            if (used.has(bare) || used.has(`${bare}/`)) return false;
-            return this.scoreThread(p) > 0;
-          })
+        const candidates = this.filterUnused(posts, used)
+          .filter((p) => this.scoreThread(p) > 0)
           .map((p) => ({
             subreddit: normalizeSub(p.subreddit || sub),
             title: p.title || '',
@@ -130,6 +140,7 @@ class OrganicDiscoveryService {
             num_comments: p.num_comments || 0,
             created_utc: p.created_utc || Date.now() / 1000,
             fit: this.scoreThread(p),
+            platform: 'reddit',
           }))
           .sort((a, b) => b.fit - a.fit);
 
@@ -144,6 +155,88 @@ class OrganicDiscoveryService {
 
     throw new Error(`No commentable threads found (tried: ${tried.join(', ')})`);
   }
+
+  async findLinkedInThread(account, used) {
+    let posts = [];
+    try {
+      posts = await playwrightService.listLinkedInFeedPosts(account.id, { limit: 12 });
+    } catch (err) {
+      console.warn('LinkedIn feed discovery:', err.message);
+    }
+    if (!posts.length) {
+      const persona = account.persona_traits || {};
+      const expertise = Array.isArray(persona.expertise) ? persona.expertise[0] : null;
+      const query = expertise || 'career growth';
+      posts = await playwrightService.listLinkedInSearchPosts(account.id, {
+        query,
+        limit: 10,
+      });
+    }
+    const candidates = this.filterUnused(posts, used).map((p) => ({
+      subreddit: p.subreddit || 'linkedin:feed',
+      title: p.title || 'LinkedIn post',
+      selftext: (p.selftext || p.title || '').slice(0, 1200),
+      post_url: p.post_url,
+      score: 0,
+      num_comments: 0,
+      fit: (p.title || '').length > 20 ? 1.2 : 0.8,
+      platform: 'linkedin',
+    }));
+    if (!candidates.length) throw new Error('No commentable LinkedIn posts (feed+search empty)');
+    return pickRandom(candidates.slice(0, 5));
+  }
+
+  async findXThread(account, used) {
+    const posts = await playwrightService.listXHomePosts(account.id, { limit: 12 });
+    const candidates = this.filterUnused(posts, used).map((p) => ({
+      subreddit: p.subreddit || 'x:home',
+      title: p.title || 'X post',
+      selftext: (p.selftext || p.title || '').slice(0, 1200),
+      post_url: p.post_url,
+      score: 0,
+      num_comments: 0,
+      fit: 1,
+      platform: 'x',
+    }));
+    if (!candidates.length) throw new Error('No commentable X home posts');
+    return pickRandom(candidates.slice(0, 5));
+  }
+
+  async findInstagramThread(account, used) {
+    const posts = await playwrightService.listInstagramExplorePosts(account.id, { limit: 10 });
+    const candidates = this.filterUnused(posts, used).map((p) => ({
+      subreddit: p.subreddit || 'instagram:feed',
+      title: p.title || 'Instagram post',
+      selftext: '',
+      post_url: p.post_url,
+      score: 0,
+      num_comments: 0,
+      fit: 1,
+      platform: 'instagram',
+    }));
+    if (!candidates.length) throw new Error('No commentable Instagram posts');
+    return pickRandom(candidates.slice(0, 5));
+  }
+
+  async findCommentableThread(account) {
+    const used = await this.getUsedPostUrls();
+    const platform = String(account.platform || '').toLowerCase();
+
+    switch (platform) {
+      case 'reddit':
+        return this.findRedditThread(account, used);
+      case 'linkedin':
+        return this.findLinkedInThread(account, used);
+      case 'x':
+      case 'twitter':
+        return this.findXThread(account, used);
+      case 'instagram':
+        return this.findInstagramThread(account, used);
+      default:
+        throw new Error(`Organic discovery not supported for platform: ${platform}`);
+    }
+  }
 }
 
 module.exports = new OrganicDiscoveryService();
+module.exports.ORGANIC_PLATFORMS = ORGANIC_PLATFORMS;

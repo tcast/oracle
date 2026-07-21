@@ -20,31 +20,31 @@ const PLATFORM_CATALOG = {
     label: 'Reddit',
     readiness: 'ready',
     selfCreate: true,
-    notes: 'Self-create via email pool + healthy US proxy',
+    notes: 'Self-create via catchall (parked domains) or Yahoo pool + healthy US proxy',
   },
   x: {
     label: 'X',
     readiness: 'needs_accounts_bought',
     selfCreate: false,
-    notes: 'Self-create gated — buy fresh accounts; instrumentation only',
+    notes: 'Import via /api/social-accounts/import (cookie dump) → verify → organic',
   },
   instagram: {
     label: 'Instagram',
-    readiness: 'not_implemented',
+    readiness: 'import_ready',
     selfCreate: false,
-    notes: 'Import/buy flow preferred; browser signup not wired',
+    notes: 'Import + TOTP verify + organic comments supported',
   },
   tiktok: {
     label: 'TikTok',
-    readiness: 'not_implemented',
+    readiness: 'import_ready',
     selfCreate: false,
-    notes: 'Import/buy flow preferred; browser signup not wired',
+    notes: 'Import + login smoke; web comment not stable — warm path ready',
   },
   linkedin: {
     label: 'LinkedIn',
-    readiness: 'not_implemented',
+    readiness: 'import_ready',
     selfCreate: false,
-    notes: 'Import/buy flow preferred; browser signup not wired',
+    notes: 'Import + session verify + organic feed comments supported',
   },
 };
 
@@ -370,10 +370,10 @@ class AccountCreationService {
 
   /**
    * Claim one unassigned active email from the pool.
+   * Prefer parked catchall domains Reddit has already delivered to (e.g. bashed.net),
+   * then other parked catchalls, then @proteusmail.net, then Yahoo/MS backup.
    */
-  async claimEmailFromPool() {
-    // Prefer catchall/domain-pool aliases — Yahoo IMAP often blocks Reddit verify.
-    // Prefer proteusmail.net (apex of the mail host) over parked catch-all domains.
+  async claimEmailFromPool(opts = {}) {
     const result = await pool.query(
       `SELECT ea.*
        FROM email_accounts ea
@@ -387,11 +387,29 @@ class AccountCreationService {
            SELECT 1 FROM social_accounts sa
            WHERE sa.email_account_id = ea.id
          )
+         AND (
+           $1::boolean = true
+           OR ea.provider IN ('catchall', 'yahoo', 'outlook', 'hotmail', 'live', 'gmx')
+         )
        ORDER BY
-         CASE WHEN ea.provider = 'catchall' THEN 0 ELSE 1 END,
-         CASE WHEN lower(ea.email) LIKE '%@proteusmail.net' THEN 0 ELSE 1 END,
+         CASE
+           -- Domains with proven Reddit SMTP delivery into the Hetzner pool inbox
+           WHEN ea.provider = 'catchall'
+             AND lower(split_part(ea.email, '@', 2)) IN (
+               'bashed.net', 'faregiant.com', 'retain360.io', 'uspunk.com', 'usgeek.com'
+             ) THEN 0
+           WHEN ea.provider = 'catchall'
+             AND lower(split_part(ea.email, '@', 2)) <> 'proteusmail.net' THEN 1
+           WHEN ea.provider = 'catchall' THEN 2
+           WHEN ea.provider = 'yahoo' THEN 3
+           WHEN ea.provider IN ('outlook', 'hotmail', 'live') THEN 4
+           WHEN ea.provider = 'gmx' THEN 5
+           ELSE 6
+         END,
+         CASE WHEN COALESCE(ea.metadata->>'last_inbox_ok', '') = 'true' THEN 0 ELSE 1 END,
          ea.id DESC
-       LIMIT 1`
+       LIMIT 1`,
+      [opts.allowAnyProvider === true]
     );
     return result.rows[0] || null;
   }
@@ -547,38 +565,41 @@ class AccountCreationService {
         console.log(
           `Reddit asking for email verification code… email=${emailAccount.email} hint=${pageHint.replace(/\s+/g, ' ').slice(0, 180)}`
         );
-        const verifyStartedAt = new Date();
+        const verifyStartedAt = new Date(Date.now() - 90_000);
         let verified = null;
-        const pollDeadline = Date.now() + 240000;
-        let resent = false;
+        // Reddit → catchall SMTP can take 3–6+ minutes (seen on bashed.net).
+        const pollDeadline = Date.now() + 420000;
+        let resentAt = 0;
+        let firstResendAfter = Date.now() + 120000;
         while (Date.now() < pollDeadline) {
           try {
             verified = await emailInboxService.pollForVerification(emailAccount, {
-              timeoutMs: Math.min(45000, pollDeadline - Date.now()),
-              intervalMs: 4000,
-              limit: 40,
+              timeoutMs: Math.min(60000, pollDeadline - Date.now()),
+              intervalMs: 5000,
+              limit: 50,
               fromIncludes: 'reddit',
               afterDate: verifyStartedAt,
             });
             if (verified?.code) break;
           } catch (pollErr) {
-            if (!/not received within/i.test(pollErr.message)) throw pollErr;
+            const msg = pollErr.message || String(pollErr);
+            console.warn(`Reddit verify poll wait: ${msg.slice(0, 180)}`);
           }
-          if (!resent) {
+          if (Date.now() >= firstResendAfter && (!resentAt || Date.now() - resentAt > 120000)) {
             const resend =
               (await page.$('button:has-text("Resend"), button:has-text("Send again"), a:has-text("Resend")')) ||
               (await page.getByText(/resend|send again|didn.?t get/i).first().elementHandle().catch(() => null));
             if (resend) {
               console.log('Reddit verify: clicking resend…');
               await resend.click().catch(() => {});
-              resent = true;
+              resentAt = Date.now();
               await this.humanLikeDelay(2000, 4000);
             }
           }
         }
         if (!verified?.code) {
           throw new Error(
-            `Verification email not received within 240000ms for ${emailAccount.email}`
+            `Verification email not received within 420000ms for ${emailAccount.email}`
           );
         }
         await this.humanLikeTyping(

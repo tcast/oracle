@@ -241,8 +241,19 @@ class OrganicCommentService {
   async generateOrganicComment(account, thread) {
     const persona = this.parsePersona(account);
     const brandTerms = await this.getBrandBanTerms();
+    const platform = String(account.platform || thread.platform || 'reddit').toLowerCase();
+    const place =
+      platform === 'reddit'
+        ? `Subreddit: r/${thread.subreddit}`
+        : platform === 'linkedin'
+          ? 'Network: LinkedIn feed'
+          : platform === 'instagram'
+            ? 'Network: Instagram'
+            : platform === 'x' || platform === 'twitter'
+              ? 'Network: X (Twitter)'
+              : `Network: ${platform}`;
 
-    const system = `You write short Reddit comments that sound like a real person, not a brand or an AI.
+    const system = `You write short social comments that sound like a real person, not a brand or an AI.
 
 Hard rules:
 - Purely helpful / conversational. Never promote products, companies, services, waitlists, or links.
@@ -252,6 +263,9 @@ Hard rules:
 - React to ONE concrete detail from the title/body. Add a small personal take or clarifying question.
 - Sound mid-conversation, slightly imperfect is fine.
 - Ban marketing tone, cheerleading, and corporate polish.
+${platform === 'linkedin' ? '- Keep it professional-casual (LinkedIn). Avoid slang.' : ''}
+${platform === 'instagram' ? '- Keep it brief and natural (Instagram).' : ''}
+${platform === 'x' || platform === 'twitter' ? '- Keep it concise (X).' : ''}
 
 Persona:
 - writingStyle: ${persona.writingStyle || 'casual'}
@@ -261,7 +275,7 @@ Persona:
 - engagementStyle: ${persona.engagementStyle || 'questioner'}
 - responseLength: concise`;
 
-    const user = `Subreddit: r/${thread.subreddit}
+    const user = `${place}
 Title: ${thread.title}
 Body excerpt: ${thread.selftext || '(no body — title-only post)'}
 
@@ -326,11 +340,12 @@ Write only the comment text.`;
   }
 
   async listEligibleAccounts() {
+    const platforms = organicDiscoveryService.getSupportedPlatforms();
     const result = await pool.query(
       `SELECT sa.*
        FROM social_accounts sa
        LEFT JOIN organic_comment_jobs j ON j.social_account_id = sa.id
-       WHERE sa.platform = 'reddit'
+       WHERE sa.platform = ANY($1::text[])
          AND COALESCE(sa.is_simulated, false) = false
          AND sa.status = 'active'
          AND lower(sa.status) NOT IN ('banned', 'disabled')
@@ -344,7 +359,13 @@ Write only the comment text.`;
            WHERE sap.social_account_id = sa.id AND sap.is_active = true
              AND p.is_active = true
              AND (p.cooldown_until IS NULL OR p.cooldown_until <= NOW())
-         )`
+         )
+         -- Only run accounts that have an enabled job (or reddit legacy: auto-pick)
+         AND (
+           COALESCE(j.enabled, false) = true
+           OR (sa.platform = 'reddit' AND (j.id IS NULL OR j.enabled = true))
+         )`,
+      [platforms]
     );
     return result.rows;
   }
@@ -535,16 +556,25 @@ Write only the comment text.`;
       const content = generated.content;
       let platformCommentId = null;
       let status = 'simulated';
+      const platform = String(account.platform || 'reddit').toLowerCase();
+      // X cookies are fragile / rate-limited — never password-submit from organic.
+      // LinkedIn/IG: prefer session; allow password only for linkedin/instagram when needed.
+      const allowLogin = platform === 'reddit' || platform === 'linkedin' || platform === 'instagram';
 
       if (!dryRun) {
-        await playwrightService.requireProxyForLive(account.id);
+        if (platform !== 'linkedin') {
+          await playwrightService.requireProxyForLive(account.id);
+        }
         platformCommentId = await playwrightService.postComment(
-          'reddit',
+          platform === 'twitter' ? 'x' : platform,
           account.id,
           thread.post_url,
           content,
           null,
-          { requireProxy: true }
+          {
+            requireProxy: platform !== 'linkedin',
+            allowLogin: platform === 'x' || platform === 'twitter' ? false : allowLogin,
+          }
         );
         status = 'posted';
       }

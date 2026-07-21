@@ -3,7 +3,8 @@ import api from '../utils/api';
 
 const READINESS_LABEL = {
   ready: { text: 'Ready', className: 'bg-emerald-50 text-emerald-700' },
-  needs_accounts_bought: { text: 'Buy accounts', className: 'bg-amber-50 text-amber-700' },
+  needs_accounts_bought: { text: 'Buy + import', className: 'bg-amber-50 text-amber-700' },
+  import_ready: { text: 'Import ready', className: 'bg-sky-50 text-sky-700' },
   not_implemented: { text: 'Import only', className: 'bg-gray-100 text-gray-600' },
   blocked: { text: 'Blocked', className: 'bg-red-50 text-red-700' },
 };
@@ -236,8 +237,9 @@ const CreateAccountsForm = ({ onClose, onSuccess }) => {
 
         {selectedMeta && !isReadySelfCreate && (
           <div className="bg-amber-50 border border-amber-200 text-amber-800 px-4 py-3 rounded-xl text-sm">
-            Self-create is gated for {formData.platform}. Submitting will record a skipped attempt for NOC
-            (no mass create). Prefer buying/importing accounts.
+            {selectedMeta.readiness === 'import_ready' || selectedMeta.readiness === 'needs_accounts_bought'
+              ? `Use Import for ${formData.platform} (paste dump → verify → organic). Self-create stays gated.`
+              : `Self-create is gated for ${formData.platform}. Submitting will record a skipped attempt for NOC (no mass create). Prefer buying/importing accounts.`}
           </div>
         )}
 

@@ -3,6 +3,7 @@ const router = express.Router();
 const { authMiddleware } = require('../middleware/auth');
 const pool = require('../services/db');
 const accountCreationService = require('../services/accountCreationService');
+const accountImportService = require('../services/accountImportService');
 const { formatForApi } = require('../services/profileEnrichment');
 
 router.use(authMiddleware);
@@ -303,6 +304,52 @@ router.get('/create/eligibility', async (req, res) => {
   } catch (error) {
     console.error('Create eligibility error:', error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+/** Import format help for X / IG / TikTok / LinkedIn dumps */
+router.get('/import/formats', async (_req, res) => {
+  res.json({
+    platforms: accountImportService.constructor.SUPPORTED || ['x', 'instagram', 'tiktok', 'linkedin'],
+    formats: accountImportService.getFormats(),
+  });
+});
+
+/**
+ * Bulk-import bought accounts (paste text), assign proxies, optional smoke verify,
+ * enable organic when sessions live.
+ */
+router.post('/import', async (req, res) => {
+  try {
+    const {
+      platform,
+      text,
+      verify = true,
+      enableOrganic = true,
+      max = 25,
+      verifyLimit = 3,
+    } = req.body || {};
+
+    if (!platform || !text) {
+      return res.status(400).json({
+        error: 'Missing platform or text',
+        formats: accountImportService.getFormats(),
+      });
+    }
+
+    const result = await accountImportService.importFromText({
+      platform: String(platform).toLowerCase(),
+      text,
+      verify: verify !== false,
+      enableOrganic: enableOrganic !== false,
+      max: Math.min(Number(max) || 25, 50),
+      verifyLimit: Math.min(Number(verifyLimit) || 3, 5),
+    });
+
+    res.json(result);
+  } catch (error) {
+    console.error('Account import error:', error);
+    res.status(400).json({ error: error.message, formats: accountImportService.getFormats() });
   }
 });
 

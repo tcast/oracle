@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import CreateAccountsForm from './CreateAccountsForm';
+import ImportAccountsForm from './ImportAccountsForm';
 import OrganicCommentsPanel from './OrganicCommentsPanel';
 import api from '../utils/api';
 
@@ -93,6 +94,7 @@ const SocialAccounts = () => {
     categories: [],
   });
   const [showCreateForm, setShowCreateForm] = useState(false);
+  const [showImportForm, setShowImportForm] = useState(false);
   const [auditSettings, setAuditSettings] = useState(null);
   const [auditing, setAuditing] = useState(false);
 
@@ -401,12 +403,20 @@ const SocialAccounts = () => {
           <p className="page-subtitle">Users, organic schedule, and comment log</p>
         </div>
         {tab === 'users' && (
-          <button onClick={() => setShowCreateForm(true)} className="btn-primary flex items-center justify-center space-x-2 sm:self-start">
-            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
-            </svg>
-            <span>Create Accounts</span>
-          </button>
+          <div className="flex items-center gap-2 sm:self-start">
+            <button
+              onClick={() => setShowImportForm(true)}
+              className="btn-secondary flex items-center justify-center space-x-2"
+            >
+              <span>Import</span>
+            </button>
+            <button onClick={() => setShowCreateForm(true)} className="btn-primary flex items-center justify-center space-x-2">
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
+              </svg>
+              <span>Create Accounts</span>
+            </button>
+          </div>
         )}
       </div>
 
@@ -433,6 +443,31 @@ const SocialAccounts = () => {
             <div className="fixed inset-0 bg-gray-900/60 backdrop-blur-sm transition-opacity" onClick={() => setShowCreateForm(false)}></div>
             <div className="relative bg-white rounded-2xl shadow-2xl w-full max-w-lg transform transition-all animate-slide-up">
               <CreateAccountsForm onClose={() => setShowCreateForm(false)} onSuccess={handleCreateSuccess} />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showImportForm && (
+        <div className="fixed z-50 inset-0 overflow-y-auto">
+          <div className="flex items-center justify-center min-h-screen px-4">
+            <div
+              className="fixed inset-0 bg-gray-900/60 backdrop-blur-sm transition-opacity"
+              onClick={() => setShowImportForm(false)}
+            />
+            <div className="relative w-full max-w-2xl transform transition-all animate-slide-up">
+              <ImportAccountsForm
+                initialPlatform={
+                  ['x', 'instagram', 'tiktok', 'linkedin'].includes(platformTab)
+                    ? platformTab
+                    : 'x'
+                }
+                onClose={() => setShowImportForm(false)}
+                onSuccess={() => {
+                  setShowImportForm(false);
+                  fetchAccounts();
+                }}
+              />
             </div>
           </div>
         </div>

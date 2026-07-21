@@ -1434,7 +1434,7 @@ class PlaywrightService {
       await submitBtn.click();
       await this.humanLikeDelay(2000, 4000);
 
-      return true;
+      return `x-${Date.now()}`;
     } catch (error) {
       console.error('Error posting X comment:', error);
       return false;
@@ -1980,7 +1980,13 @@ class PlaywrightService {
       const creds = typeof account.credentials === 'string'
         ? JSON.parse(account.credentials)
         : (account.credentials || {});
-      const result = await this.createBrowserForAccount(accountId);
+      // Prefer direct — sticky proxies often authwall live LinkedIn cookies.
+      let result;
+      try {
+        result = await this.createBrowserForAccount(accountId, 2, { skipProxy: true });
+      } catch {
+        result = await this.createBrowserForAccount(accountId);
+      }
       browser = result.browser;
       context = result.context;
       page = result.page;
@@ -1989,19 +1995,42 @@ class PlaywrightService {
       const loginEmail = account.email || account.username;
       const password = creds.password || account.credentials?.password;
       const extras = {
+        allowLogin: false,
         totpSecret: creds.totp_secret || creds.totp || creds.twofa,
         emailPassword: creds.email_password,
         profileUrl: creds.profile_url,
       };
-      const loggedIn = await this.ensureLoggedIn(page, 'linkedin', accountId, loginEmail, password, extras);
+      let loggedIn = await this.ensureLoggedIn(page, 'linkedin', accountId, loginEmail, password, extras);
+      if (!loggedIn) {
+        extras.allowLogin = true;
+        loggedIn = await this.ensureLoggedIn(page, 'linkedin', accountId, loginEmail, password, extras);
+      }
       if (!loggedIn) throw new Error('LinkedIn login failed');
 
-      await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded' });
+      await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded' }).catch(() => {});
       await this.humanLikeDelay(2000, 4000);
+      await this.dismissLinkedInModals(page);
       await this.simulateHumanBehavior(page);
 
-      const startPostBtn = await page.waitForSelector('button[data-control-name="share.start_post"], button[aria-label*="Start a post"]', { timeout: 10000 });
-      await startPostBtn.click();
+      let startPostBtn = await page.$(
+        'button[data-control-name="share.start_post"], button[aria-label*="Start a post" i], button.share-box-feed-entry__trigger'
+      );
+      if (!startPostBtn) {
+        startPostBtn = await page.evaluateHandle(() => {
+          const buttons = [...document.querySelectorAll('button, div[role="button"], a')];
+          return (
+            buttons.find((b) => /start a post/i.test((b.innerText || b.getAttribute('aria-label') || '').trim())) ||
+            null
+          );
+        });
+        if (startPostBtn && !(await startPostBtn.asElement())) startPostBtn = null;
+        else if (startPostBtn) startPostBtn = startPostBtn.asElement();
+      }
+      if (!startPostBtn) {
+        await page.screenshot({ path: `/tmp/linkedin-no-start-post-${accountId}.png` }).catch(() => {});
+        throw new Error('LinkedIn Start a post control not found');
+      }
+      await startPostBtn.click({ force: true });
       await this.humanLikeDelay(1000, 2000);
 
       const editor = await page.waitForSelector('.ql-editor', { timeout: 10000 });
@@ -2745,41 +2774,448 @@ class PlaywrightService {
     }
   }
 
+  async dismissLinkedInModals(page) {
+    await page.evaluate(() => {
+      const buttons = [...document.querySelectorAll('button, [role="button"]')];
+      for (const b of buttons) {
+        const t = (b.innerText || b.getAttribute('aria-label') || '').trim();
+        if (/^(Dismiss|Not now|No thanks|Skip|Close|Got it|Maybe later)$/i.test(t)) {
+          try { b.click(); } catch { /* ignore */ }
+        }
+      }
+      const close = document.querySelector(
+        'button[aria-label="Dismiss"], button[data-test-modal-close-btn], .artdeco-modal__dismiss'
+      );
+      if (close) {
+        try { close.click(); } catch { /* ignore */ }
+      }
+    }).catch(() => {});
+    await this.humanLikeDelay(400, 900);
+  }
+
+  /**
+   * Collect commentable activity URLs from the logged-in LinkedIn feed.
+   */
+  async listLinkedInFeedPosts(accountId, { limit = 10 } = {}) {
+    let browser;
+    try {
+      const account = await this.getAccount(accountId);
+      const creds = account.credentials || {};
+      const loginId = account.email || account.username;
+      const extras = {
+        allowLogin: false,
+        totpSecret: creds.totp_secret || creds.totp || creds.twofa,
+        emailPassword: creds.email_password,
+        profileUrl: creds.profile_url,
+      };
+
+      // Direct first — LinkedIn sticky proxies frequently authwall live cookies.
+      const modes = [
+        { label: 'direct', open: async () => {
+          const direct = await this.createBrowser(
+            null,
+            false,
+            await this.getOrCreateDeviceProfile(accountId, { forceDesktop: true })
+          );
+          direct.accountId = accountId;
+          this._trackBrowser(accountId, direct.browser);
+          return direct;
+        }},
+        { label: 'proxy', open: async () => {
+          await this.requireProxyForLive(accountId);
+          return this.createBrowserForAccount(accountId, 2, { requireProxy: true });
+        }},
+      ];
+
+      let lastErr;
+      for (const mode of modes) {
+        try {
+          if (browser) {
+            await browser.close().catch(() => {});
+            this._untrackBrowser(accountId);
+            browser = null;
+          }
+          const opened = await mode.open();
+          browser = opened.browser;
+          const page = opened.page;
+          const loggedIn = await this.ensureLoggedIn(
+            page,
+            'linkedin',
+            accountId,
+            loginId,
+            creds.password,
+            extras
+          );
+          if (!loggedIn) {
+            lastErr = new Error(`LinkedIn session dead (${mode.label})`);
+            continue;
+          }
+          const posts = await this._scrapeLinkedInFeed(page, limit);
+          await this.persistSession(page, 'linkedin', accountId).catch(() => {});
+          return posts;
+        } catch (err) {
+          lastErr = err;
+          console.warn(`LinkedIn feed discovery via ${mode.label}:`, err.message);
+        }
+      }
+      throw lastErr || new Error('LinkedIn feed discovery failed');
+    } finally {
+      if (browser) await browser.close().catch(() => {});
+      this._untrackBrowser(accountId);
+    }
+  }
+
+  async _scrapeLinkedInFeed(page, limit = 10) {
+    const alreadyOnFeed = /linkedin\.com\/feed/i.test(page.url()) && !/authwall|login/i.test(page.url());
+    if (!alreadyOnFeed) {
+      try {
+        await page.goto('https://www.linkedin.com/feed/', {
+          waitUntil: 'domcontentloaded',
+          timeout: 60000,
+        });
+      } catch (err) {
+        // ERR_ABORTED often means a client-side redirect finished the navigation.
+        if (!/ERR_ABORTED|frame was detached/i.test(err.message)) throw err;
+        await this.humanLikeDelay(1500, 2500);
+      }
+    }
+    await this.humanLikeDelay(1500, 3000);
+    await this.dismissLinkedInModals(page);
+    if (/authwall|\/login|\/uas\//i.test(page.url())) {
+      throw new Error('LinkedIn feed authwalled during discovery');
+    }
+    await this.randomScroll(page).catch(() => {});
+    await this.humanLikeDelay(800, 1500);
+
+    const posts = await page.evaluate((max) => {
+      const out = [];
+      const seen = new Set();
+      const cards = [
+        ...document.querySelectorAll(
+          '.feed-shared-update-v2, div[data-urn*="activity"], div[data-urn*="ugcPost"], div.feed-shared-update-v2__control-menu-container, article'
+        ),
+      ];
+      for (const card of cards) {
+        const urn =
+          card.getAttribute('data-urn') ||
+          card.querySelector('[data-urn]')?.getAttribute('data-urn') ||
+          '';
+        let url = null;
+        if (/urn:li:(activity|ugcPost|share):/i.test(urn)) {
+          url = `https://www.linkedin.com/feed/update/${urn}`;
+        }
+        if (!url) {
+          const a = card.querySelector(
+            'a[href*="/feed/update/"], a[href*="activity-"], a[href*="/posts/"][href*="activity"]'
+          );
+          if (a?.href && !/\/company\/[^/]+\/posts\/?$/i.test(a.href)) {
+            url = a.href.split('?')[0].replace(/\/$/, '');
+          }
+        }
+        if (!url || seen.has(url)) continue;
+        if (/\/company\/[^/]+\/posts\/?$/i.test(url)) continue;
+        seen.add(url);
+        const title = (card.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+        out.push({
+          post_url: url,
+          title,
+          selftext: title.slice(0, 400),
+          subreddit: 'linkedin:feed',
+          score: 0,
+          num_comments: 0,
+        });
+        if (out.length >= max) break;
+      }
+      // Fallback: any activity / update href on the page
+      if (!out.length) {
+        for (const a of document.querySelectorAll('a[href*="/feed/update/"], a[href*="activity-"]')) {
+          const href = (a.href || '').split('?')[0];
+          if (!href || seen.has(href) || /\/company\//i.test(href)) continue;
+          seen.add(href);
+          out.push({
+            post_url: href,
+            title: (a.innerText || 'LinkedIn post').replace(/\s+/g, ' ').trim().slice(0, 120),
+            selftext: '',
+            subreddit: 'linkedin:feed',
+            score: 0,
+            num_comments: 0,
+          });
+          if (out.length >= max) break;
+        }
+      }
+      return out;
+    }, limit);
+
+    return posts;
+  }
+
+  /**
+   * Search LinkedIn content results for commentable activity URLs.
+   * Useful for low-connection accounts whose home feed is mostly ads.
+   */
+  async listLinkedInSearchPosts(accountId, { query = 'hiring', limit = 8 } = {}) {
+    let browser;
+    try {
+      const account = await this.getAccount(accountId);
+      const creds = account.credentials || {};
+      const loginId = account.email || account.username;
+      const opened = await this.createBrowserForAccount(accountId, 2, { skipProxy: true });
+      browser = opened.browser;
+      const page = opened.page;
+      const loggedIn = await this.ensureLoggedIn(
+        page,
+        'linkedin',
+        accountId,
+        loginId,
+        creds.password,
+        {
+          allowLogin: false,
+          totpSecret: creds.totp_secret || creds.totp || creds.twofa,
+        }
+      );
+      if (!loggedIn) throw new Error('LinkedIn session not alive for search discovery');
+
+      const url = `https://www.linkedin.com/search/results/content/?keywords=${encodeURIComponent(query)}&origin=SWITCH_SEARCH_VERTICAL`;
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+      await this.humanLikeDelay(2500, 4000);
+      await this.dismissLinkedInModals(page);
+      await this.randomScroll(page).catch(() => {});
+
+      const posts = await page.evaluate((max) => {
+        const out = [];
+        const seen = new Set();
+        for (const a of document.querySelectorAll(
+          'a[href*="/feed/update/"], a[href*="activity-"], a[href*="/posts/"]'
+        )) {
+          let href = (a.href || '').split('?')[0].replace(/\/$/, '');
+          if (!href || seen.has(href)) continue;
+          if (/\/company\/[^/]+\/posts\/?$/i.test(href)) continue;
+          if (!/feed\/update|activity-|\/posts\/.+activity/i.test(href)) continue;
+          seen.add(href);
+          const card = a.closest('li') || a.closest('div');
+          const title = ((card && card.innerText) || a.innerText || '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 160);
+          out.push({
+            post_url: href,
+            title,
+            selftext: title.slice(0, 400),
+            subreddit: 'linkedin:search',
+            score: 0,
+            num_comments: 0,
+          });
+          if (out.length >= max) break;
+        }
+        return out;
+      }, limit);
+
+      return posts;
+    } finally {
+      if (browser) await browser.close().catch(() => {});
+      this._untrackBrowser(accountId);
+    }
+  }
+
   async linkedInPostComment(page, postUrl, comment, parentCommentId = null) {
     try {
       const targetUrl = parentCommentId
         ? postUrl + '?commentUrn=urn:li:comment:' + parentCommentId
         : postUrl;
 
-      await page.goto(targetUrl, { waitUntil: 'domcontentloaded' });
+      await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
       await this.humanLikeDelay(1500, 3000);
+      await this.dismissLinkedInModals(page);
       await this.simulateHumanBehavior(page);
 
-      const commentBtn = await page.$('button[aria-label*="Comment"]');
+      const commentBtn = await page.$('button[aria-label*="Comment"], button.comment-button, button[aria-label*="comment"]');
       if (commentBtn) {
-        await commentBtn.click();
+        await commentBtn.click({ timeout: 10000 }).catch(async () => {
+          await this.dismissLinkedInModals(page);
+          await commentBtn.click({ force: true }).catch(() => {});
+        });
         await this.humanLikeDelay(1000, 2000);
       }
 
-      const editor = await page.waitForSelector('.ql-editor', { timeout: 10000 });
+      const editor = await page.waitForSelector('.ql-editor, div[role="textbox"]', { timeout: 15000 });
       const eBox = await editor.boundingBox();
       if (eBox) {
         await this.simulateMouseMovement(page, 0, 0, eBox.x + eBox.width / 2, eBox.y + eBox.height / 2);
       }
 
-      await this.humanLikeTyping(page, '.ql-editor', comment);
+      await editor.click({ force: true }).catch(() => {});
+      await this.humanLikeTyping(page, '.ql-editor, div[role="textbox"]', comment);
       await this.humanLikeDelay(500, 1500);
 
-      const postCommentBtn = await page.$('button:has-text("Post")');
+      const postCommentBtn = await page.$(
+        'button.comments-comment-box__submit-button, button:has-text("Post"), button[aria-label="Post comment"]'
+      );
       if (postCommentBtn) {
-        await postCommentBtn.click();
+        await postCommentBtn.click({ force: true });
         await this.humanLikeDelay(2000, 4000);
-        return true;
+        return `li-${Date.now()}`;
       }
       return false;
     } catch (error) {
       console.error('Error posting LinkedIn comment:', error);
       return false;
+    }
+  }
+
+  /**
+   * Instagram comment on a post URL (must be logged in).
+   */
+  async instagramPostComment(page, postUrl, comment) {
+    try {
+      await page.goto(postUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await this.humanLikeDelay(2000, 3500);
+      await this.simulateHumanBehavior(page);
+
+      // Dismiss save-login / notifications prompts
+      await page.evaluate(() => {
+        const buttons = [...document.querySelectorAll('button')];
+        const skip = buttons.find((b) => /^(Not Now|Not now)$/i.test((b.innerText || '').trim()));
+        if (skip) skip.click();
+      }).catch(() => {});
+
+      const textarea = await page.waitForSelector(
+        'textarea[aria-label*="Add a comment"], textarea[placeholder*="Add a comment"], form textarea',
+        { timeout: 15000 }
+      );
+      await textarea.click();
+      await this.humanLikeTyping(
+        page,
+        'textarea[aria-label*="Add a comment"], textarea[placeholder*="Add a comment"], form textarea',
+        comment
+      );
+      await this.humanLikeDelay(400, 1000);
+
+      const posted = await page.evaluate(() => {
+        const buttons = [...document.querySelectorAll('button, [role="button"]')];
+        const postBtn = buttons.find((b) => /^(Post|Comment)$/i.test((b.innerText || '').trim()));
+        if (postBtn && !postBtn.disabled) {
+          postBtn.click();
+          return true;
+        }
+        return false;
+      });
+      if (!posted) {
+        await page.keyboard.press('Enter');
+      }
+      await this.humanLikeDelay(2000, 4000);
+      return `ig-${Date.now()}`;
+    } catch (error) {
+      console.error('Error posting Instagram comment:', error);
+      return false;
+    }
+  }
+
+  async listInstagramExplorePosts(accountId, { limit = 8 } = {}) {
+    let browser;
+    try {
+      await this.requireProxyForLive(accountId);
+      const result = await this.createBrowserForAccount(accountId, 2, { requireProxy: true });
+      browser = result.browser;
+      const page = result.page;
+      const account = await this.getAccount(accountId);
+      const creds = account.credentials || {};
+      const loggedIn = await this.ensureLoggedIn(
+        page,
+        'instagram',
+        accountId,
+        account.username,
+        creds.password,
+        {
+          allowLogin: false,
+          totpSecret: creds.totp_secret || creds.totp || creds.twofa,
+        }
+      );
+      if (!loggedIn) throw new Error('Instagram session not alive for discovery');
+
+      await page.goto('https://www.instagram.com/', {
+        waitUntil: 'domcontentloaded',
+        timeout: 60000,
+      });
+      await this.humanLikeDelay(2000, 3500);
+      await this.randomScroll(page).catch(() => {});
+
+      const posts = await page.evaluate((max) => {
+        const out = [];
+        const seen = new Set();
+        for (const a of document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]')) {
+          const href = (a.href || '').split('?')[0];
+          if (!href || seen.has(href)) continue;
+          if (!/instagram\.com\/(p|reel)\//i.test(href)) continue;
+          seen.add(href);
+          out.push({
+            post_url: href,
+            title: 'instagram post',
+            selftext: '',
+            subreddit: 'instagram:feed',
+            score: 0,
+            num_comments: 0,
+          });
+          if (out.length >= max) break;
+        }
+        return out;
+      }, limit);
+      return posts;
+    } finally {
+      if (browser) await browser.close().catch(() => {});
+      this._untrackBrowser(accountId);
+    }
+  }
+
+  async listXHomePosts(accountId, { limit = 8 } = {}) {
+    let browser;
+    try {
+      await this.requireProxyForLive(accountId);
+      const result = await this.createBrowserForAccount(accountId, 2, { requireProxy: true });
+      browser = result.browser;
+      const page = result.page;
+      const account = await this.getAccount(accountId);
+      const creds = account.credentials || {};
+      const loggedIn = await this.ensureLoggedIn(
+        page,
+        'x',
+        accountId,
+        account.username,
+        creds.password,
+        { allowLogin: false, totpSecret: creds.totp_secret }
+      );
+      if (!loggedIn) throw new Error('X session not alive for discovery');
+
+      await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await this.humanLikeDelay(2000, 3500);
+      await this.randomScroll(page).catch(() => {});
+
+      const posts = await page.evaluate((max) => {
+        const out = [];
+        const seen = new Set();
+        for (const a of document.querySelectorAll('a[href*="/status/"]')) {
+          const m = (a.href || '').match(/(?:x|twitter)\.com\/([^/]+)\/status\/(\d+)/i);
+          if (!m) continue;
+          const url = `https://x.com/${m[1]}/status/${m[2]}`;
+          if (seen.has(url)) continue;
+          seen.add(url);
+          const article = a.closest('article');
+          const title = ((article && article.innerText) || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+          out.push({
+            post_url: url,
+            title,
+            selftext: title.slice(0, 400),
+            subreddit: 'x:home',
+            score: 0,
+            num_comments: 0,
+          });
+          if (out.length >= max) break;
+        }
+        return out;
+      }, limit);
+      return posts;
+    } finally {
+      if (browser) await browser.close().catch(() => {});
+      this._untrackBrowser(accountId);
     }
   }
 
@@ -3051,7 +3487,14 @@ class PlaywrightService {
     }
   }
 
-  async postComment(platform, accountId, postUrl, comment, parentCommentId = null, { requireProxy = false } = {}) {
+  async postComment(
+    platform,
+    accountId,
+    postUrl,
+    comment,
+    parentCommentId = null,
+    { requireProxy = false, allowLogin = true, skipProxy = false } = {}
+  ) {
     let browser, context, page, proxyId;
     let operationSuccess = false;
     let lastErrorMsg = null;
@@ -3062,13 +3505,65 @@ class PlaywrightService {
       }
 
       const account = await this.getAccount(accountId);
-      const result = await this.createBrowserForAccount(accountId, 2, { requireProxy });
+      const creds =
+        typeof account.credentials === 'string'
+          ? JSON.parse(account.credentials)
+          : account.credentials || {};
+
+      // LinkedIn sessions often survive on direct but authwall on sticky proxies.
+      const preferDirect = skipProxy || (platform === 'linkedin' && !requireProxy);
+      const result = preferDirect
+        ? await this.createBrowserForAccount(accountId, 2, { skipProxy: true })
+        : await this.createBrowserForAccount(accountId, 2, { requireProxy });
       browser = result.browser;
       context = result.context;
       page = result.page;
       proxyId = result.proxyConfig?._proxyId;
 
-      const loggedIn = await this.ensureLoggedIn(page, platform, accountId, account.username, account.credentials.password);
+      const loginId =
+        platform === 'linkedin'
+          ? account.email || account.username
+          : account.username;
+      const extras = {
+        allowLogin,
+        totpSecret: creds.totp_secret || creds.totp || creds.twofa,
+        emailPassword: creds.email_password,
+        profileUrl: creds.profile_url,
+        email: creds.email || account.email,
+      };
+      let loggedIn = await this.ensureLoggedIn(
+        page,
+        platform,
+        accountId,
+        loginId,
+        creds.password || account.credentials?.password,
+        extras
+      );
+
+      // LinkedIn: sticky proxies sometimes authwall live cookies — retry direct once.
+      if (!loggedIn && platform === 'linkedin' && allowLogin === false) {
+        await browser.close().catch(() => {});
+        this._untrackBrowser(accountId);
+        const direct = await this.createBrowser(
+          null,
+          false,
+          await this.getOrCreateDeviceProfile(accountId, { forceDesktop: true })
+        );
+        browser = direct.browser;
+        page = direct.page;
+        proxyId = null;
+        direct.accountId = accountId;
+        this._trackBrowser(accountId, browser);
+        loggedIn = await this.ensureLoggedIn(
+          page,
+          platform,
+          accountId,
+          loginId,
+          creds.password,
+          extras
+        );
+      }
+
       if (!loggedIn) throw new Error('Login failed');
 
       let platformCommentId = null;
@@ -3081,6 +3576,9 @@ class PlaywrightService {
           break;
         case 'linkedin':
           platformCommentId = await this.linkedInPostComment(page, postUrl, comment, parentCommentId);
+          break;
+        case 'instagram':
+          platformCommentId = await this.instagramPostComment(page, postUrl, comment);
           break;
         default:
           throw new Error(`Platform ${platform} not supported for comments`);
