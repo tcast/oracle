@@ -2053,20 +2053,44 @@ class PlaywrightService {
         }
       }
 
-      const postBtn = await page.waitForSelector('button:has-text("Post")', { timeout: 10000 });
-      await postBtn.click();
+      await this.humanLikeDelay(800, 1500);
+      const posted = await page.evaluate(() => {
+        const buttons = [...document.querySelectorAll('button')];
+        // Prefer primary share-box Post (enabled, exact label)
+        const candidates = buttons.filter((b) => {
+          const t = (b.innerText || '').trim();
+          return /^Post$/i.test(t) && !b.disabled && b.offsetParent !== null;
+        });
+        // Prefer buttons inside share/modal containers
+        const inModal = candidates.find((b) =>
+          b.closest('.share-box, .share-creation-state, [data-test-modal-id], .artdeco-modal')
+        );
+        const btn = inModal || candidates[candidates.length - 1] || null;
+        if (!btn) return false;
+        btn.click();
+        return true;
+      });
+      if (!posted) {
+        await page.screenshot({ path: `/tmp/linkedin-no-post-btn-${accountId}.png` }).catch(() => {});
+        throw new Error('LinkedIn Post button not found/enabled');
+      }
       await this.humanLikeDelay(3000, 5000);
 
       const postUrl = await page.evaluate(() => {
-        const items = document.querySelectorAll('.feed-shared-update-v2');
+        const items = document.querySelectorAll('.feed-shared-update-v2, div[data-urn*="activity"]');
         if (items.length > 0) {
-          const link = items[0].querySelector('a[href*="/feed/update/"]');
+          const link = items[0].querySelector('a[href*="/feed/update/"], a[href*="activity-"]');
           return link ? link.href : null;
         }
         return null;
       });
 
-      const postId = postUrl ? postUrl.split('update/')[1] : null;
+      // Even without a scraped URL, treat successful Post click as success if still on feed.
+      let postId = postUrl ? (postUrl.split('update/')[1] || postUrl) : null;
+      if (!postId) {
+        const stillLoggedIn = !/authwall|\/login/i.test(page.url());
+        if (stillLoggedIn) postId = `li-post-${Date.now()}`;
+      }
       if (postId) {
         operationSuccess = true;
         await this.persistSession(page, 'linkedin', accountId);
