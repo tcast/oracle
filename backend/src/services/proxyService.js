@@ -386,6 +386,45 @@ class ProxyService {
   }
 
   /**
+   * One-shot proxy borrow (e.g. BrightData for login verify). Does not reassign accounts.
+   * Prefers unassigned healthy rows, then lightly-used assigned ones.
+   */
+  async pickHealthyProxyByProvider(provider, { preferUnassigned = true } = {}) {
+    const want = String(provider || '').trim();
+    if (!want) return null;
+
+    const { rows } = await pool.query(
+      `SELECT p.*,
+              EXISTS (
+                SELECT 1 FROM social_account_proxies sap
+                WHERE sap.proxy_id = p.id AND sap.is_active = true
+              ) AS is_assigned
+       FROM proxies p
+       WHERE p.is_active = true
+         AND lower(p.provider) = lower($1)
+         AND (p.cooldown_until IS NULL OR p.cooldown_until <= NOW())
+         AND COALESCE(p.consecutive_failures, 0) < 3
+         AND (p.last_health_ok IS DISTINCT FROM false)
+       ORDER BY
+         CASE WHEN $2::boolean THEN
+           CASE WHEN EXISTS (
+             SELECT 1 FROM social_account_proxies sap
+             WHERE sap.proxy_id = p.id AND sap.is_active = true
+           ) THEN 1 ELSE 0 END
+         ELSE 0 END ASC,
+         p.last_used_at ASC NULLS FIRST,
+         p.id ASC
+       LIMIT 8`,
+      [want, preferUnassigned]
+    );
+
+    for (const row of rows) {
+      if (this.isAssignableProxy(row)) return row;
+    }
+    return rows[0] || null;
+  }
+
+  /**
    * Apply cooldown to one proxy, with a fleet burst cap so a single bad event
    * (or mistaken bulk SQL path reused in app code) cannot mass-cool hundreds.
    */

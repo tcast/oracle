@@ -279,7 +279,13 @@ class PlaywrightService {
     }
   }
 
-  async createBrowserForAccount(accountId, maxRetries = 2, { requireProxy = false, skipProxy = false, forceDesktop: forceDesktopOpt = false } = {}) {
+  async createBrowserForAccount(accountId, maxRetries = 2, {
+    requireProxy = false,
+    skipProxy = false,
+    forceDesktop: forceDesktopOpt = false,
+    proxyOverride = null,
+    preferProvider = null,
+  } = {}) {
     let lastError;
     let attempt = 0;
 
@@ -299,7 +305,19 @@ class PlaywrightService {
 
     while (attempt < maxRetries) {
       try {
-        const proxyConfig = await proxyService.getNextProxyForAccount(accountId);
+        let proxyConfig = proxyOverride || null;
+        if (!proxyConfig && preferProvider) {
+          const preferred = await proxyService.pickHealthyProxyByProvider(preferProvider);
+          if (preferred) {
+            proxyConfig = proxyService.formatProxyConfig(preferred);
+            console.log(
+              `Using preferred ${preferProvider} proxy ${preferred.id} for account ${accountId}`
+            );
+          }
+        }
+        if (!proxyConfig) {
+          proxyConfig = await proxyService.getNextProxyForAccount(accountId);
+        }
 
         if (!proxyConfig) {
           if (requireProxy || process.env.REQUIRE_PROXY_FOR_LIVE === 'true') {

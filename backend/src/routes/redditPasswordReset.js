@@ -85,6 +85,60 @@ router.post('/run-in-session/:accountId', async (req, res) => {
   }
 });
 
+/** Audit DB password vs Reddit login (BrightData preferred). Clears risk or marks locked. */
+router.post('/audit-password/:accountId', async (req, res) => {
+  try {
+    const accountId = Number(req.params.accountId);
+    const { rows } = await pool.query('SELECT * FROM social_accounts WHERE id = $1', [accountId]);
+    const account = rows[0];
+    if (!account) return res.status(404).json({ error: 'Not found' });
+    if (account.platform !== 'reddit') {
+      return res.status(400).json({ error: 'Not a Reddit account' });
+    }
+    res.json(await redditPasswordResetService.auditPasswordMatchForAccount(account));
+  } catch (error) {
+    console.error('reddit-password-reset audit-password error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/batch-in-session', async (req, res) => {
+  try {
+    const dryRun = req.body?.dry_run !== false;
+    const limit = Math.min(Number(req.body?.limit) || 2, 10);
+    const force = req.body?.force !== false;
+    const accountIds = Array.isArray(req.body?.account_ids)
+      ? req.body.account_ids.map(Number).filter(Boolean)
+      : null;
+
+    let accounts;
+    if (accountIds?.length) {
+      const { rows } = await pool.query(
+        `SELECT * FROM social_accounts WHERE id = ANY($1::int[]) AND platform = 'reddit'`,
+        [accountIds]
+      );
+      accounts = rows;
+    } else {
+      accounts = (await redditPasswordResetService.listInSessionEligibleAccounts()).slice(0, limit);
+    }
+
+    const results = [];
+    for (const account of accounts.slice(0, limit)) {
+      results.push({
+        accountId: account.id,
+        username: account.username,
+        ...(await redditPasswordResetService.runInSessionRotateForAccount(account, {
+          dryRun,
+          force,
+        })),
+      });
+    }
+    res.json({ dryRun, count: results.length, results });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 router.post('/batch', async (req, res) => {
   try {
     const dryRun = req.body?.dry_run !== false; // default dry-run for safety

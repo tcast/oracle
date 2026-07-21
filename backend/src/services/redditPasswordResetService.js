@@ -58,6 +58,12 @@ class RedditPasswordResetService {
     const sources = Array.isArray(patch.sources) && patch.sources.length
       ? patch.sources
       : current.sources || BOUGHT_SOURCES;
+    const in_session_enabled =
+      patch.in_session_enabled !== undefined
+        ? !!patch.in_session_enabled
+        : !!current.in_session_enabled;
+    const in_session_max_per_day =
+      patch.in_session_max_per_day ?? current.in_session_max_per_day ?? 3;
 
     if (max_per_day < 1 || max_per_day > 10) {
       throw new Error('max_per_day must be between 1 and 10');
@@ -67,6 +73,9 @@ class RedditPasswordResetService {
     }
     if (rotate_every_days < 7 || rotate_every_days > 180) {
       throw new Error('rotate_every_days must be between 7 and 180');
+    }
+    if (in_session_max_per_day < 1 || in_session_max_per_day > 10) {
+      throw new Error('in_session_max_per_day must be between 1 and 10');
     }
 
     const result = await pool.query(
@@ -78,6 +87,8 @@ class RedditPasswordResetService {
            quiet_hours_start = $5,
            quiet_hours_end = $6,
            sources = $7,
+           in_session_enabled = $8,
+           in_session_max_per_day = $9,
            updated_at = NOW()
        WHERE id = 1
        RETURNING *`,
@@ -89,6 +100,8 @@ class RedditPasswordResetService {
         quiet_hours_start,
         quiet_hours_end,
         sources,
+        in_session_enabled,
+        in_session_max_per_day,
       ]
     );
     return result.rows[0];
@@ -272,6 +285,42 @@ class RedditPasswordResetService {
     for (const row of rows) {
       const info = await this.classifyAccount(row, settings);
       if (info.eligible) out.push({ ...row, _eligibility: info });
+    }
+    return out;
+  }
+
+  /**
+   * Bought Reddit accounts eligible for logged-in password rotate (no inbox required).
+   * Skips accounts flagged password_locked / bad_credentials job class.
+   */
+  async listInSessionEligibleAccounts() {
+    const settings = await this.getSettings();
+    const sources = settings.sources || BOUGHT_SOURCES;
+    const { rows } = await pool.query(
+      `SELECT sa.*
+       FROM social_accounts sa
+       WHERE sa.platform = 'reddit'
+         AND sa.status = 'active'
+         AND COALESCE(sa.is_simulated, false) = false
+         AND sa.credentials->>'source' = ANY($1::text[])
+         AND COALESCE(sa.credentials->>'password', '') NOT IN ('', 'default_password')
+         AND COALESCE(sa.credentials->>'password_locked', '') <> 'true'
+       ORDER BY
+         CASE WHEN sa.credentials->>'password_rotated_at' IS NULL THEN 0 ELSE 1 END,
+         (sa.credentials->>'password_rotated_at')::timestamptz ASC NULLS FIRST,
+         sa.id`,
+      [sources]
+    );
+
+    const out = [];
+    for (const row of rows) {
+      const info = await this.classifyAccount(row, settings);
+      const canRotate =
+        info.proxyHealthy &&
+        !!parseCreds(row.credentials).password &&
+        parseCreds(row.credentials).password !== 'default_password';
+      if (!canRotate) continue;
+      out.push({ ...row, _eligibility: { ...info, eligibleInSession: true } });
     }
     return out;
   }
@@ -614,7 +663,7 @@ class RedditPasswordResetService {
     if (!userVisible) {
       // New Reddit login shell sometimes serves on /login
       const user2 = page.locator('input[name="username"], input[autocomplete="username"]').first();
-      const pass2 = page.locator('input[name="password"], input[type="password"]').first();
+      const pass2 = page.locator('input[type="password"], input[name="password"]').first();
       if (!(await user2.isVisible().catch(() => false))) {
         return { ok: false, reason: 'login_form_missing', snippet: body0.slice(0, 160) };
       }
@@ -656,6 +705,193 @@ class RedditPasswordResetService {
         snippet: text.slice(0, 160),
       };
     });
+  }
+
+  /**
+   * Prefer BrightData (or known-good provider) for password login verify.
+   * ProxyBase sticky IPs often hit "network policy" right after update_password.
+   */
+  async openVerifyBrowser(accountId) {
+    const meta = {};
+    const tryOpen = async (opts, via) => {
+      const browser = await playwrightService.createBrowserForAccount(accountId, 2, {
+        forceDesktop: true,
+        ...opts,
+      });
+      meta.verifyVia = via;
+      meta.proxyId = browser.proxyConfig?._proxyId || null;
+      return browser;
+    };
+
+    try {
+      return { browserResult: await tryOpen({ preferProvider: 'BrightData', requireProxy: true }, 'brightdata'), meta };
+    } catch (bdErr) {
+      meta.brightdataError = String(bdErr.message || bdErr).slice(0, 160);
+    }
+    try {
+      return { browserResult: await tryOpen({ skipProxy: true }, 'direct'), meta };
+    } catch (directErr) {
+      meta.directError = String(directErr.message || directErr).slice(0, 160);
+    }
+    const browserResult = await tryOpen({ requireProxy: true }, 'account_proxy');
+    return { browserResult, meta };
+  }
+
+  async clearPasswordRotateRisk(accountId, extra = {}) {
+    const { rows } = await pool.query(`SELECT credentials FROM social_accounts WHERE id = $1`, [
+      accountId,
+    ]);
+    const creds = parseCreds(rows[0]?.credentials);
+    const next = { ...creds, ...extra };
+    delete next.password_rotate_risk;
+    delete next.password_rotate_risk_at;
+    await pool.query(
+      `UPDATE social_accounts SET credentials = $2::jsonb, updated_at = NOW() WHERE id = $1`,
+      [accountId, JSON.stringify(next)]
+    );
+  }
+
+  async markPasswordLocked(accountId, reason) {
+    const { rows } = await pool.query(`SELECT credentials FROM social_accounts WHERE id = $1`, [
+      accountId,
+    ]);
+    const creds = parseCreds(rows[0]?.credentials);
+    const next = {
+      ...creds,
+      password_locked: 'true',
+      password_locked_at: new Date().toISOString(),
+      password_locked_reason: String(reason || '').slice(0, 240),
+      password_rotate_risk: 'locked_unverified',
+      password_rotate_risk_at: new Date().toISOString(),
+    };
+    await pool.query(
+      `UPDATE social_accounts SET credentials = $2::jsonb, updated_at = NOW() WHERE id = $1`,
+      [accountId, JSON.stringify(next)]
+    );
+    const job = await this.ensureJob(accountId);
+    await pool.query(
+      `UPDATE reddit_password_reset_jobs
+       SET failure_class = 'bad_credentials',
+           last_error = $2,
+           cooldown_until = NOW() + INTERVAL '72 hours',
+           updated_at = NOW()
+       WHERE id = $1`,
+      [job.id, String(reason || 'password_locked').slice(0, 500)]
+    );
+  }
+
+  /**
+   * Determine whether DB password still logs into Reddit (for password_rotate_risk audit).
+   * Prefers BrightData for the login attempt.
+   */
+  async auditPasswordMatchForAccount(account) {
+    const creds = parseCreds(account.credentials);
+    const password = creds.password;
+    const previous = creds.previous_password;
+    if (!password || password === 'default_password') {
+      return { accountId: account.id, username: account.username, status: 'missing_password' };
+    }
+
+    let browser;
+    let meta = {};
+    try {
+      const opened = await this.openVerifyBrowser(account.id);
+      browser = opened.browserResult.browser;
+      meta = opened.meta;
+      const page = opened.browserResult.page;
+
+      const current = await this.loginOldRedditPassword(page, account.username, password);
+      if (current.ok) {
+        await this.clearPasswordRotateRisk(account.id, {
+          password_verified_at: new Date().toISOString(),
+          password_verify_via: meta.verifyVia || null,
+        });
+        await playwrightService.persistSession(page, 'reddit', account.id).catch(() => {});
+        await this.logAction(account.id, meta.proxyId, 'password_match_ok', {
+          via: meta.verifyVia,
+          riskCleared: true,
+        });
+        return {
+          accountId: account.id,
+          username: account.username,
+          status: 'match',
+          via: meta.verifyVia,
+          login: current,
+        };
+      }
+
+      if (previous && previous !== password) {
+        const prevLogin = await this.loginOldRedditPassword(page, account.username, previous);
+        if (prevLogin.ok) {
+          await this.persistNewPassword(
+            account.id,
+            creds,
+            previous,
+            'reddit_restore_previous_password'
+          );
+          await this.clearPasswordRotateRisk(account.id, {
+            password_verified_at: new Date().toISOString(),
+            password_verify_via: meta.verifyVia || null,
+            password_restored_from_previous: true,
+          });
+          await playwrightService.persistSession(page, 'reddit', account.id).catch(() => {});
+          await this.logAction(account.id, meta.proxyId, 'password_restored_previous', {
+            via: meta.verifyVia,
+          });
+          return {
+            accountId: account.id,
+            username: account.username,
+            status: 'restored_previous',
+            via: meta.verifyVia,
+            login: prevLogin,
+          };
+        }
+        meta.previousLogin = prevLogin;
+      }
+
+      const blocked = !!(current.blocked || meta.previousLogin?.blocked);
+      if (blocked) {
+        return {
+          accountId: account.id,
+          username: account.username,
+          status: 'blocked_retry',
+          via: meta.verifyVia,
+          login: current,
+          meta,
+        };
+      }
+
+      await this.markPasswordLocked(
+        account.id,
+        `DB password login failed; previous=${!!previous && previous !== password}`
+      );
+      await this.logAction(
+        account.id,
+        meta.proxyId,
+        'password_locked',
+        { via: meta.verifyVia, current, meta },
+        'password_mismatch'
+      );
+      return {
+        accountId: account.id,
+        username: account.username,
+        status: 'locked',
+        via: meta.verifyVia,
+        login: current,
+        meta,
+      };
+    } catch (err) {
+      return {
+        accountId: account.id,
+        username: account.username,
+        status: 'error',
+        error: err.message,
+        meta,
+      };
+    } finally {
+      if (browser) await browser.close().catch(() => {});
+      playwrightService._untrackBrowser?.(account.id);
+    }
   }
 
   /**
@@ -948,6 +1184,7 @@ class RedditPasswordResetService {
         newPassword,
         'reddit_in_session_prefs'
       );
+      await this.clearPasswordRotateRisk(account.id).catch(() => {});
       await playwrightService.persistSession(page, 'reddit', account.id).catch(() => {});
 
       // Close the logged-in browser before verify — clearing cookies in-place
@@ -964,25 +1201,12 @@ class RedditPasswordResetService {
       let oldStillWorks = false;
       let verifyMeta = {};
       {
-        // Prefer a direct (skipProxy) verify browser — ProxyBase often network-policy
-        // blocks password login right after update_password on the same sticky IP.
-        let verifyBrowser;
-        try {
-          verifyBrowser = await playwrightService.createBrowserForAccount(account.id, 1, {
-            skipProxy: true,
-            forceDesktop: true,
-          });
-          verifyMeta.verifyVia = 'direct';
-        } catch (directErr) {
-          verifyMeta.directError = String(directErr.message || directErr).slice(0, 160);
-          verifyBrowser = await playwrightService.createBrowserForAccount(account.id, 2, {
-            requireProxy: true,
-            forceDesktop: true,
-          });
-          verifyMeta.verifyVia = 'proxy';
-        }
-        browser = verifyBrowser.browser;
-        const vpage = verifyBrowser.page;
+        // Prefer BrightData for verify — ProxyBase often network-policy blocks
+        // password login right after update_password on the same sticky IP.
+        const opened = await this.openVerifyBrowser(account.id);
+        browser = opened.browserResult.browser;
+        const vpage = opened.browserResult.page;
+        verifyMeta = { ...opened.meta };
         try {
           const neu = await this.loginOldRedditPassword(vpage, account.username, newPassword);
           loginOk = !!neu.ok;
@@ -1012,6 +1236,12 @@ class RedditPasswordResetService {
           verifyMeta,
         }
       );
+      if (loginOk) {
+        await this.clearPasswordRotateRisk(account.id, {
+          password_verified_at: new Date().toISOString(),
+          password_verify_via: verifyMeta.verifyVia || null,
+        }).catch(() => {});
+      }
       if (proxyId) await proxyService.updateProxyStats(proxyId, true).catch(() => {});
 
       return {
