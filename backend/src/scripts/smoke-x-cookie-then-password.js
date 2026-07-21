@@ -71,7 +71,7 @@ async function resolveAccountIds(argv) {
 
 async function proxyLabel(accountId) {
   const r = await pool.query(
-    `SELECT p.id, p.host, p.port, COALESCE(p.metadata->>'zone','') AS zone
+    `SELECT p.id, COALESCE(p.metadata->>'zone','') AS zone
      FROM social_account_proxies sap
      JOIN proxies p ON p.id = sap.proxy_id
      WHERE sap.social_account_id = $1 AND sap.is_active = true
