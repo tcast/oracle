@@ -9,6 +9,8 @@
  *   node src/scripts/import-reddit-accounts.js /app/private/reddit-accounts-batch.json
  *   node src/scripts/import-reddit-accounts.js /app/private/reddit-accounts-batch.json --smoke=10
  *   node src/scripts/import-reddit-accounts.js ... --allow-missing-totp   # legacy dumps without 2FA
+ *   node src/scripts/import-reddit-accounts.js ... --auto-assign         # unbound ProxyBase (prefer mobile/res)
+ *   node src/scripts/import-reddit-accounts.js ... --enable-organic --daily-target=3
  */
 require('dotenv').config();
 const fs = require('fs');
@@ -16,6 +18,7 @@ const path = require('path');
 const pool = require('../services/db');
 const proxyService = require('../services/proxyService');
 const playwrightService = require('../services/playwrightService');
+const organicCommentService = require('../services/organicCommentService');
 const { assertImportCredentials } = require('../utils/credentialGate');
 
 function sanitizeCookies(cookies) {
@@ -67,6 +70,34 @@ async function takeProxiesFromPendingShells(needed) {
   return proxyIds;
 }
 
+/** Unbound ProxyBase only — never Bright Data / Oxylabs. Prefer mobile then residential. */
+async function takeUnboundProxyBase(needed) {
+  const result = await pool.query(
+    `SELECT p.id
+     FROM proxies p
+     WHERE p.is_active = true
+       AND p.provider = 'ProxyBase'
+       AND COALESCE(p.failure_count, 0) < 3
+       AND NOT EXISTS (
+         SELECT 1 FROM social_account_proxies sap
+         WHERE sap.proxy_id = p.id AND sap.is_active = true
+       )
+     ORDER BY
+       CASE
+         WHEN COALESCE(p.metadata->>'session_type', '') ILIKE '%mobile%'
+           OR p.name ILIKE '%mobile%' THEN 0
+         WHEN COALESCE(p.metadata->>'session_type', '') ILIKE '%res%'
+           OR p.name ILIKE '%res%' THEN 1
+         ELSE 2
+       END,
+       p.last_used_at ASC NULLS FIRST,
+       p.id
+     LIMIT $1`,
+    [needed]
+  );
+  return result.rows.map((r) => r.id);
+}
+
 async function upsertRedditAccount(row, proxyId) {
   const gate = assertImportCredentials(row, {
     requireTotp: false, // already asserted in main when strict
@@ -80,6 +111,8 @@ async function upsertRedditAccount(row, proxyId) {
     totp_secret: gate.totp_secret || row.totp_secret || null,
     source: 'excel_import',
     batch: row.batch || null,
+    order_id: row.order_id || null,
+    notes: row.order_id ? `order ${row.order_id}` : row.notes || null,
     has_cookies: Array.isArray(row.cookies) && row.cookies.length > 0,
     credential_gate: gate.totp_secret ? 'ok' : 'missing_totp',
     credential_warnings: gate.warnings,
@@ -198,21 +231,58 @@ async function smokeRedditSession(accountId) {
   }
 }
 
+async function enableOrganicStaggered(accountIds, dailyTarget = 3) {
+  let enabled = 0;
+  for (let i = 0; i < accountIds.length; i++) {
+    const accountId = accountIds[i];
+    await organicCommentService.setAccountEnabled(accountId, true);
+    const staggerMin = 5 + Math.floor(Math.random() * 90) + i * 3;
+    await pool.query(
+      `UPDATE organic_comment_jobs
+       SET daily_target = $2,
+           next_due_at = NOW() + ($3 || ' minutes')::interval,
+           status = 'idle',
+           updated_at = NOW()
+       WHERE social_account_id = $1`,
+      [accountId, dailyTarget, String(staggerMin)]
+    );
+    enabled += 1;
+  }
+  return enabled;
+}
+
 async function main() {
   const file = process.argv[2];
   if (!file) {
-    console.error('Usage: node src/scripts/import-reddit-accounts.js <json> [--smoke=N]');
+    console.error(
+      'Usage: node src/scripts/import-reddit-accounts.js <json> [--smoke=N] [--auto-assign] [--enable-organic] [--daily-target=3]'
+    );
     process.exit(1);
   }
   const smokeArg = process.argv.find((a) => a.startsWith('--smoke'));
   const smokeN = smokeArg ? Number(smokeArg.split('=')[1] || 5) : 0;
+  const autoAssign = process.argv.includes('--auto-assign');
+  const enableOrganic = process.argv.includes('--enable-organic');
+  const dailyArg = process.argv.find((a) => a.startsWith('--daily-target'));
+  const dailyTarget = dailyArg ? Number(dailyArg.split('=')[1] || 3) : 3;
 
   const raw = JSON.parse(fs.readFileSync(path.resolve(file), 'utf8'));
   if (!Array.isArray(raw) || !raw.length) throw new Error('JSON must be a non-empty array');
 
   console.log(`Importing ${raw.length} Reddit accounts from ${file}`);
-  const proxyIds = await takeProxiesFromPendingShells(raw.length);
-  console.log(`Reclaimed ${proxyIds.length} proxies from pending_setup shells`);
+  let proxyIds = [];
+  if (autoAssign) {
+    proxyIds = await takeUnboundProxyBase(raw.length);
+    console.log(`Auto-assigned pool: ${proxyIds.length} unbound ProxyBase (mobile/res preferred)`);
+  } else {
+    proxyIds = await takeProxiesFromPendingShells(raw.length);
+    console.log(`Reclaimed ${proxyIds.length} proxies from pending_setup shells`);
+    if (proxyIds.length < raw.length) {
+      const more = await takeUnboundProxyBase(raw.length - proxyIds.length);
+      console.log(`Filled ${more.length} more from unbound ProxyBase`);
+      proxyIds = proxyIds.concat(more);
+    }
+  }
 
   const results = [];
   const allowMissingTotp = process.argv.includes('--allow-missing-totp');
@@ -242,6 +312,7 @@ async function main() {
     `\nImported ${ok.length}/${raw.length} (proxied=${withProxy.length}, cookies=${withCookies.length})`
   );
 
+  const smokePassIds = [];
   if (smokeN > 0) {
     // Prefer cookie accounts first
     const smokeIds = [
@@ -255,11 +326,32 @@ async function main() {
       console.log(`\n=== Account ${id} ===`);
       const r = await smokeRedditSession(id);
       console.log(JSON.stringify(r));
-      if (r.success) pass += 1;
+      if (r.success) {
+        pass += 1;
+        smokePassIds.push(id);
+      }
       await new Promise((res) => setTimeout(res, 5000 + Math.floor(Math.random() * 4000)));
     }
     console.log(`\nSmoke: ${pass}/${smokeIds.length} ok`);
   }
+
+  if (enableOrganic) {
+    // Prior bought-Reddit pattern: enroll all imported (login on first organic tick).
+    // If smoke ran, still enroll all proxied imports — smoke is a sample, not a gate.
+    const enrollIds = ok.filter((r) => r.proxyId).map((r) => r.accountId);
+    const n = await enableOrganicStaggered(enrollIds, dailyTarget);
+    console.log(`\nOrganic enabled: ${n} (daily_target=${dailyTarget}, staggered)`);
+  }
+
+  console.log(
+    JSON.stringify({
+      imported: ok.length,
+      with_proxy: withProxy.length,
+      smoke_pass: smokePassIds.length,
+      smoke_n: smokeN,
+      organic_enabled: enableOrganic ? ok.filter((r) => r.proxyId).length : 0,
+    })
+  );
 
   await pool.end().catch(() => {});
 }
