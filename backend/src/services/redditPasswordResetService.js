@@ -649,6 +649,7 @@ class RedditPasswordResetService {
     try {
       // Phase 1: trigger forgot-password (close browser before Outlook — two Chromiums OOM the box)
       {
+        console.log(`Password-reset phase1 trigger start account=${account.id} ${account.username}`);
         const result = await playwrightService.createBrowserForAccount(account.id, 2, {
           requireProxy: true,
           forceDesktop: true,
@@ -657,6 +658,10 @@ class RedditPasswordResetService {
         const page = result.page;
         const triggerEmail = account.email || creds.email || account.username;
         trigger = await this.triggerForgotPassword(page, triggerEmail);
+        console.log(
+          `Password-reset phase1 trigger ok account=${account.id}:`,
+          (trigger?.confirmationSnippet || '').slice(0, 120)
+        );
         await browser.close().catch(() => {});
         playwrightService._untrackBrowser?.(account.id);
         browser = null;
@@ -775,14 +780,33 @@ class RedditPasswordResetService {
 
       // Phase 3: open reset link + set password + verify login
       {
-        const result = await playwrightService.createBrowserForAccount(account.id, 2, {
-          requireProxy: true,
-          forceDesktop: true,
-        });
-        browser = result.browser;
-        const page = result.page;
+        let completed;
+        let usedSkipProxy = false;
+        let page;
 
-        const completed = await this.completePasswordReset(page, resetLink, newPassword);
+        const openBrowser = async (opts) => {
+          if (browser) await browser.close().catch(() => {});
+          playwrightService._untrackBrowser?.(account.id);
+          const result = await playwrightService.createBrowserForAccount(account.id, 2, opts);
+          browser = result.browser;
+          page = result.page;
+        };
+
+        try {
+          await openBrowser({ requireProxy: true, forceDesktop: true });
+          completed = await this.completePasswordReset(page, resetLink, newPassword);
+        } catch (resetErr) {
+          if (!/network.security|blocked by network|Password fields not found/i.test(resetErr.message || '')) {
+            throw resetErr;
+          }
+          console.warn(
+            `Reset via proxy failed for ${account.username} (${resetErr.message}); retrying direct`
+          );
+          usedSkipProxy = true;
+          await openBrowser({ skipProxy: true, forceDesktop: true });
+          completed = await this.completePasswordReset(page, resetLink, newPassword);
+        }
+
         await this.persistNewPassword(account.id, creds, newPassword);
 
         let loginOk = false;
@@ -795,9 +819,24 @@ class RedditPasswordResetService {
             newPassword
           ));
         } catch (loginErr) {
-          console.warn(
-            `Password rotated for ${account.username} but login verify failed: ${loginErr.message}`
-          );
+          try {
+            await openBrowser({
+              requireProxy: !usedSkipProxy,
+              skipProxy: usedSkipProxy,
+              forceDesktop: true,
+            });
+            loginOk = !!(await playwrightService.ensureLoggedIn(
+              page,
+              'reddit',
+              account.id,
+              account.username,
+              newPassword
+            ));
+          } catch (loginErr2) {
+            console.warn(
+              `Password rotated for ${account.username} but login verify failed: ${loginErr2.message}`
+            );
+          }
         }
 
         await this.markSuccess(job, settings);

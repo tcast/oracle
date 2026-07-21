@@ -35,6 +35,7 @@ services:
   backend:
     build: ./backend
     container_name: whisper-backend
+    shm_size: "1gb"
     ports:
       - "3021:3000"
     environment:
