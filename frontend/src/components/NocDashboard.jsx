@@ -27,36 +27,75 @@ const ago = (value) => {
 
 const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
 
-/** Lon/lat bounds must match the continental US outline below */
+/** Lon/lat bounds for continental US — shared by outline + node dots */
 const US_LON0 = -125;
 const US_LON1 = -66;
-const US_LAT0 = 24.5;
-const US_LAT1 = 49.5;
+const US_LAT0 = 24;
+const US_LAT1 = 50;
+const US_LON_SPAN = US_LON1 - US_LON0; // 59°
+const US_LAT_SPAN = US_LAT1 - US_LAT0; // 26°
+/** Equal-degree equirectangular: viewBox aspect = lonSpan/latSpan (~2.27:1) */
+const US_MAP_PAD = 10;
+const US_MAP_INNER_W = 590;
+const US_MAP_INNER_H = Math.round(US_MAP_INNER_W * (US_LAT_SPAN / US_LON_SPAN)); // ~260
+const US_MAP_W = US_MAP_INNER_W + US_MAP_PAD * 2;
+const US_MAP_H = US_MAP_INNER_H + US_MAP_PAD * 2;
 
-/** Project lon/lat into SVG viewBox coords (continental US) */
-const projectUS = (lon, lat, w = 560, h = 340) => {
-  const x = ((lon - US_LON0) / (US_LON1 - US_LON0)) * w;
-  const y = ((US_LAT1 - lat) / (US_LAT1 - US_LAT0)) * h;
-  return { x: clamp(x, 4, w - 4), y: clamp(y, 4, h - 4) };
+/** Project lon/lat into SVG coords (same transform for outline and dots) */
+const projectUS = (lon, lat, w = US_MAP_W, h = US_MAP_H) => {
+  const padX = US_MAP_PAD * (w / US_MAP_W);
+  const padY = US_MAP_PAD * (h / US_MAP_H);
+  const innerW = w - padX * 2;
+  const innerH = h - padY * 2;
+  const x = padX + ((lon - US_LON0) / US_LON_SPAN) * innerW;
+  const y = padY + ((US_LAT1 - lat) / US_LAT_SPAN) * innerH;
+  return { x, y };
 };
 
-/** Simplified continental US ring (lon, lat) — same projection as projectUS */
+/**
+ * Simplified continental US ring (lon, lat), clockwise from WA coast.
+ * ~110 verts — Florida peninsula, Gulf, Atlantic, Great Lakes north edge.
+ */
 const US_OUTLINE = [
-  [-124.7, 48.4], [-123.0, 48.0], [-122.4, 47.3], [-122.8, 46.2], [-124.0, 46.3],
-  [-124.4, 43.0], [-124.2, 40.5], [-123.7, 39.0], [-122.5, 37.8], [-122.0, 36.6],
-  [-121.0, 35.4], [-120.5, 34.5], [-119.0, 34.0], [-117.2, 32.6], [-114.7, 32.7],
-  [-111.0, 31.4], [-108.2, 31.4], [-106.5, 31.8], [-104.9, 30.0], [-103.0, 29.0],
-  [-100.0, 28.0], [-97.2, 25.9], [-97.4, 27.6], [-94.0, 29.7], [-90.0, 29.2],
-  [-89.0, 30.2], [-88.0, 30.4], [-85.5, 30.0], [-84.0, 30.0], [-81.5, 28.5],
-  [-80.4, 25.2], [-80.1, 26.8], [-81.3, 31.0], [-80.8, 32.0], [-79.0, 33.2],
-  [-76.0, 35.2], [-75.5, 37.2], [-76.0, 38.0], [-75.0, 38.5], [-74.5, 39.2],
-  [-73.9, 40.6], [-72.0, 41.3], [-70.0, 41.7], [-69.9, 43.0], [-70.8, 43.1],
-  [-67.0, 44.8], [-66.9, 45.0], [-67.8, 47.1], [-69.2, 47.4], [-70.0, 45.9],
-  [-71.5, 45.0], [-74.7, 45.0], [-76.5, 44.0], [-79.2, 43.6], [-82.5, 41.7],
-  [-83.5, 42.0], [-84.5, 43.6], [-86.5, 45.4], [-87.5, 45.0], [-88.0, 46.0],
-  [-90.5, 46.8], [-92.0, 46.7], [-93.5, 48.6], [-95.2, 49.0], [-97.2, 49.0],
-  [-100.0, 49.0], [-104.0, 49.0], [-110.0, 49.0], [-116.0, 49.0], [-122.8, 49.0],
-  [-123.2, 48.2], [-124.7, 48.4],
+  // Pacific NW → CA → Baja border
+  [-124.72, 48.37], [-124.55, 47.90], [-124.25, 47.25], [-124.05, 46.25],
+  [-124.00, 45.55], [-124.10, 43.80], [-124.25, 42.80], [-124.40, 41.90],
+  [-124.20, 40.75], [-123.85, 39.70], [-123.50, 38.90], [-122.95, 38.10],
+  [-122.50, 37.75], [-122.40, 37.20], [-121.95, 36.55], [-121.50, 35.85],
+  [-120.90, 35.15], [-120.55, 34.55], [-119.85, 34.40], [-119.20, 34.10],
+  [-118.45, 33.85], [-117.70, 33.45], [-117.15, 32.55], [-116.40, 32.55],
+  [-114.80, 32.72],
+  // AZ / NM / TX Mexico border → southern tip of TX
+  [-114.55, 32.80], [-111.05, 31.33], [-109.05, 31.33], [-108.20, 31.78],
+  [-106.55, 31.78], [-104.95, 30.40], [-103.35, 29.10], [-101.80, 29.85],
+  [-100.40, 28.45], [-99.20, 27.20], [-97.55, 25.85], [-97.15, 25.90],
+  // Gulf coast → FL panhandle → FL west coast → Keys → FL east → GA/SC
+  [-97.40, 26.90], [-97.05, 27.85], [-95.60, 28.80], [-94.70, 29.35],
+  [-93.85, 29.75], [-92.20, 29.55], [-90.85, 29.20], [-89.55, 29.15],
+  [-89.10, 30.15], [-88.45, 30.35], [-87.55, 30.25], [-86.45, 30.35],
+  [-85.45, 30.15], [-84.95, 29.65], [-84.15, 30.05], [-83.35, 29.45],
+  [-82.85, 28.55], [-82.65, 27.75], [-82.55, 26.85], [-82.15, 26.35],
+  [-81.80, 25.85], [-81.65, 25.15], [-81.25, 25.10], [-80.55, 25.15],
+  [-80.15, 25.55], [-80.05, 26.15], [-80.05, 26.85], [-80.15, 27.55],
+  [-80.35, 28.35], [-80.55, 29.15], [-81.05, 30.05], [-81.35, 30.75],
+  [-81.45, 31.55], [-81.15, 32.05], [-80.85, 32.55], [-80.05, 32.75],
+  [-79.25, 33.15], [-78.55, 33.85], [-77.85, 34.20], [-76.85, 34.85],
+  [-75.95, 35.25], [-75.55, 35.55], [-75.50, 36.05], [-75.85, 36.55],
+  // Chesapeake / Mid-Atlantic → NY → New England → Maine
+  [-76.05, 37.15], [-76.15, 37.85], [-76.35, 38.75], [-75.65, 39.15],
+  [-75.15, 38.85], [-74.85, 39.05], [-74.45, 39.35], [-74.05, 40.15],
+  [-73.95, 40.55], [-72.95, 40.95], [-71.95, 41.25], [-71.15, 41.45],
+  [-70.55, 41.65], [-70.05, 41.75], [-69.95, 42.05], [-70.65, 42.25],
+  [-70.75, 43.05], [-69.25, 43.75], [-68.05, 44.35], [-67.15, 44.75],
+  [-66.95, 44.85], [-67.15, 45.35], [-67.85, 47.05], [-69.05, 47.35],
+  // Northern border / Great Lakes north edge → WA
+  [-70.15, 46.65], [-71.45, 45.05], [-73.95, 45.00], [-76.35, 44.05],
+  [-79.05, 43.55], [-81.95, 42.25], [-82.85, 42.05], [-83.45, 42.35],
+  [-84.55, 43.55], [-85.55, 45.05], [-86.55, 45.35], [-87.55, 45.05],
+  [-88.05, 46.05], [-89.55, 46.75], [-91.05, 46.85], [-92.15, 46.75],
+  [-93.15, 48.15], [-94.55, 48.75], [-95.15, 49.00], [-97.25, 49.00],
+  [-100.05, 49.00], [-104.05, 49.00], [-110.05, 49.00], [-115.05, 49.00],
+  [-122.75, 49.00], [-123.15, 48.25], [-124.72, 48.37],
 ];
 
 const usOutlinePath = (w, h) => {
@@ -257,8 +296,8 @@ const TopologyPanel = ({ flow }) => {
 
 const GeoMapPanel = ({ geo }) => {
   const nodes = geo?.nodes || [];
-  const W = 560;
-  const H = 340;
+  const W = US_MAP_W;
+  const H = US_MAP_H;
   const landPath = useMemo(() => usOutlinePath(W, H), []);
 
   return (
@@ -287,13 +326,13 @@ const GeoMapPanel = ({ geo }) => {
           {/* lon/lat grid */}
           {[-120, -110, -100, -90, -80, -70].map((lon) => {
             const { x } = projectUS(lon, 37, W, H);
-            return <line key={`v${lon}`} x1={x} y1={12} x2={x} y2={H - 12} stroke="#1e293b" strokeWidth="0.6" />;
+            return <line key={`v${lon}`} x1={x} y1={US_MAP_PAD} x2={x} y2={H - US_MAP_PAD} stroke="#1e293b" strokeWidth="0.6" />;
           })}
           {[30, 35, 40, 45].map((lat) => {
             const { y } = projectUS(-95, lat, W, H);
-            return <line key={`h${lat}`} x1={20} y1={y} x2={W - 20} y2={y} stroke="#1e293b" strokeWidth="0.6" />;
+            return <line key={`h${lat}`} x1={US_MAP_PAD} y1={y} x2={W - US_MAP_PAD} y2={y} stroke="#1e293b" strokeWidth="0.6" />;
           })}
-          {/* continental US landmass — must be visible behind dots */}
+          {/* continental US landmass — same lon/lat projection as dots */}
           <path
             d={landPath}
             fill="url(#nocLandFill)"
@@ -312,6 +351,7 @@ const GeoMapPanel = ({ geo }) => {
           />
 
           {nodes.slice(0, 180).map((n) => {
+            if (n.lon == null || n.lat == null) return null;
             const { x, y } = projectUS(n.lon, n.lat, W, H);
             const color = STATUS_COLOR[n.status] || STATUS_COLOR.idle;
             const hot = n.status === 'healthy' && n.last_success_at &&
