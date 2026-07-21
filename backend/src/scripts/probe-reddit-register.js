@@ -5,11 +5,12 @@ const pool = require('../services/db');
 (async () => {
   const r = await pool.query(`
     SELECT p.* FROM proxies p
-    WHERE p.is_active AND p.country = 'US' AND p.provider ILIKE '%brightdata%'
-    ORDER BY p.id
+    WHERE p.is_active AND p.country = 'US' AND p.provider ILIKE '%proxybase%'
+      AND COALESCE(p.failure_count,0) < 2
+    ORDER BY p.last_used_at ASC NULLS FIRST, p.id
     LIMIT 1`);
   const p = r.rows[0];
-  if (!p) throw new Error('No Bright Data US proxy');
+  if (!p) throw new Error('No free ProxyBase US proxy');
   const cfg = proxyService.formatProxyConfig(p);
   console.log('using proxy', p.id, p.provider, p.server);
 

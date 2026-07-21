@@ -2,7 +2,7 @@
 /**
  * Probe N US proxies against reddit.com/register — find ones that aren't blocked.
  * Usage: node src/scripts/probe-reddit-register-batch.js [limit] [provider]
- * provider: isp|proxybase|any
+ * provider: proxybase|isp|any (default proxybase; Bright Data ISP deprecated for Reddit)
  */
 require('dotenv').config();
 const accountCreationService = require('../services/accountCreationService');
@@ -10,7 +10,7 @@ const proxyService = require('../services/proxyService');
 const pool = require('../services/db');
 
 const limit = Math.min(Math.max(parseInt(process.argv[2] || '8', 10) || 8, 1), 20);
-const providerHint = String(process.argv[3] || 'isp').toLowerCase();
+const providerHint = String(process.argv[3] || 'proxybase').toLowerCase();
 
 (async () => {
   let where = `p.is_active AND p.country = 'US'

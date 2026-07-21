@@ -24,7 +24,7 @@
   "probe_summary": {
     "providers_tried": [
       "ProxyBase residential",
-      "BrightData ISP (skipped after target met)"
+      "BrightData ISP (canceled — do not use for Reddit fill)"
     ],
     "clean": 3,
     "create_attempt": "NO \u2014 cleared network gate + captcha + SMS buy on proxy 81; Continue did not show OTP; SMS cancelled",

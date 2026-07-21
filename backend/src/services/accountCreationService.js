@@ -796,13 +796,14 @@ class AccountCreationService {
       return proxy_id;
     }
 
-    // Prefer phone-gate allowlisted proxies (register→phone→Continue cleared),
-    // then recent Reddit successes, then healthy ProxyBase. Never two Reddit
-    // accounts on same proxy. Skip cooled / degraded / unhealthy.
+    // Prefer phone-gate allowlisted ProxyBase, then recent Reddit successes,
+    // then healthy ProxyBase. Bright Data canceled for Reddit — do not assign.
+    // Never two Reddit accounts on same proxy. Skip cooled / degraded / unhealthy.
     const pick = await pool.query(
       `SELECT p.id FROM proxies p
        WHERE p.is_active = true
          AND p.country = 'US'
+         AND p.provider ILIKE '%proxybase%'
          AND (p.cooldown_until IS NULL OR p.cooldown_until <= NOW())
          AND COALESCE(p.consecutive_failures, 0) < 3
          AND COALESCE(p.last_health_ok, true) = true
@@ -822,12 +823,8 @@ class AccountCreationService {
              AND p.last_success_at > NOW() - INTERVAL '2 hours'
              AND COALESCE(p.last_error, '') NOT ILIKE '%network_security%'
              THEN 1
-           WHEN p.provider ILIKE '%proxybase%'
-             AND p.name ILIKE '%residential%' THEN 2
-           WHEN p.provider ILIKE '%proxybase%' THEN 3
-           WHEN p.provider ILIKE '%brightdata%'
-             AND COALESCE(p.metadata->>'zone', '') IN ('isp_proxy3', 'isp_proxy4') THEN 4
-           ELSE 5
+           WHEN p.name ILIKE '%residential%' THEN 2
+           ELSE 3
          END,
          CASE WHEN EXISTS (
            SELECT 1 FROM social_account_proxies sap
