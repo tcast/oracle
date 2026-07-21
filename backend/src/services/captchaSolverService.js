@@ -90,23 +90,30 @@ class CaptchaSolverService {
       `🧩 Solving ${captchaType}${opts.enterprise ? ' enterprise' : ''}${opts.invisible ? ' invisible' : ''} CAPTCHA for ${pageUrl}`
     );
 
-    try {
-      // Try 2Captcha first (primary solver)
-      if (this.twoCaptchaKey && !this.twoCaptchaIssue) {
-        console.log('   Attempting with 2Captcha...');
-        return await this.solve2Captcha(siteKey, pageUrl, captchaType, version, opts);
-      }
-    } catch (error) {
-      console.warn('   2Captcha failed, trying CapSolver:', error.message);
-    }
-
-    // Fallback to CapSolver
-    if (this.capSolverKey && !this.capSolverIssue) {
+    const try2Captcha = async () => {
+      if (!this.twoCaptchaKey || this.twoCaptchaIssue) throw new Error('2Captcha unavailable');
+      console.log('   Attempting with 2Captcha...');
+      return this.solve2Captcha(siteKey, pageUrl, captchaType, version, opts);
+    };
+    const tryCapSolver = async () => {
+      if (!this.capSolverKey || this.capSolverIssue) throw new Error('CapSolver unavailable');
       console.log('   Attempting with CapSolver...');
-      return await this.solveCapSolver(siteKey, pageUrl, captchaType, version, opts);
+      return this.solveCapSolver(siteKey, pageUrl, captchaType, version, opts);
+    };
+
+    // Enterprise: CapSolver first (2Captcha often returns ERROR_CAPTCHA_UNSOLVABLE for Reddit)
+    const order = opts.enterprise ? [tryCapSolver, try2Captcha] : [try2Captcha, tryCapSolver];
+    let lastErr;
+    for (const fn of order) {
+      try {
+        return await fn();
+      } catch (error) {
+        lastErr = error;
+        console.warn(`   Solver attempt failed: ${error.message}`);
+      }
     }
 
-    throw new Error('No CAPTCHA solver available or all solvers failed');
+    throw lastErr || new Error('No CAPTCHA solver available or all solvers failed');
   }
 
   /**
@@ -292,9 +299,18 @@ class CaptchaSolverService {
         const setResponseFields = () => {
           const nodes = [
             ...document.querySelectorAll(
-              '#g-recaptcha-response, textarea[name="g-recaptcha-response"], textarea.g-recaptcha-response, [name="h-captcha-response"]'
+              '#g-recaptcha-response, textarea[name="g-recaptcha-response"], textarea.g-recaptcha-response, [name="h-captcha-response"], [name="g-recaptcha-response"]'
             ),
           ];
+          // Create hidden response field if Reddit never rendered one
+          if (!nodes.length) {
+            const ta = document.createElement('textarea');
+            ta.id = 'g-recaptcha-response';
+            ta.name = 'g-recaptcha-response';
+            ta.style.display = 'none';
+            document.body.appendChild(ta);
+            nodes.push(ta);
+          }
           for (const el of nodes) {
             el.value = token;
             el.innerHTML = token;
@@ -346,29 +362,32 @@ class CaptchaSolverService {
           }
         }
 
-        // Also try enterprise / standard grecaptcha helpers if present
+        // Reddit shreddit uses grecaptcha.enterprise.execute() — override so
+        // verify_phone_by_code_initialize receives our solved token.
+        let executeHooked = false;
         try {
-          if (window.grecaptcha?.enterprise) {
-            const clients = window.___grecaptcha_cfg?.clients || {};
-            const more = findCallbacks(clients);
-            for (const cb of more) {
-              try {
-                cb(token);
-                callbacks += 1;
-              } catch (_) {
-                /* ignore */
-              }
-            }
+          const g = window.grecaptcha;
+          if (g?.enterprise) {
+            g.enterprise.execute = async () => token;
+            g.enterprise.getResponse = () => token;
+            executeHooked = true;
+          }
+          if (g) {
+            g.execute = async () => token;
+            g.getResponse = () => token;
           }
         } catch (_) {
           /* ignore */
         }
 
-        return { fields, callbacks };
+        // Persist for late execute calls after navigation within SPA
+        window.__oracleRecaptchaToken = token;
+
+        return { fields, callbacks, executeHooked };
       }, token);
 
       console.log(
-        `   ✅ CAPTCHA token injected into page (fields=${result.fields} callbacks=${result.callbacks})`
+        `   ✅ CAPTCHA token injected (fields=${result.fields} callbacks=${result.callbacks} executeHooked=${result.executeHooked})`
       );
     } catch (error) {
       console.error('Error injecting CAPTCHA token:', error);

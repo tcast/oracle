@@ -420,6 +420,48 @@ class AccountCreationService {
       { invisible: !!info.invisible, enterprise: !!info.enterprise }
     );
     await captchaSolverService.injectCaptchaToken(page, token);
+    // Patch fetch so verify_phone payloads carry the token even if execute isn't used
+    await page.evaluate((token) => {
+      if (window.__oracleFetchCaptchaPatched) {
+        window.__oracleRecaptchaToken = token;
+        return;
+      }
+      window.__oracleRecaptchaToken = token;
+      window.__oracleFetchCaptchaPatched = true;
+      const origFetch = window.fetch.bind(window);
+      window.fetch = async (input, init = {}) => {
+        const url = typeof input === 'string' ? input : input?.url || '';
+        const tok = window.__oracleRecaptchaToken || token;
+        if (/verify_phone_by_code_initialize/i.test(url) && init && typeof init.body === 'string' && tok) {
+          try {
+            const j = JSON.parse(init.body);
+            const inject = (obj) => {
+              if (!obj || typeof obj !== 'object') return false;
+              let found = false;
+              for (const k of Object.keys(obj)) {
+                if (/recaptcha|captcha|g-recaptcha/i.test(k)) {
+                  obj[k] = tok;
+                  found = true;
+                }
+              }
+              if (obj.variables && typeof obj.variables === 'object') {
+                found = inject(obj.variables) || found;
+              }
+              if (obj.input && typeof obj.input === 'object') {
+                found = inject(obj.input) || found;
+              }
+              if (!found) obj.recaptcha_token = tok;
+              return found;
+            };
+            inject(j);
+            init = { ...init, body: JSON.stringify(j) };
+          } catch (_) {
+            /* non-JSON body */
+          }
+        }
+        return origFetch(input, init);
+      };
+    }, token);
     return {
       solved: true,
       type: info.type,
@@ -819,6 +861,16 @@ class AccountCreationService {
       }
     };
     page.on('response', onResponse);
+    page.on('request', (req) => {
+      try {
+        if (/verify_phone_by_code_initialize/i.test(req.url())) {
+          const body = (req.postData() || '').replace(/\s+/g, ' ').slice(0, 400);
+          console.log(`Reddit verify_phone request body: ${body}`);
+        }
+      } catch (_) {
+        /* ignore */
+      }
+    });
     try {
       await this.waitForRedditRegisterReady(page);
 
