@@ -62,10 +62,17 @@ function parseJson(value, fallback = {}) {
 
 function classifyApplyError(msg) {
   const m = String(msg || '');
-  if (/no_live_session|session_not_logged_in|not.?logged.?in|login_wall|no_session/i.test(m)) {
+  if (
+    /account_suspended|is suspended|no_live_session|session_not_logged_in|not.?logged.?in|login_wall|no_session/i.test(
+      m
+    )
+  ) {
     return 'session_dead';
   }
-  if (/rate.?limit|try again later|something went wrong/i.test(m)) {
+  if (/x_persona_verify_failed/i.test(m)) {
+    return 'verify_failed';
+  }
+  if (/rate.?limit|try again later|something went wrong|x_profile_error/i.test(m)) {
     return 'rate_limit';
   }
   if (/proxy|oxylabs|ECONNREFUSED|ETIMEDOUT|tunnel|ERR_PROXY/i.test(m)) {
@@ -209,12 +216,26 @@ async function applyOne(accountId, { withPhoto, dryRun, delayMs }) {
       photoPath,
       requireProxy: true,
     });
+    // applyXPersonaLive only returns success after live read-back verification
+    if (!result?.success) {
+      return {
+        accountId,
+        success: false,
+        error: result?.error || 'apply returned without success',
+        class: 'verify_failed',
+        username: result?.username,
+        verified: result?.verified,
+        skipped: result?.skipped,
+      };
+    }
     return {
       accountId,
       success: true,
       username: result.username,
       display_name: result.display_name,
-      photo: result.photo,
+      photo: !!result.photo,
+      verified: result.verified,
+      skipped: result.skipped,
     };
   } catch (err) {
     const msg = err.message || String(err);
@@ -239,6 +260,7 @@ async function applyOne(accountId, { withPhoto, dryRun, delayMs }) {
       success: false,
       error: msg,
       class: cls,
+      // verify_failed is a hard fail — must not be treated as soft OK
       soft: cls === 'rate_limit' || cls === 'proxy_error' || cls === 'challenge',
     };
   } finally {
@@ -273,9 +295,13 @@ async function main() {
     const result = await applyOne(id, { withPhoto, dryRun, delayMs });
     results.push(result);
     if (result.success) {
+      const v = result.verified
+        ? ` verified[name=${!!result.verified.display_name},bio=${!!result.verified.bio},photo=${!!result.verified.photo}]`
+        : '';
       console.log(
         `#${id} OK @${result.username || '?'} → ${result.display_name || '?'}` +
           (result.photo ? ' +photo' : '') +
+          v +
           (dryRun ? ' [dry-run]' : '')
       );
     } else {

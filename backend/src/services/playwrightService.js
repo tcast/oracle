@@ -2993,6 +2993,201 @@ class PlaywrightService {
   }
 
   /**
+   * Fail fast on X error/suspension UI. Never treat these as apply success.
+   */
+  async assertXProfileActionAllowed(page, { accountId } = {}) {
+    const tag = accountId ? `#${accountId}` : '';
+    const text = await page
+      .evaluate(() => {
+        const dialog = document.querySelector('[role="dialog"]');
+        const parts = [
+          dialog ? dialog.innerText || '' : '',
+          document.body ? document.body.innerText || '' : '',
+        ];
+        return parts.join('\n').slice(0, 12000);
+      })
+      .catch(() => '');
+
+    if (/Your account is suspended/i.test(text)) {
+      await page.screenshot({ path: `/tmp/x-persona-suspended-${accountId || 'x'}.png` }).catch(() => {});
+      throw new Error(
+        'account_suspended: Your account is suspended and is not permitted to perform this action'
+      );
+    }
+    if (/Oops,\s*something went wrong/i.test(text)) {
+      await page.screenshot({ path: `/tmp/x-persona-oops-${accountId || 'x'}.png` }).catch(() => {});
+      throw new Error('x_profile_error: Oops, something went wrong. Please try again later.');
+    }
+    // Banner-only suspension inside edit modal (sometimes sparse body text)
+    const banner = await page
+      .locator('[role="dialog"]')
+      .filter({ hasText: /suspended/i })
+      .count()
+      .catch(() => 0);
+    if (banner > 0) {
+      await page.screenshot({ path: `/tmp/x-persona-suspended-${accountId || 'x'}.png` }).catch(() => {});
+      throw new Error(
+        'account_suspended: Your account is suspended and is not permitted to perform this action'
+      );
+    }
+    console.log(`X persona ${tag}: no Oops/suspension banner detected`);
+  }
+
+  _normXPersonaText(value) {
+    return String(value || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+  }
+
+  /**
+   * Read live X profile (sidebar → Profile) or fall back to open Edit modal fields.
+   */
+  async readXLiveProfile(page, { accountId, username } = {}) {
+    const tag = accountId ? `#${accountId}` : '';
+    console.log(`X persona ${tag}: reading back live profile for verification`);
+
+    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForSelector('[data-testid="AppTabBar_Profile_Link"]', { timeout: 30000 });
+    await this.humanLikeDelay(1200, 2000);
+    await page.click('[data-testid="AppTabBar_Profile_Link"]');
+    await this.humanLikeDelay(2500, 4000);
+    if (username) {
+      await page.waitForURL(new RegExp(`/${username}(?:\\?|$|/)`), { timeout: 15000 }).catch(() => {});
+    }
+
+    await this.assertXProfileActionAllowed(page, { accountId });
+
+    let live = await page.evaluate(() => {
+      const userNameRoot = document.querySelector('[data-testid="UserName"]');
+      const displayName = userNameRoot
+        ? (userNameRoot.innerText || '').split('\n').map((s) => s.trim()).filter(Boolean)[0] || ''
+        : '';
+      const bio = ((document.querySelector('[data-testid="UserDescription"]') || {}).innerText || '')
+        .trim();
+      const imgs = Array.from(
+        document.querySelectorAll(
+          'a[href$="/photo"] img, [data-testid^="UserAvatar-Container"] img, [data-testid="UserAvatar-Container-unknown"] img'
+        )
+      );
+      const avatarSrc = imgs.map((i) => i.getAttribute('src') || '').find(Boolean) || '';
+      const isDefaultAvatar =
+        !avatarSrc || /default_profile|default_profile_images|\/default_profile\./i.test(avatarSrc);
+      return { displayName, bio, avatarSrc, isDefaultAvatar, source: 'profile_page' };
+    });
+
+    // If profile page name is empty / still looking like a stub, try Edit modal fields
+    if (!live.displayName) {
+      const editBtn =
+        (await page.$('[data-testid="editProfileButton"], [aria-label="Edit profile"]')) ||
+        (await page
+          .locator('button:has-text("Edit profile")')
+          .first()
+          .elementHandle()
+          .catch(() => null));
+      if (editBtn) {
+        await editBtn.click().catch(() => {});
+        await this.humanLikeDelay(1500, 2500);
+        await this.assertXProfileActionAllowed(page, { accountId });
+        const modal = await page.evaluate(() => {
+          const nameEl =
+            document.querySelector('input[name="displayName"], input[name="name"]') ||
+            document.querySelector('[role="dialog"] input[type="text"]');
+          const bioEl =
+            document.querySelector(
+              'textarea[name="description"], textarea[name="bio"], textarea[data-testid="Account_description"]'
+            ) || document.querySelector('[role="dialog"] textarea');
+          const img =
+            document.querySelector('[role="dialog"] img') ||
+            document.querySelector('input[type="file"]')?.closest('[role="dialog"]')?.querySelector('img');
+          const avatarSrc = img?.getAttribute('src') || '';
+          return {
+            displayName: nameEl ? String(nameEl.value || '').trim() : '',
+            bio: bioEl ? String(bioEl.value || '').trim() : '',
+            avatarSrc,
+            isDefaultAvatar:
+              !avatarSrc || /default_profile|default_profile_images|\/default_profile\./i.test(avatarSrc),
+            source: 'edit_modal',
+          };
+        });
+        live = { ...live, ...modal, source: modal.source || 'edit_modal' };
+        // Close modal if open
+        await page.keyboard.press('Escape').catch(() => {});
+      }
+    }
+
+    console.log(
+      `X persona ${tag}: live read (${live.source}) name="${live.displayName}" ` +
+        `bioLen=${(live.bio || '').length} defaultAvatar=${!!live.isDefaultAvatar}`
+    );
+    return live;
+  }
+
+  /**
+   * Confirm attempted fields actually landed. Does not invent success for skipped fields.
+   */
+  async verifyXPersonaLive(page, persona, attempts = {}, { accountId, username } = {}) {
+    const tag = accountId ? `#${accountId}` : '';
+    const live = await this.readXLiveProfile(page, { accountId, username });
+    const verified = { display_name: false, bio: false, photo: false };
+    const skipped = [];
+    const failed = [];
+
+    if (!attempts.nameAttempted) skipped.push('display_name');
+    else if (this._normXPersonaText(live.displayName) === this._normXPersonaText(persona.display_name)) {
+      verified.display_name = true;
+    } else {
+      failed.push(
+        `display_name expected="${persona.display_name}" live="${live.displayName || ''}"`
+      );
+    }
+
+    if (!attempts.bioAttempted) skipped.push('bio');
+    else if (this._normXPersonaText(live.bio) === this._normXPersonaText(persona.bio)) {
+      verified.bio = true;
+    } else {
+      failed.push(`bio mismatch (expectedLen=${(persona.bio || '').length} liveLen=${(live.bio || '').length})`);
+    }
+
+    // Photo is independent: never claim photo_applied on default avatar, but do not
+    // block applied_live when name/bio verified.
+    const photoFailed = [];
+    if (!attempts.photoAttempted) skipped.push('photo');
+    else if (!live.isDefaultAvatar) {
+      verified.photo = true;
+    } else {
+      photoFailed.push(`photo still default_profile (src=${(live.avatarSrc || '').slice(0, 80)})`);
+    }
+
+    console.log(
+      `X persona ${tag}: verify verified=${JSON.stringify(verified)} ` +
+        `skipped=[${skipped.join(',')}] failed=[${failed.concat(photoFailed).join(' | ')}]`
+    );
+
+    if (failed.length) {
+      await page.screenshot({ path: `/tmp/x-persona-verify-fail-${accountId || 'x'}.png` }).catch(() => {});
+      throw new Error(`x_persona_verify_failed: ${failed.join('; ')}`);
+    }
+    if (photoFailed.length) {
+      console.warn(`X persona ${tag}: photo not verified — ${photoFailed.join('; ')}`);
+    }
+
+    const appliedLive = !!(
+      (attempts.nameAttempted ? verified.display_name : true) &&
+      (attempts.bioAttempted ? verified.bio : true) &&
+      (attempts.nameAttempted || attempts.bioAttempted)
+    );
+
+    return {
+      live,
+      verified,
+      skipped,
+      appliedLive,
+      photoApplied: !!verified.photo,
+    };
+  }
+
+  /**
    * LIVE X profile edit (cookie session only — no password login).
    *
    * URL: https://x.com/settings/profile (fallback: Edit profile modal)
@@ -3000,6 +3195,8 @@ class PlaywrightService {
    * Do NOT rename handle in v1.
    *
    * Requires process.env.X_PERSONA_LIVE === '1'
+   *
+   * Returns attempt flags only — callers must verifyXPersonaLive before applied_live.
    *
    * @param {import('playwright').Page} page — already cookie-restored session
    * @param {{ display_name: string, bio: string, location?: string|null, website?: string|null }} persona
@@ -3046,6 +3243,7 @@ class PlaywrightService {
     };
 
     const advanceSetupStep = async () => {
+      await this.assertXProfileActionAllowed(page, { accountId });
       const next =
         (await page.$('[data-testid="ocfEnterTextNextButton"]')) ||
         (await page.$('[data-testid="ocfSettingsListNextButton"]')) ||
@@ -3069,6 +3267,10 @@ class PlaywrightService {
       return true;
     };
 
+    let nameAttempted = false;
+    let bioAttempted = false;
+    let photoAttempted = false;
+
     // Direct /settings/profile and /{user} often hang on spinner — use home → Profile click.
     console.log(`X persona ${tag}: opening profile via sidebar`);
     await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 60000 });
@@ -3076,6 +3278,7 @@ class PlaywrightService {
     await this.humanLikeDelay(1500, 2500);
     await page.click('[data-testid="AppTabBar_Profile_Link"]');
     await this.humanLikeDelay(3000, 4500);
+    await this.assertXProfileActionAllowed(page, { accountId });
     await page.waitForSelector(editBtnSel, { timeout: 45000 }).catch(() => null);
 
     let editBtn =
@@ -3091,12 +3294,12 @@ class PlaywrightService {
     }
     await editBtn.click();
     await this.humanLikeDelay(2500, 4000);
+    await this.assertXProfileActionAllowed(page, { accountId });
 
     // --- setup_profile onboarding (warmed / incomplete accounts) ---
     const onSetup = /\/i\/flow\/setup_profile/i.test(page.url()) ||
       /Pick a profile picture|Describe yourself|Where do you live/i.test(await dialogText());
 
-    let photoOk = false;
     if (onSetup) {
       console.log(`X persona ${tag}: setup_profile flow`);
 
@@ -3114,10 +3317,11 @@ class PlaywrightService {
             await apply.click().catch(() => {});
             await this.humanLikeDelay(1500, 2500);
           }
+          await this.assertXProfileActionAllowed(page, { accountId });
           // After crop, flow usually advances; otherwise Next
           await advanceSetupStep();
-          photoOk = true;
-          console.log(`X persona ${tag}: photo uploaded in setup`);
+          photoAttempted = true;
+          console.log(`X persona ${tag}: photo upload attempted in setup (unverified)`);
         } else {
           await clickTextButton('Skip for now');
         }
@@ -3132,7 +3336,7 @@ class PlaywrightService {
       // Bio
       text = await dialogText();
       if (/Describe yourself|Your bio/i.test(text) || (await page.$(`textarea${setupField}`))) {
-        await fillSetupField(persona.bio, 160);
+        bioAttempted = await fillSetupField(persona.bio, 160);
         await advanceSetupStep();
       }
 
@@ -3159,6 +3363,7 @@ class PlaywrightService {
           await this.humanLikeDelay(2500, 4000);
         }
       }
+      await this.assertXProfileActionAllowed(page, { accountId });
       await page.screenshot({ path: `/tmp/x-persona-saved-${accountId || 'x'}.png` }).catch(() => {});
       console.log(`X persona ${tag}: setup saved bio/location (display_name may need Edit pass)`);
 
@@ -3168,6 +3373,7 @@ class PlaywrightService {
       await page.waitForSelector('[data-testid="AppTabBar_Profile_Link"]', { timeout: 20000 }).catch(() => null);
       await page.click('[data-testid="AppTabBar_Profile_Link"]').catch(() => {});
       await this.humanLikeDelay(2500, 4000);
+      await this.assertXProfileActionAllowed(page, { accountId });
       const editAgain =
         (await page.$('[data-testid="editProfileButton"]')) ||
         (await page.locator('button:has-text("Edit profile")').first().elementHandle().catch(() => null));
@@ -3176,6 +3382,7 @@ class PlaywrightService {
         if (/edit profile/i.test(label)) {
           await editAgain.click();
           await this.humanLikeDelay(2000, 3500);
+          await this.assertXProfileActionAllowed(page, { accountId });
           const nameEl =
             (await page.$('input[name="displayName"], input[name="name"]')) ||
             (await page.locator('[role="dialog"] input[type="text"]').first().elementHandle().catch(() => null));
@@ -3184,13 +3391,18 @@ class PlaywrightService {
             await nameEl.fill('');
             await nameEl.type(persona.display_name.slice(0, 50), { delay: 18 });
             await this.humanLikeDelay(300, 600);
+            nameAttempted = true;
             await clickTextButton('Save');
-            console.log(`X persona ${tag}: display_name set via Edit profile`);
+            await this.assertXProfileActionAllowed(page, { accountId });
+            console.log(`X persona ${tag}: display_name edit attempted via Edit profile (unverified)`);
           }
         }
       }
 
-      return { photoOk };
+      console.log(
+        `X persona ${tag}: attempts name=${nameAttempted} bio=${bioAttempted} photo=${photoAttempted}`
+      );
+      return { nameAttempted, bioAttempted, photoAttempted };
     }
 
     // --- Classic Edit profile modal ---
@@ -3212,7 +3424,7 @@ class PlaywrightService {
       return false;
     };
 
-    const nameOk = await fillField(
+    nameAttempted = await fillField(
       [
         'input[name="displayName"]',
         'input[data-testid="DisplayNameInput"]',
@@ -3222,11 +3434,11 @@ class PlaywrightService {
       persona.display_name.slice(0, 50),
       'display_name'
     );
-    if (!nameOk) {
+    if (!nameAttempted) {
       await page.screenshot({ path: `/tmp/x-persona-noform-${accountId || 'x'}.png` }).catch(() => {});
       throw new Error('X profile edit form not found (display name input)');
     }
-    await fillField(
+    bioAttempted = await fillField(
       [
         'textarea[name="description"]',
         'textarea[data-testid="Account_description"]',
@@ -3259,7 +3471,7 @@ class PlaywrightService {
           await apply.click().catch(() => {});
           await this.humanLikeDelay(1500, 2500);
         }
-        photoOk = true;
+        photoAttempted = true;
       }
     }
 
@@ -3273,13 +3485,18 @@ class PlaywrightService {
     }
     await save.click();
     await this.humanLikeDelay(2500, 4000);
+    await this.assertXProfileActionAllowed(page, { accountId });
     await page.screenshot({ path: `/tmp/x-persona-saved-${accountId || 'x'}.png` }).catch(() => {});
-    console.log(`X persona ${tag}: saved display_name="${persona.display_name}"`);
-    return { photoOk };
+    console.log(
+      `X persona ${tag}: edit submitted name="${persona.display_name}" ` +
+        `(attempts name=${nameAttempted} bio=${bioAttempted} photo=${photoAttempted}; unverified)`
+    );
+    return { nameAttempted, bioAttempted, photoAttempted };
   }
 
   /**
    * Upload X avatar from a local image (cookie session, allowLogin=false).
+   * Returns { photoAttempted } only — caller must verify live avatar.
    */
   async updateXProfilePhoto(page, photoPath, { accountId, username } = {}) {
     const fs = require('fs');
@@ -3291,6 +3508,7 @@ class PlaywrightService {
     const openEditForPhoto = async (url) => {
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
       await this.humanLikeDelay(2000, 3500);
+      await this.assertXProfileActionAllowed(page, { accountId });
       const editBtn =
         (await page.$('[data-testid="editProfileButton"]')) ||
         (await page.$('[aria-label="Edit profile"]'));
@@ -3298,6 +3516,7 @@ class PlaywrightService {
         await editBtn.click().catch(() => {});
         await this.humanLikeDelay(1500, 2500);
       }
+      await this.assertXProfileActionAllowed(page, { accountId });
       return page.$('input[type="file"][accept*="image"], input[type="file"], input[data-testid="fileInput"]');
     };
 
@@ -3343,14 +3562,16 @@ class PlaywrightService {
       await save.click().catch(() => {});
       await this.humanLikeDelay(2500, 4000);
     }
+    await this.assertXProfileActionAllowed(page, { accountId });
     await page.screenshot({ path: `/tmp/x-avatar-done-${accountId || 'x'}.png` }).catch(() => {});
-    console.log(`X persona ${tag}: avatar uploaded from ${photoPath}`);
-    return true;
+    console.log(`X persona ${tag}: avatar upload attempted from ${photoPath} (unverified)`);
+    return { photoAttempted: true };
   }
 
   /**
    * End-to-end: restore cookie session → apply x_persona fields (+ optional photo).
    * Never password-logs in.
+   * Never sets applied_live / photo_applied without live profile read-back verification.
    */
   async applyXPersonaLive(accountId, { photoPath = null, requireProxy = true } = {}) {
     if (process.env.X_PERSONA_LIVE !== '1') {
@@ -3391,28 +3612,46 @@ class PlaywrightService {
         username: account.username,
         photoPath,
       });
-      let photoOk = !!(personaResult && personaResult.photoOk);
+      const attempts = {
+        nameAttempted: !!(personaResult && personaResult.nameAttempted),
+        bioAttempted: !!(personaResult && personaResult.bioAttempted),
+        photoAttempted: !!(personaResult && personaResult.photoAttempted),
+      };
       // Fallback photo upload if setup flow skipped photo or classic modal had no file input
-      if (photoPath && !photoOk) {
+      if (photoPath && !attempts.photoAttempted) {
         try {
-          await this.updateXProfilePhoto(page, photoPath, {
+          const photoResult = await this.updateXProfilePhoto(page, photoPath, {
             accountId,
             username: account.username,
           });
-          photoOk = true;
+          attempts.photoAttempted = !!(photoResult && photoResult.photoAttempted);
         } catch (photoErr) {
-          console.warn(`X #${accountId} photo failed (text fields may still be saved): ${photoErr.message}`);
+          console.warn(`X #${accountId} photo upload attempt failed: ${photoErr.message}`);
         }
       }
+
+      const verification = await this.verifyXPersonaLive(page, persona, attempts, {
+        accountId,
+        username: account.username,
+      });
 
       await this.persistSession(page, 'x', accountId);
 
       const nextPersona = {
         ...persona,
-        applied_live: true,
-        applied_live_at: new Date().toISOString(),
-        photo_applied: photoOk,
+        applied_live: !!verification.appliedLive,
+        applied_live_at: verification.appliedLive ? new Date().toISOString() : null,
+        photo_applied: !!verification.photoApplied,
+        last_verify: {
+          at: new Date().toISOString(),
+          verified: verification.verified,
+          skipped: verification.skipped,
+          live_name: verification.live?.displayName || null,
+        },
       };
+      // Strip null applied_live_at noise
+      if (!nextPersona.applied_live) delete nextPersona.applied_live_at;
+
       await pool.query(
         `UPDATE social_accounts
          SET credentials = jsonb_set(COALESCE(credentials, '{}'::jsonb), '{x_persona}', $2::jsonb),
@@ -3424,20 +3663,29 @@ class PlaywrightService {
       await updateEnrichment(
         accountId,
         {
-          headline: true,
-          about: true,
-          photo: photoOk,
+          headline: !!verification.verified.display_name,
+          about: !!verification.verified.bio,
+          photo: !!verification.photoApplied,
           category: 'general',
         },
-        { source: 'x_persona_live' }
+        { source: verification.appliedLive ? 'x_persona_live' : 'x_persona_offline' }
       );
+
+      if (!verification.appliedLive) {
+        throw new Error(
+          'x_persona_verify_failed: no text fields verified after apply ' +
+            `(verified=${JSON.stringify(verification.verified)} skipped=[${verification.skipped.join(',')}])`
+        );
+      }
 
       return {
         success: true,
         accountId,
         username: account.username,
         display_name: persona.display_name,
-        photo: photoOk,
+        photo: !!verification.photoApplied,
+        verified: verification.verified,
+        skipped: verification.skipped,
       };
     } finally {
       if (browser) await browser.close().catch(() => {});
