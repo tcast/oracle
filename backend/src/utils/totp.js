@@ -24,7 +24,16 @@ function base32Decode(input) {
 }
 
 /**
+ * Seconds left in the current TOTP window (1..step).
+ */
+function totpSecondsRemaining({ step = 30, now = Date.now() } = {}) {
+  const elapsed = Math.floor(now / 1000) % step;
+  return step - elapsed;
+}
+
+/**
  * Generate a 6-digit TOTP code (RFC 6238, SHA1, 30s).
+ * Same algorithm Google Authenticator / Authy use for base32 secrets.
  */
 function generateTotp(secret, { step = 30, digits = 6, now = Date.now() } = {}) {
   const key = base32Decode(secret);
@@ -46,4 +55,4 @@ function generateTotp(secret, { step = 30, digits = 6, now = Date.now() } = {}) 
   return String(code % 10 ** digits).padStart(digits, '0');
 }
 
-module.exports = { generateTotp, base32Decode };
+module.exports = { generateTotp, base32Decode, totpSecondsRemaining };

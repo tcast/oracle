@@ -2,11 +2,15 @@
 /**
  * Import X (Twitter) accounts from AccsMarket-style dumps.
  *
- * Line format (---- outer, | inside the email/token block):
- *   username----password----email|email_password|auth_token|batch_uuid----totp_secret----ct0
+ * Supported line formats (---- outer):
+ *   A) AccsMarket cookies:
+ *      username----password----email|email_password|auth_token|batch_uuid----totp_secret----ct0
+ *   B) Password+TOTP (no live auth_token):
+ *      username----password----email----email_password----totp_secret----ct0
+ *      (email_password may be empty: email--------totp----ct0)
  *
- * Persists auth_token + ct0 into browser_sessions as .x.com cookies.
- * Reclaims proxies from pending_setup shells when available.
+ * Field 5 (1-based) is always the TOTP base32 secret in both formats.
+ * Persists auth_token + ct0 into browser_sessions only when auth_token looks like a real X cookie (M.…).
  *
  * Usage (in container):
  *   node src/scripts/import-x-accounts.js /app/private/x-accounts-order-206264.txt
@@ -27,63 +31,93 @@ function parseLine(line) {
   if (!raw || raw.startsWith('#')) return null;
 
   const dash = raw.split('----');
-  if (dash.length !== 5) {
-    throw new Error(`Expected 5 ---- fields, got ${dash.length}`);
-  }
+  let username;
+  let password;
+  let email;
+  let email_password;
+  let auth_token = null;
+  let batch_uuid = null;
+  let totp_secret;
+  let ct0;
 
-  const username = dash[0].trim();
-  const password = dash[1].trim();
-  const mid = dash[2].split('|');
-  if (mid.length !== 4) {
-    throw new Error(`Expected email|email_pass|auth_token|batch_uuid, got ${mid.length} pipe fields`);
+  if (dash.length === 5 && dash[2].includes('|')) {
+    // AccsMarket: username----password----email|email_pass|auth_token|batch----totp----ct0
+    username = dash[0].trim();
+    password = dash[1].trim();
+    const mid = dash[2].split('|');
+    if (mid.length !== 4) {
+      throw new Error(`Expected email|email_pass|auth_token|batch_uuid, got ${mid.length} pipe fields`);
+    }
+    email = mid[0].trim();
+    email_password = mid[1].trim();
+    auth_token = mid[2].trim();
+    batch_uuid = mid[3].trim();
+    totp_secret = dash[3].trim();
+    ct0 = dash[4].trim();
+  } else if (dash.length === 6) {
+    // Password+TOTP: username----password----email----email_pass----totp----ct0
+    username = dash[0].trim();
+    password = dash[1].trim();
+    email = dash[2].trim();
+    email_password = dash[3].trim();
+    totp_secret = dash[4].trim();
+    ct0 = dash[5].trim();
+    // Last field is ct0 (40-hex). Do NOT treat it as auth_token.
+  } else {
+    throw new Error(
+      `Unrecognized X dump format: expected 5 ---- fields (AccsMarket) or 6 (password+totp), got ${dash.length}`
+    );
   }
-
-  const email = mid[0].trim();
-  const email_password = mid[1].trim();
-  const auth_token = mid[2].trim();
-  const batch_uuid = mid[3].trim();
-  const totp_secret = dash[3].trim();
-  const ct0 = dash[4].trim();
 
   if (!username || !password) throw new Error('Missing username/password');
   if (!/@/.test(email)) throw new Error(`Invalid email: ${email}`);
-  if (!auth_token.startsWith('M.')) throw new Error('auth_token does not look like X cookie');
-  if (!/^[0-9a-f]{40}$/i.test(ct0)) throw new Error(`ct0 must be 40-hex, got len=${ct0.length}`);
+  if (auth_token && !auth_token.startsWith('M.')) {
+    throw new Error('auth_token does not look like X cookie (expected M.…)');
+  }
+  if (ct0 && !/^[0-9a-f]{40}$/i.test(ct0)) {
+    throw new Error(`ct0 must be 40-hex, got len=${ct0.length}`);
+  }
 
   const row = {
     username,
     password,
     email,
-    email_password,
-    auth_token,
-    batch_uuid,
+    email_password: email_password || null,
+    auth_token: auth_token || null,
+    batch_uuid: batch_uuid || null,
     totp_secret,
-    ct0,
+    ct0: ct0 || null,
   };
-  assertImportCredentials(row, { requireTotp: true, preferEmailAccess: true });
+  const gate = assertImportCredentials(row, { requireTotp: true, preferEmailAccess: true });
+  row.totp_secret = gate.totp_secret || row.totp_secret;
   return row;
 }
 
 function buildXCookies(authToken, ct0) {
   const base = { path: '/', secure: true };
-  return [
-    {
+  const cookies = [];
+  // Real X auth_token cookies start with "M." — never persist a ct0 hex as auth_token.
+  if (authToken && String(authToken).startsWith('M.')) {
+    cookies.push({
       ...base,
       name: 'auth_token',
       value: authToken,
       domain: '.x.com',
       httpOnly: true,
       sameSite: 'None',
-    },
-    {
+    });
+  }
+  if (ct0 && /^[0-9a-f]{40}$/i.test(ct0)) {
+    cookies.push({
       ...base,
       name: 'ct0',
       value: ct0,
       domain: '.x.com',
       httpOnly: false,
       sameSite: 'Lax',
-    },
-  ];
+    });
+  }
+  return cookies;
 }
 
 async function takeProxiesFromPendingShells(needed) {
@@ -118,13 +152,17 @@ async function upsertXAccount(row, proxyId) {
     email: row.email,
     email_password: row.email_password,
     totp_secret: row.totp_secret,
-    auth_token: row.auth_token,
-    ct0: row.ct0,
     batch_uuid: row.batch_uuid,
     source: 'manual_import',
     order: '206264',
-    has_cookies: true,
+    has_cookies: !!(row.auth_token && row.auth_token.startsWith('M.') && row.ct0),
   };
+  if (row.auth_token && row.auth_token.startsWith('M.')) {
+    credentials.auth_token = row.auth_token;
+  }
+  if (row.ct0) {
+    credentials.ct0 = row.ct0;
+  }
 
   const existing = await pool.query(
     `SELECT id FROM social_accounts
@@ -170,13 +208,24 @@ async function upsertXAccount(row, proxyId) {
   }
 
   const cookies = buildXCookies(row.auth_token, row.ct0);
-  await pool.query(
-    `INSERT INTO browser_sessions (account_id, platform, cookies, session_data, user_agent)
-     VALUES ($1, 'x', $2::jsonb, '{}'::jsonb, NULL)
-     ON CONFLICT (account_id, platform)
-     DO UPDATE SET cookies = $2::jsonb, updated_at = NOW()`,
-    [accountId, JSON.stringify(cookies)]
-  );
+  if (cookies.length) {
+    await pool.query(
+      `INSERT INTO browser_sessions (account_id, platform, cookies, session_data, user_agent)
+       VALUES ($1, 'x', $2::jsonb, '{}'::jsonb, NULL)
+       ON CONFLICT (account_id, platform)
+       DO UPDATE SET cookies = $2::jsonb, updated_at = NOW()`,
+      [accountId, JSON.stringify(cookies)]
+    );
+  } else {
+    // Password+TOTP dumps have no live session — clear any prior bogus cookies.
+    await pool.query(
+      `INSERT INTO browser_sessions (account_id, platform, cookies, session_data, user_agent)
+       VALUES ($1, 'x', '[]'::jsonb, '{}'::jsonb, NULL)
+       ON CONFLICT (account_id, platform)
+       DO UPDATE SET cookies = '[]'::jsonb, updated_at = NOW()`,
+      [accountId]
+    );
+  }
 
   return { accountId, cookieCount: cookies.length, username: row.username };
 }
