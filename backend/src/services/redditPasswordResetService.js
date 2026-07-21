@@ -677,19 +677,29 @@ class RedditPasswordResetService {
 
       const pollInbox = async (opts) => {
         if (emailInboxService.isMicrosoftAccount(inboxAccount)) {
-          // Give Reddit time to deliver before first Outlook scrape.
-          await new Promise((r) => setTimeout(r, opts.initialDelayMs || 45000));
+          // Give Reddit time to deliver before first Outlook scrape (and avoid OOM thrash).
+          await new Promise((r) => setTimeout(r, opts.initialDelayMs || 90000));
           const start = Date.now();
           let last = null;
           let attempt = 0;
-          while (Date.now() - start < (opts.timeoutMs || 420000)) {
+          const maxAttempts = opts.maxAttempts || 5;
+          while (attempt < maxAttempts && Date.now() - start < (opts.timeoutMs || 420000)) {
             const searchQuery = SEARCH_QUERIES[attempt % SEARCH_QUERIES.length];
             attempt += 1;
-            const messages = await emailInboxService.fetchViaOutlookWeb(inboxAccount, {
-              limit: opts.limit || 20,
-              searchQuery,
-              timeoutMs: 150000,
-            });
+            let messages = [];
+            try {
+              messages = await emailInboxService.fetchViaOutlookWeb(inboxAccount, {
+                limit: opts.limit || 20,
+                searchQuery,
+                timeoutMs: 180000,
+              });
+            } catch (scrapeErr) {
+              console.warn(
+                `Outlook reset scrape failed attempt ${attempt} for ${inboxAccount.email}: ${scrapeErr.message}`
+              );
+              await new Promise((r) => setTimeout(r, opts.intervalMs || 50000));
+              continue;
+            }
             last = emailInboxService.pickLatestFromMessages(messages, {
               fromIncludes: opts.fromIncludes || FROM_NEEDLES,
               subjectIncludes: opts.subjectIncludes || SUBJECT_NEEDLES,
@@ -701,9 +711,12 @@ class RedditPasswordResetService {
               const loose = emailInboxService.pickLatestFromMessages(messages, {
                 linkIncludes: 'reddit.com',
               });
-              if (loose.found && /password|reset|recover|change|account/i.test(
-                `${loose.message?.subject || ''} ${loose.message?.preview || ''} ${loose.link || ''}`
-              )) {
+              if (
+                loose.found &&
+                /password|reset|recover|change|account/i.test(
+                  `${loose.message?.subject || ''} ${loose.message?.preview || ''} ${loose.link || ''}`
+                )
+              ) {
                 last = loose;
               }
             }
@@ -711,7 +724,7 @@ class RedditPasswordResetService {
             console.warn(
               `Outlook reset poll attempt ${attempt} for ${inboxAccount.email}: scanned ${last?.scanned || 0} (query=${searchQuery})`
             );
-            await new Promise((r) => setTimeout(r, opts.intervalMs || 40000));
+            await new Promise((r) => setTimeout(r, opts.intervalMs || 50000));
           }
           throw new Error(
             `Verification email not received within ${opts.timeoutMs || 420000}ms` +
@@ -723,8 +736,9 @@ class RedditPasswordResetService {
 
       const verified = await pollInbox({
         timeoutMs: 420000,
-        intervalMs: 40000,
-        initialDelayMs: 45000,
+        intervalMs: 50000,
+        initialDelayMs: 90000,
+        maxAttempts: 5,
         fromIncludes: FROM_NEEDLES,
         subjectIncludes: SUBJECT_NEEDLES,
         linkIncludes: 'reddit.com',
