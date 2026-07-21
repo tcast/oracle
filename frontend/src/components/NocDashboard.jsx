@@ -27,11 +27,42 @@ const ago = (value) => {
 
 const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
 
-/** Project lon/lat (US-ish) into SVG viewBox coords */
+/** Lon/lat bounds must match the continental US outline below */
+const US_LON0 = -125;
+const US_LON1 = -66;
+const US_LAT0 = 24.5;
+const US_LAT1 = 49.5;
+
+/** Project lon/lat into SVG viewBox coords (continental US) */
 const projectUS = (lon, lat, w = 560, h = 340) => {
-  const x = ((lon + 125) / 60) * w;
-  const y = ((50 - lat) / 25) * h;
-  return { x: clamp(x, 8, w - 8), y: clamp(y, 8, h - 8) };
+  const x = ((lon - US_LON0) / (US_LON1 - US_LON0)) * w;
+  const y = ((US_LAT1 - lat) / (US_LAT1 - US_LAT0)) * h;
+  return { x: clamp(x, 4, w - 4), y: clamp(y, 4, h - 4) };
+};
+
+/** Simplified continental US ring (lon, lat) — same projection as projectUS */
+const US_OUTLINE = [
+  [-124.7, 48.4], [-123.0, 48.0], [-122.4, 47.3], [-122.8, 46.2], [-124.0, 46.3],
+  [-124.4, 43.0], [-124.2, 40.5], [-123.7, 39.0], [-122.5, 37.8], [-122.0, 36.6],
+  [-121.0, 35.4], [-120.5, 34.5], [-119.0, 34.0], [-117.2, 32.6], [-114.7, 32.7],
+  [-111.0, 31.4], [-108.2, 31.4], [-106.5, 31.8], [-104.9, 30.0], [-103.0, 29.0],
+  [-100.0, 28.0], [-97.2, 25.9], [-97.4, 27.6], [-94.0, 29.7], [-90.0, 29.2],
+  [-89.0, 30.2], [-88.0, 30.4], [-85.5, 30.0], [-84.0, 30.0], [-81.5, 28.5],
+  [-80.4, 25.2], [-80.1, 26.8], [-81.3, 31.0], [-80.8, 32.0], [-79.0, 33.2],
+  [-76.0, 35.2], [-75.5, 37.2], [-76.0, 38.0], [-75.0, 38.5], [-74.5, 39.2],
+  [-73.9, 40.6], [-72.0, 41.3], [-70.0, 41.7], [-69.9, 43.0], [-70.8, 43.1],
+  [-67.0, 44.8], [-66.9, 45.0], [-67.8, 47.1], [-69.2, 47.4], [-70.0, 45.9],
+  [-71.5, 45.0], [-74.7, 45.0], [-76.5, 44.0], [-79.2, 43.6], [-82.5, 41.7],
+  [-83.5, 42.0], [-84.5, 43.6], [-86.5, 45.4], [-87.5, 45.0], [-88.0, 46.0],
+  [-90.5, 46.8], [-92.0, 46.7], [-93.5, 48.6], [-95.2, 49.0], [-97.2, 49.0],
+  [-100.0, 49.0], [-104.0, 49.0], [-110.0, 49.0], [-116.0, 49.0], [-122.8, 49.0],
+  [-123.2, 48.2], [-124.7, 48.4],
+];
+
+const usOutlinePath = (w, h) => {
+  const pts = US_OUTLINE.map(([lon, lat]) => projectUS(lon, lat, w, h));
+  if (!pts.length) return '';
+  return pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ') + ' Z';
 };
 
 const STATUS_COLOR = {
@@ -228,35 +259,59 @@ const GeoMapPanel = ({ geo }) => {
   const nodes = geo?.nodes || [];
   const W = 560;
   const H = 340;
-
-  // Simplified continental US silhouette (approximate polygon)
-  const usPath =
-    'M 95,70 L 140,55 L 200,48 L 280,52 L 360,58 L 430,70 L 480,95 L 500,130 L 490,170 L 470,200 L 430,230 L 380,250 L 320,265 L 250,270 L 180,255 L 130,230 L 95,190 L 70,150 L 65,110 Z';
+  const landPath = useMemo(() => usOutlinePath(W, H), []);
 
   return (
     <div className="noc-panel h-full flex flex-col">
       <div className="noc-panel-head">
         <span>EGRESS MAP</span>
         <span className="text-[10px] text-slate-500 font-mono">
-          {nodes.length} nodes · approx US placement
+          {nodes.length} nodes · continental US
         </span>
       </div>
-      <div className="flex-1 relative min-h-[220px]">
-        <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-full absolute inset-0">
+      <div className="flex-1 relative min-h-[220px] bg-[#060b14]">
+        <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-full absolute inset-0" preserveAspectRatio="xMidYMid meet">
           <defs>
-            <radialGradient id="nocMapGlow" cx="50%" cy="50%" r="50%">
-              <stop offset="0%" stopColor="#22d3ee" stopOpacity="0.12" />
-              <stop offset="100%" stopColor="#0f172a" stopOpacity="0" />
+            <radialGradient id="nocMapGlow" cx="50%" cy="45%" r="55%">
+              <stop offset="0%" stopColor="#0ea5e9" stopOpacity="0.08" />
+              <stop offset="100%" stopColor="#060b14" stopOpacity="0" />
             </radialGradient>
+            <linearGradient id="nocLandFill" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#1e3a5f" />
+              <stop offset="100%" stopColor="#152a45" />
+            </linearGradient>
           </defs>
+          {/* ocean */}
+          <rect width={W} height={H} fill="#060b14" />
           <rect width={W} height={H} fill="url(#nocMapGlow)" />
-          <path d={usPath} fill="#132033" stroke="#1e3a5f" strokeWidth="1.5" />
-          {/* grid */}
-          {[80, 160, 240, 320].map((y) => (
-            <line key={y} x1="40" y1={y} x2={W - 40} y2={y} stroke="#1e293b" strokeWidth="0.5" strokeDasharray="2 4" />
-          ))}
+          {/* lon/lat grid */}
+          {[-120, -110, -100, -90, -80, -70].map((lon) => {
+            const { x } = projectUS(lon, 37, W, H);
+            return <line key={`v${lon}`} x1={x} y1={12} x2={x} y2={H - 12} stroke="#1e293b" strokeWidth="0.6" />;
+          })}
+          {[30, 35, 40, 45].map((lat) => {
+            const { y } = projectUS(-95, lat, W, H);
+            return <line key={`h${lat}`} x1={20} y1={y} x2={W - 20} y2={y} stroke="#1e293b" strokeWidth="0.6" />;
+          })}
+          {/* continental US landmass — must be visible behind dots */}
+          <path
+            d={landPath}
+            fill="url(#nocLandFill)"
+            stroke="#38bdf8"
+            strokeWidth="1.4"
+            strokeOpacity="0.55"
+            strokeLinejoin="round"
+          />
+          <path
+            d={landPath}
+            fill="none"
+            stroke="#94a3b8"
+            strokeWidth="0.4"
+            strokeOpacity="0.35"
+            strokeLinejoin="round"
+          />
 
-          {nodes.slice(0, 120).map((n) => {
+          {nodes.slice(0, 180).map((n) => {
             const { x, y } = projectUS(n.lon, n.lat, W, H);
             const color = STATUS_COLOR[n.status] || STATUS_COLOR.idle;
             const hot = n.status === 'healthy' && n.last_success_at &&
@@ -273,9 +328,11 @@ const GeoMapPanel = ({ geo }) => {
                   cy={y}
                   r={n.status === 'cooldown' || n.status === 'degraded' ? 3.5 : 2.2}
                   fill={color}
-                  opacity={0.9}
+                  opacity={0.95}
+                  stroke="#0b1220"
+                  strokeWidth="0.4"
                 >
-                  <title>{`${n.provider} #${n.id} · ${n.city} · ${n.status}${n.account_platform ? ` · ${n.account_platform}/${n.account_username}` : ''}`}</title>
+                  <title>{`${n.provider} #${n.id} · ${n.city || ''} · ${n.status}${n.account_platform ? ` · ${n.account_platform}/${n.account_username}` : ''}`}</title>
                 </circle>
               </g>
             );
