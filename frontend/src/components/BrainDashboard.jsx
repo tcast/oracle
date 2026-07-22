@@ -41,7 +41,7 @@ const emptySnapshot = () => ({
   in_flight: [],
   recent_events: [],
   pools: {},
-  stats_15m: { comments: 0, follows: 0, by_platform: { x: 0, reddit: 0 } },
+  stats_15m: { comments: 0, follows: 0, by_platform: { x: 0, reddit: 0, linkedin: 0 } },
   capacity: { alerts: [] },
   tick: null,
   tick_age_ms: null,
@@ -229,7 +229,8 @@ const BrainDashboard = () => {
   const byPlat = snap.tick?.by_platform || {};
   const xShare = byPlat.x || 0;
   const rShare = byPlat.reddit || 0;
-  const shareTotal = Math.max(1, xShare + rShare);
+  const liShare = byPlat.linkedin || 0;
+  const shareTotal = Math.max(1, xShare + rShare + liShare);
   const pools = snap.pools || {};
   const stats = snap.stats_15m || {};
   const alerts = snap.capacity?.alerts || [];
@@ -307,10 +308,19 @@ const BrainDashboard = () => {
                 style={{ width: `${(rShare / shareTotal) * 100}%` }}
                 title={`Reddit ${rShare}`}
               />
+              <div
+                className="brain-share-li"
+                style={{
+                  width: `${(liShare / shareTotal) * 100}%`,
+                  background: PLAT.linkedin.color,
+                }}
+                title={`LinkedIn ${liShare}`}
+              />
             </div>
             <div className="brain-share-legend">
               <span><i style={{ background: PLAT.x.accent }} /> X {xShare}</span>
               <span><i style={{ background: PLAT.reddit.color }} /> REDDIT {rShare}</span>
+              <span><i style={{ background: PLAT.linkedin.color }} /> LINKEDIN {liShare}</span>
             </div>
           </div>
 

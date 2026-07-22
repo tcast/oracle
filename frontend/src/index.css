@@ -503,6 +503,7 @@
 }
 .brain-share-x { background: #1d9bf0; transition: width 0.6s ease; }
 .brain-share-r { background: #ff4500; transition: width 0.6s ease; }
+.brain-share-li { background: #0a66c2; transition: width 0.6s ease; }
 .brain-share-legend {
   display: flex;
   justify-content: space-between;

@@ -657,11 +657,9 @@ Write only the comment text.`;
       let platformCommentId = null;
       let status = 'simulated';
       const platform = String(account.platform || 'reddit').toLowerCase();
-      // X cookies are fragile / rate-limited — never password-submit from organic.
-      // LinkedIn/IG: prefer session; allow password only for linkedin/instagram when needed.
-      const allowLogin = platform === 'reddit' || platform === 'linkedin' || platform === 'instagram';
 
       if (!dryRun) {
+        // LinkedIn organic is cookie-session only — never password/captcha during ticks.
         if (platform !== 'linkedin') {
           await playwrightService.requireProxyForLive(account.id);
         }
@@ -673,7 +671,7 @@ Write only the comment text.`;
           null,
           {
             requireProxy: platform !== 'linkedin',
-            allowLogin: platform === 'x' || platform === 'twitter' ? false : allowLogin,
+            allowLogin: platform === 'reddit',
           }
         );
         status = 'posted';
@@ -730,7 +728,7 @@ Write only the comment text.`;
       // "...threads", "...LinkedIn posts", "...Instagram posts") plus transient
       // browser teardown under concurrent organic ticks.
       if (
-        /No commentable|gate_failed|duplicate key|has been closed|Target closed|browser.*closed/i.test(
+        /No commentable|gate_failed|duplicate key|has been closed|Target closed|browser.*closed|Comment submit failed/i.test(
           msg
         ) &&
         !/no_live_session|session_not_logged_in|cookie_session_dead/i.test(msg)

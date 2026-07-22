@@ -5984,58 +5984,103 @@ class PlaywrightService {
       const account = await this.getAccount(accountId);
       const creds = account.credentials || {};
       const loginId = account.email || account.username;
-      const opened = await this.createBrowserForAccount(accountId, 2, { skipProxy: true });
-      browser = opened.browser;
-      const page = opened.page;
-      const loggedIn = await this.ensureLoggedIn(
-        page,
-        'linkedin',
-        accountId,
-        loginId,
-        creds.password,
+      const extras = {
+        allowLogin: false,
+        totpSecret: creds.totp_secret || creds.totp || creds.twofa,
+      };
+
+      // Same dual-mode as feed: direct first (LI sticky proxies often authwall cookies), then proxy.
+      const modes = [
         {
-          allowLogin: false,
-          totpSecret: creds.totp_secret || creds.totp || creds.twofa,
+          label: 'direct',
+          open: async () => {
+            const direct = await this.createBrowser(
+              null,
+              false,
+              await this.getOrCreateDeviceProfile(accountId, { forceDesktop: true })
+            );
+            direct.accountId = accountId;
+            this._trackBrowser(accountId, direct.browser);
+            return direct;
+          },
+        },
+        {
+          label: 'proxy',
+          open: async () => {
+            await this.requireProxyForLive(accountId);
+            return this.createBrowserForAccount(accountId, 2, { requireProxy: true });
+          },
+        },
+      ];
+
+      let lastErr;
+      let posts = [];
+      for (const mode of modes) {
+        try {
+          if (browser) {
+            await browser.close().catch(() => {});
+            this._untrackBrowser(accountId);
+            browser = null;
+          }
+          const opened = await mode.open();
+          browser = opened.browser;
+          const page = opened.page;
+          const loggedIn = await this.ensureLoggedIn(
+            page,
+            'linkedin',
+            accountId,
+            loginId,
+            creds.password,
+            extras
+          );
+          if (!loggedIn) {
+            lastErr = new Error(`LinkedIn session not alive for search (${mode.label})`);
+            continue;
+          }
+
+          const url = `https://www.linkedin.com/search/results/content/?keywords=${encodeURIComponent(query)}&origin=SWITCH_SEARCH_VERTICAL`;
+          await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+          await this.humanLikeDelay(2500, 4000);
+          await this.dismissLinkedInModals(page);
+          await this.randomScroll(page).catch(() => {});
+
+          posts = await page.evaluate((max) => {
+            const out = [];
+            const seen = new Set();
+            for (const a of document.querySelectorAll(
+              'a[href*="/feed/update/"], a[href*="activity-"], a[href*="/posts/"]'
+            )) {
+              let href = (a.href || '').split('?')[0].replace(/\/$/, '');
+              if (!href || seen.has(href)) continue;
+              if (/\/company\/[^/]+\/posts\/?$/i.test(href)) continue;
+              if (!/feed\/update|activity-|\/posts\/.+activity/i.test(href)) continue;
+              seen.add(href);
+              const card = a.closest('li') || a.closest('div');
+              const title = ((card && card.innerText) || a.innerText || '')
+                .replace(/\s+/g, ' ')
+                .trim()
+                .slice(0, 160);
+              out.push({
+                post_url: href,
+                title,
+                selftext: title.slice(0, 400),
+                subreddit: 'linkedin:search',
+                score: 0,
+                num_comments: 0,
+              });
+              if (out.length >= max) break;
+            }
+            return out;
+          }, limit);
+          await this.persistSession(page, 'linkedin', accountId).catch(() => {});
+          if (posts.length) return posts;
+        } catch (err) {
+          lastErr = err;
+          console.warn(`LinkedIn search discovery via ${mode.label}:`, err.message);
         }
-      );
-      if (!loggedIn) throw new Error('LinkedIn session not alive for search discovery');
-
-      const url = `https://www.linkedin.com/search/results/content/?keywords=${encodeURIComponent(query)}&origin=SWITCH_SEARCH_VERTICAL`;
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
-      await this.humanLikeDelay(2500, 4000);
-      await this.dismissLinkedInModals(page);
-      await this.randomScroll(page).catch(() => {});
-
-      const posts = await page.evaluate((max) => {
-        const out = [];
-        const seen = new Set();
-        for (const a of document.querySelectorAll(
-          'a[href*="/feed/update/"], a[href*="activity-"], a[href*="/posts/"]'
-        )) {
-          let href = (a.href || '').split('?')[0].replace(/\/$/, '');
-          if (!href || seen.has(href)) continue;
-          if (/\/company\/[^/]+\/posts\/?$/i.test(href)) continue;
-          if (!/feed\/update|activity-|\/posts\/.+activity/i.test(href)) continue;
-          seen.add(href);
-          const card = a.closest('li') || a.closest('div');
-          const title = ((card && card.innerText) || a.innerText || '')
-            .replace(/\s+/g, ' ')
-            .trim()
-            .slice(0, 160);
-          out.push({
-            post_url: href,
-            title,
-            selftext: title.slice(0, 400),
-            subreddit: 'linkedin:search',
-            score: 0,
-            num_comments: 0,
-          });
-          if (out.length >= max) break;
-        }
-        return out;
-      }, limit);
-
-      return posts;
+      }
+      if (posts.length) return posts;
+      throw lastErr || new Error('LinkedIn search discovery failed');
     } finally {
       if (browser) await browser.close().catch(() => {});
       this._untrackBrowser(accountId);
@@ -6053,36 +6098,68 @@ class PlaywrightService {
       await this.dismissLinkedInModals(page);
       await this.simulateHumanBehavior(page);
 
-      const commentBtn = await page.$('button[aria-label*="Comment"], button.comment-button, button[aria-label*="comment"]');
-      if (commentBtn) {
-        await commentBtn.click({ timeout: 10000 }).catch(async () => {
-          await this.dismissLinkedInModals(page);
-          await commentBtn.click({ force: true }).catch(() => {});
+      // Open comment box if collapsed
+      const opened = await page.evaluate(() => {
+        const buttons = [...document.querySelectorAll('button, [role="button"]')];
+        const commentBtn = buttons.find((b) => {
+          const t = `${b.innerText || ''} ${b.getAttribute('aria-label') || ''}`.toLowerCase();
+          return /\bcomment\b/.test(t) && !/comments?\s+\d/i.test(t);
         });
-        await this.humanLikeDelay(1000, 2000);
-      }
+        if (commentBtn) {
+          commentBtn.click();
+          return true;
+        }
+        return false;
+      });
+      if (opened) await this.humanLikeDelay(800, 1600);
 
-      const editor = await page.waitForSelector('.ql-editor, div[role="textbox"]', { timeout: 15000 });
-      const eBox = await editor.boundingBox();
-      if (eBox) {
-        await this.simulateMouseMovement(page, 0, 0, eBox.x + eBox.width / 2, eBox.y + eBox.height / 2);
-      }
-
-      await editor.click({ force: true }).catch(() => {});
-      await this.humanLikeTyping(page, '.ql-editor, div[role="textbox"]', comment);
-      await this.humanLikeDelay(500, 1500);
-
-      const postCommentBtn = await page.$(
-        'button.comments-comment-box__submit-button, button:has-text("Post"), button[aria-label="Post comment"]'
+      const editor = await page.waitForSelector(
+        '.comments-comment-box .ql-editor, .comments-comment-box div[role="textbox"], form.comments-comment-box__form .ql-editor, .ql-editor[contenteditable="true"], div[role="textbox"][contenteditable="true"]',
+        { timeout: 15000 }
       );
-      if (postCommentBtn) {
-        await postCommentBtn.click({ force: true });
+      await editor.click({ force: true });
+      await this.humanLikeDelay(300, 600);
+      // Quill needs real keyboard events (same as createLinkedInPost) to enable Post.
+      await page.keyboard.type(String(comment || ''), { delay: 25 });
+      await this.humanLikeDelay(800, 1600);
+
+      const posted = await page.evaluate(() => {
+        const buttons = [...document.querySelectorAll('button')];
+        const candidates = buttons.filter((b) => {
+          const label = `${(b.innerText || '').trim()} ${b.getAttribute('aria-label') || ''}`.trim();
+          const isPost =
+            /^Post$/i.test((b.innerText || '').trim()) ||
+            /post comment/i.test(label) ||
+            /comments-comment-box__submit-button/.test(b.className || '');
+          return isPost && !b.disabled && b.offsetParent !== null;
+        });
+        const inBox = candidates.find((b) =>
+          b.closest('.comments-comment-box, form.comments-comment-box__form, .comments-comment-texteditor')
+        );
+        const btn = inBox || candidates[candidates.length - 1] || null;
+        if (!btn) return false;
+        btn.click();
+        return true;
+      });
+      if (!posted) {
+        // LinkedIn comment box accepts Ctrl+Enter
+        await page.keyboard.press('Control+Enter');
+        await this.humanLikeDelay(1500, 2500);
+      } else {
         await this.humanLikeDelay(2000, 4000);
-        return `li-${Date.now()}`;
       }
+
+      const snippet = String(comment || '').slice(0, 40);
+      const visible = snippet
+        ? await page.evaluate((s) => document.body && document.body.innerText.includes(s), snippet)
+        : false;
+      if (posted || visible) return `li-${Date.now()}`;
+
+      await page.screenshot({ path: `/tmp/linkedin-comment-fail-${Date.now()}.png` }).catch(() => {});
       return false;
     } catch (error) {
       console.error('Error posting LinkedIn comment:', error);
+      await page.screenshot({ path: `/tmp/linkedin-comment-err-${Date.now()}.png` }).catch(() => {});
       return false;
     }
   }

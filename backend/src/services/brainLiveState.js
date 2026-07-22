@@ -31,7 +31,7 @@ class BrainLiveState extends EventEmitter {
     this.stats15m = {
       comments: 0,
       follows: 0,
-      by_platform: { x: 0, reddit: 0 },
+      by_platform: { x: 0, reddit: 0, linkedin: 0 },
       refreshed_at: null,
     };
     this.capacity = { alerts: [], computed_at: null, stats: {} };
