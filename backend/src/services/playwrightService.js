@@ -4082,7 +4082,7 @@ class PlaywrightService {
    * Click banner OR avatar media control and set files via filechooser (preferred)
    * or a label-classified file input. Never cross-wires avatar ↔ banner.
    */
-  async _setXProfileMediaFiles(page, kind, filePath, { accountId } = {}) {
+  async _setXProfileMediaFiles(page, kind, filePath, { accountId, saveProfile = true } = {}) {
     const wantBanner = kind === 'banner';
     const btnSelectors = wantBanner
       ? [
@@ -4149,7 +4149,9 @@ class PlaywrightService {
     }
 
     await this.humanLikeDelay(2500, 4000);
-    await this._applyXMediaCropAndSave(page);
+    await this._applyXMediaCropAndSave(page, {
+      saveProfile: options.saveProfile !== false,
+    });
     await this.assertXProfileActionAllowed(page, { accountId });
   }
 
@@ -4244,7 +4246,7 @@ class PlaywrightService {
     return fileInput;
   }
 
-  async _applyXMediaCropAndSave(page) {
+  async _applyXMediaCropAndSave(page, { saveProfile = true } = {}) {
     const apply =
       (await page.$('[data-testid="applyButton"]')) ||
       (await page.locator('button:has-text("Apply")').first().elementHandle().catch(() => null));
@@ -4252,6 +4254,7 @@ class PlaywrightService {
       await apply.click().catch(() => {});
       await this.humanLikeDelay(1500, 2500);
     }
+    if (!saveProfile) return;
     const save =
       (await page.$('[data-testid="settingsDetailSave"]')) ||
       (await page.$('[data-testid="Profile_Save_Button"]')) ||
@@ -4262,12 +4265,12 @@ class PlaywrightService {
     }
   }
 
-  async _setXBannerInputFiles(page, bannerPath, { accountId } = {}) {
-    await this._setXProfileMediaFiles(page, 'banner', bannerPath, { accountId });
+  async _setXBannerInputFiles(page, bannerPath, { accountId, saveProfile = true } = {}) {
+    await this._setXProfileMediaFiles(page, 'banner', bannerPath, { accountId, saveProfile });
   }
 
-  async _setXAvatarInputFiles(page, photoPath, { accountId } = {}) {
-    await this._setXProfileMediaFiles(page, 'avatar', photoPath, { accountId });
+  async _setXAvatarInputFiles(page, photoPath, { accountId, saveProfile = true } = {}) {
+    await this._setXProfileMediaFiles(page, 'avatar', photoPath, { accountId, saveProfile });
   }
 
   /**
@@ -4524,7 +4527,7 @@ class PlaywrightService {
 
   /**
    * Restore avatar (portrait) then set scenic banner — cookie session only.
-   * Use after a bad run that wrote banner assets onto avatars.
+   * Opens Edit profile once and applies both media controls in the same modal.
    */
   async applyXAvatarAndBannerLive(
     accountId,
@@ -4569,16 +4572,37 @@ class PlaywrightService {
       await this.humanBrowseXSession(page, { accountId });
       await this.assertXProfileActionAllowed(page, { accountId });
 
-      // 1) Restore face avatar first
-      await this.updateXProfilePhoto(page, photoPath, {
-        accountId,
-        username: account.username,
-      });
-      // 2) Then scenic banner via banner control only
-      await this.updateXProfileBanner(page, bannerPath, {
-        accountId,
-        username: account.username,
-      });
+      // Open Edit profile once
+      await page
+        .goto(`https://x.com/${account.username}`, {
+          waitUntil: 'domcontentloaded',
+          timeout: 60000,
+        })
+        .catch(() => {});
+      await this.humanLikeDelay(2000, 3500);
+      await this.assertXProfileActionAllowed(page, { accountId });
+      const editBtn =
+        (await page.$('[data-testid="editProfileButton"]')) ||
+        (await page.$('[aria-label="Edit profile"]'));
+      if (!editBtn) throw new Error('Edit profile button not found');
+      await editBtn.click().catch(() => {});
+      await this.humanLikeDelay(1500, 2500);
+      await this.assertXProfileActionAllowed(page, { accountId });
+
+      console.log(`X #${accountId}: restoring avatar from ${require('path').basename(photoPath)}`);
+      await this._setXAvatarInputFiles(page, photoPath, { accountId, saveProfile: false });
+      console.log(`X #${accountId}: setting scenic banner from ${require('path').basename(bannerPath)}`);
+      await this._setXBannerInputFiles(page, bannerPath, { accountId, saveProfile: false });
+
+      // Final Save if still open
+      const save =
+        (await page.$('[data-testid="settingsDetailSave"]')) ||
+        (await page.$('[data-testid="Profile_Save_Button"]')) ||
+        (await page.locator('[role="dialog"] button:has-text("Save")').first().elementHandle().catch(() => null));
+      if (save) {
+        await save.click().catch(() => {});
+        await this.humanLikeDelay(2500, 4000);
+      }
 
       const live = await this.readXLiveProfile(page, {
         accountId,
@@ -4593,11 +4617,12 @@ class PlaywrightService {
         );
       }
 
-      // Proof screenshots (profile header shows both)
-      await page.goto(`https://x.com/${account.username}`, {
-        waitUntil: 'domcontentloaded',
-        timeout: 60000,
-      }).catch(() => {});
+      await page
+        .goto(`https://x.com/${account.username}`, {
+          waitUntil: 'domcontentloaded',
+          timeout: 60000,
+        })
+        .catch(() => {});
       await this.humanLikeDelay(2000, 3500);
       await page
         .screenshot({ path: `/tmp/x-media-proof-${accountId}.png`, fullPage: false })
