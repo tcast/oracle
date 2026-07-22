@@ -829,6 +829,14 @@ class PlaywrightService {
     // One more idle wander on feed
     await this.simulateHumanBehavior(page);
     await this.humanLikeDelay(1500, 3500);
+    // Tweet open/goBack or tunnel flaps can leave about:blank — recover before callers.
+    if (!/x\.com|twitter\.com/i.test(page.url() || '')) {
+      console.warn(`X ${tag}: browse left blank — recovering to home`);
+      await page
+        .goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 60000 })
+        .catch(() => {});
+      await this.humanLikeDelay(1500, 2500);
+    }
     console.log(`X ${tag}: human browse done (url=${page.url()})`);
   }
 
@@ -3785,21 +3793,26 @@ class PlaywrightService {
     const tag = accountId ? `#${accountId}` : '';
 
     // Transient "Oops" modal — dismiss once and re-check (not a ban)
+    // IMPORTANT: locator.elementHandle() waits default 30s when absent — always pass a short timeout.
     const dismissOops = async () => {
       const oops = await page
         .locator('[role="dialog"]')
         .filter({ hasText: /Oops,\s*something went wrong/i })
         .first()
-        .elementHandle()
+        .elementHandle({ timeout: 1200 })
         .catch(() => null);
       if (!oops) return false;
       const ok =
         (await page
           .locator('[role="dialog"] button:has-text("OK"), [role="dialog"] [role="button"]:has-text("OK")')
           .first()
-          .elementHandle()
+          .elementHandle({ timeout: 1500 })
           .catch(() => null)) ||
-        (await page.locator('button:has-text("OK")').first().elementHandle().catch(() => null));
+        (await page
+          .locator('button:has-text("OK")')
+          .first()
+          .elementHandle({ timeout: 1500 })
+          .catch(() => null));
       if (ok) {
         await ok.click().catch(() => {});
         await this.humanLikeDelay(1200, 2200);
@@ -4315,7 +4328,7 @@ class PlaywrightService {
         const el = await page
           .locator(`button:has-text("${label}"), [role="button"]:has-text("${label}")`)
           .first()
-          .elementHandle()
+          .elementHandle({ timeout: 1500 })
           .catch(() => null);
         if (!el) continue;
         const visible = await el.isVisible().catch(() => false);
@@ -4332,7 +4345,11 @@ class PlaywrightService {
       const next =
         (await page.$('[data-testid="ocfEnterTextNextButton"]')) ||
         (await page.$('[data-testid="ocfSettingsListNextButton"]')) ||
-        (await page.locator('[role="dialog"] button:has-text("Next")').first().elementHandle().catch(() => null));
+        (await page
+          .locator('[role="dialog"] button:has-text("Next")')
+          .first()
+          .elementHandle({ timeout: 1500 })
+          .catch(() => null));
       if (next) {
         await next.click().catch(() => {});
         await this.humanLikeDelay(1800, 3000);
@@ -4361,13 +4378,16 @@ class PlaywrightService {
       await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 60000 });
       await this.humanLikeDelay(2000, 3500);
     }
+    if (!/x\.com|twitter\.com/i.test(page.url() || '')) {
+      throw new Error('proxy_error: cannot open profile — page still blank');
+    }
     await this.randomMouseMove(page);
     await this.humanLikeDelay(800, 1600);
     const profileLink =
       (await page.$('[data-testid="AppTabBar_Profile_Link"]')) ||
       (await page.locator('a[aria-label="Profile"]').first().elementHandle().catch(() => null));
     if (!profileLink) {
-      await page.waitForSelector('[data-testid="AppTabBar_Profile_Link"]', { timeout: 30000 });
+      await page.waitForSelector('[data-testid="AppTabBar_Profile_Link"]', { timeout: 20000 });
     }
     const profileEl = profileLink || (await page.$('[data-testid="AppTabBar_Profile_Link"]'));
     if (!profileEl) throw new Error('X Profile sidebar link not found');
@@ -4382,7 +4402,7 @@ class PlaywrightService {
     let editBtn = null;
     for (let attempt = 1; attempt <= 3; attempt++) {
       await page
-        .waitForSelector(editBtnSel, { timeout: attempt === 1 ? 45000 : 25000 })
+        .waitForSelector(editBtnSel, { timeout: attempt === 1 ? 30000 : 18000 })
         .catch(() => null);
       editBtn =
         (await page.$(editBtnSel)) ||
@@ -4391,14 +4411,14 @@ class PlaywrightService {
             'button:has-text("Set up profile"), button:has-text("Edit profile"), [role="button"]:has-text("Set up profile"), [role="button"]:has-text("Edit profile")'
           )
           .first()
-          .elementHandle()
+          .elementHandle({ timeout: 2000 })
           .catch(() => null)) ||
         (await page
           .locator(
             'button:has-text("Complete your profile"), a:has-text("Complete your profile"), [role="button"]:has-text("Complete your profile")'
           )
           .first()
-          .elementHandle()
+          .elementHandle({ timeout: 2000 })
           .catch(() => null));
       if (editBtn) break;
 
@@ -4716,9 +4736,11 @@ class PlaywrightService {
       'website'
     );
 
+    // saveProfile:false — crop Apply only; one Profile Save at end (mid-edit Save closes modal).
     if (photoPath && fs.existsSync(photoPath)) {
       try {
-        await this._setXAvatarInputFiles(page, photoPath, { accountId });
+        console.log(`X persona ${tag}: uploading avatar (defer profile Save)`);
+        await this._setXAvatarInputFiles(page, photoPath, { accountId, saveProfile: false });
         photoAttempted = true;
       } catch (photoErr) {
         console.warn(`X persona ${tag}: avatar upload skipped — ${photoErr.message}`);
@@ -4728,7 +4750,8 @@ class PlaywrightService {
     // Banner / header — MUST use banner/header control only (never avatar file input)
     if (bannerPath && fs.existsSync(bannerPath)) {
       try {
-        await this._setXBannerInputFiles(page, bannerPath, { accountId });
+        console.log(`X persona ${tag}: uploading banner (defer profile Save)`);
+        await this._setXBannerInputFiles(page, bannerPath, { accountId, saveProfile: false });
         bannerAttempted = true;
       } catch (bannerErr) {
         console.warn(`X persona ${tag}: banner upload skipped — ${bannerErr.message}`);
@@ -4738,10 +4761,15 @@ class PlaywrightService {
     await page.screenshot({ path: `/tmp/x-persona-presave-${accountId || 'x'}.png` }).catch(() => {});
     await this.humanLikeDelay(1200, 2500);
     await this.randomMouseMove(page);
+    console.log(`X persona ${tag}: looking for profile Save`);
     let save =
       (await page.$('[data-testid="settingsDetailSave"]')) ||
       (await page.$('[data-testid="Profile_Save_Button"]')) ||
-      (await page.locator('[role="dialog"] button:has-text("Save")').first().elementHandle().catch(() => null));
+      (await page
+        .locator('[role="dialog"] button:has-text("Save")')
+        .first()
+        .elementHandle({ timeout: 2000 })
+        .catch(() => null));
     if (!save) {
       const viaEval = await page.evaluateHandle(() => {
         const buttons = [...document.querySelectorAll('button, [role="button"]')];
@@ -4951,7 +4979,11 @@ class PlaywrightService {
   async _applyXMediaCropAndSave(page, { saveProfile = true } = {}) {
     const apply =
       (await page.$('[data-testid="applyButton"]')) ||
-      (await page.locator('button:has-text("Apply")').first().elementHandle().catch(() => null));
+      (await page
+        .locator('button:has-text("Apply")')
+        .first()
+        .elementHandle({ timeout: 1500 })
+        .catch(() => null));
     if (apply) {
       await apply.click().catch(() => {});
       await this.humanLikeDelay(1500, 2500);
@@ -4960,7 +4992,11 @@ class PlaywrightService {
     const save =
       (await page.$('[data-testid="settingsDetailSave"]')) ||
       (await page.$('[data-testid="Profile_Save_Button"]')) ||
-      (await page.locator('button:has-text("Save")').first().elementHandle().catch(() => null));
+      (await page
+        .locator('button:has-text("Save")')
+        .first()
+        .elementHandle({ timeout: 1500 })
+        .catch(() => null));
     if (save) {
       await save.click().catch(() => {});
       await this.humanLikeDelay(2500, 4000);
@@ -5650,6 +5686,17 @@ class PlaywrightService {
 
       // Act like a person: feed first, then ban check, then profile edit.
       await this.humanBrowseXSession(page, { accountId });
+      // Tunnel/browse can leave about:blank — recover before profile edits.
+      if (!/x\.com|twitter\.com/i.test(page.url() || '')) {
+        console.warn(`X #${accountId}: post-browse blank — recovering to home`);
+        await page
+          .goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 60000 })
+          .catch(() => {});
+        await this.humanLikeDelay(2000, 3500);
+      }
+      if (!/x\.com|twitter\.com/i.test(page.url() || '')) {
+        throw new Error('proxy_error: still about:blank after browse recovery');
+      }
       await this.assertXProfileActionAllowed(page, { accountId });
 
       const personaResult = await this.updateXPersona(page, persona, {
