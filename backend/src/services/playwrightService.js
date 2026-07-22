@@ -5507,7 +5507,7 @@ class PlaywrightService {
 
   /** Shared timeline scrape from whatever X page is loaded (home / search / explore). */
   async xScrapeTimelinePosts(page, { limit = 10, source = 'x:timeline' } = {}) {
-    return page.evaluate((max, src) => {
+    return page.evaluate(({ max, src }) => {
       const out = [];
       const seen = new Set();
       for (const a of document.querySelectorAll('a[href*="/status/"]')) {
@@ -5532,7 +5532,7 @@ class PlaywrightService {
         if (out.length >= max) break;
       }
       return out;
-    }, limit, source);
+    }, { max: limit, src: source });
   }
 
   /**
@@ -5569,23 +5569,21 @@ class PlaywrightService {
     return page.evaluate((max) => {
       const out = [];
       const seen = new Set();
-      const candidates = [
-        ...document.querySelectorAll('[data-testid="UserCell"] a[href^="/"]'),
-        ...document.querySelectorAll('a[href^="/"][role="link"]'),
-      ];
-      for (const a of candidates) {
+      const junk = /^(home|explore|search|settings|messages|notifications|i|compose|login|signup|tos|privacy|people|verified|premium|jobs|lists|communities|grok|technology|business|sports)$/i;
+      // Prefer UserCell only — bare role=link picks up nav/topic chips as fake handles
+      const cells = document.querySelectorAll('[data-testid="UserCell"]');
+      for (const cell of cells) {
+        const a = cell.querySelector('a[href^="/"]');
+        if (!a) continue;
         const href = (a.getAttribute('href') || '').split('?')[0];
         const m = href.match(/^\/([A-Za-z0-9_]{1,15})$/);
         if (!m) continue;
         const handle = m[1];
-        if (/^(home|explore|search|settings|messages|notifications|i|compose|login|signup|tos|privacy)$/i.test(handle)) {
-          continue;
-        }
+        if (junk.test(handle)) continue;
         const key = handle.toLowerCase();
         if (seen.has(key)) continue;
         seen.add(key);
-        const cell = a.closest('[data-testid="UserCell"]') || a.closest('div');
-        const blurb = ((cell && cell.innerText) || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+        const blurb = (cell.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 120);
         out.push({ handle, profile_url: `https://x.com/${handle}`, blurb });
         if (out.length >= max) break;
       }
@@ -5662,7 +5660,7 @@ class PlaywrightService {
     await this.randomScroll(page).catch(() => {});
     await this.humanLikeDelay(700, 1400);
 
-    return page.evaluate((max, seedLower) => {
+    return page.evaluate(({ max, seedLower }) => {
       const out = [];
       const seen = new Set([seedLower]);
       for (const a of document.querySelectorAll('[data-testid="UserCell"] a[href^="/"], a[href^="/"][role="link"]')) {
@@ -5683,7 +5681,7 @@ class PlaywrightService {
         if (out.length >= max) break;
       }
       return out;
-    }, limit, seed.toLowerCase());
+    }, { max: limit, seedLower: seed.toLowerCase() });
   }
 
   /**

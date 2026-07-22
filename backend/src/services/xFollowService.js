@@ -253,10 +253,18 @@ class XFollowService {
   }
 
   async insertDiscoveredTargets(targets, { category = 'discovered', priority = 80 } = {}) {
+    const junk = new Set([
+      'home', 'explore', 'search', 'settings', 'messages', 'notifications', 'i',
+      'compose', 'login', 'signup', 'tos', 'privacy', 'following', 'followers',
+      'technology', 'business', 'sports', 'finance', 'science', 'gaming', 'education',
+      'people', 'verified', 'premium', 'jobs', 'lists', 'communities', 'grok',
+    ]);
     let inserted = 0;
     for (const t of targets || []) {
       const handle = String(t.handle || '').replace(/^@/, '').trim();
-      if (!handle || handle.length > 15) continue;
+      if (!handle || handle.length < 2 || handle.length > 15) continue;
+      if (junk.has(handle.toLowerCase())) continue;
+      if (!/^[A-Za-z0-9_]+$/.test(handle)) continue;
       const cat = String(t.category || category).slice(0, 50);
       const notes = t.source ? `source=${t.source}` : null;
       const result = await pool.query(
