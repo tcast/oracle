@@ -1039,7 +1039,19 @@ class AccountOpsBrainService {
       const msg = err?.message || String(err);
       if (/no_live_session|session_not_logged_in|cookie_session_dead/i.test(msg)) {
         try {
-          await organicCommentService.markDeadSessionAccount(account.id, `ops_brain: ${msg}`);
+          // LinkedIn owned accounts with passwords: cookie expiry is recoverable via
+          // password+TOTP login. Do not terminal-kill them the way we do for X.
+          const revivable = await organicCommentService.isRevivableLinkedInSessionLoss(
+            account.id,
+            msg
+          );
+          if (revivable) {
+            console.warn(
+              `Brain soft-skip LinkedIn session loss for ${account.id} (password present) — ${msg.slice(0, 120)}`
+            );
+          } else {
+            await organicCommentService.markDeadSessionAccount(account.id, `ops_brain: ${msg}`);
+          }
         } catch (e) {
           console.warn('Brain markDeadSession failed:', e.message);
         }

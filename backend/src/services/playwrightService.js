@@ -3259,7 +3259,8 @@ class PlaywrightService {
   async followLinkedInTarget(accountId, handle, {
     targetType = 'person',
     requireProxy = false,
-    allowLogin = false,
+    // Owned LinkedIn accounts carry passwords — cookie-first, password fallback.
+    allowLogin = true,
   } = {}) {
     const slug = String(handle || '')
       .replace(/^@/, '')
@@ -3431,7 +3432,7 @@ class PlaywrightService {
       const page = opened.page;
 
       const loggedIn = await this.ensureLoggedIn(page, 'linkedin', accountId, loginId, creds.password, {
-        allowLogin: false,
+        allowLogin: true,
         totpSecret: creds.totp_secret || creds.totp || creds.twofa,
       });
       if (!loggedIn) throw new Error('no_live_session for linkedin accept');
@@ -3497,7 +3498,7 @@ class PlaywrightService {
       const page = opened.page;
 
       const loggedIn = await this.ensureLoggedIn(page, 'linkedin', accountId, loginId, creds.password, {
-        allowLogin: false,
+        allowLogin: true,
         totpSecret: creds.totp_secret || creds.totp || creds.twofa,
       });
       if (!loggedIn) throw new Error('no_live_session for linkedin discover');
