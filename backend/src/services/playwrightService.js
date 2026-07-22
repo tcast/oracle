@@ -4216,10 +4216,56 @@ class PlaywrightService {
   }
 
   /**
-   * Rename X @handle via settings/screen_name (cookie session only, no password).
+   * Confirm password when X asks after username Save.
+   * One-shot password use for settings rename only — never for organic browsing.
+   */
+  async confirmXPasswordIfPrompted(page, password, { accountId } = {}) {
+    const tag = accountId ? `#${accountId}` : '';
+    if (!password || !String(password).trim()) {
+      return { confirmed: false, reason: 'no_password' };
+    }
+    const pwInput =
+      (await page.$('input[name="password"], input[type="password"], input[autocomplete="current-password"]')) ||
+      (await page
+        .locator('input[type="password"]')
+        .first()
+        .elementHandle()
+        .catch(() => null));
+    if (!pwInput || !(await pwInput.isVisible().catch(() => false))) {
+      return { confirmed: false, reason: 'no_prompt' };
+    }
+    console.log(`X persona ${tag}: password confirm for username change`);
+    await this.humanTypeInto(pwInput, String(password), { clear: true, confirm: false });
+    await this.humanLikeDelay(400, 900);
+    const confirmBtn =
+      (await page.$('[data-testid="confirmationSheetConfirm"]')) ||
+      (await page
+        .locator(
+          'button:has-text("Confirm"), button:has-text("Save"), button:has-text("Next"), button:has-text("Verify"), button:has-text("Done")'
+        )
+        .first()
+        .elementHandle()
+        .catch(() => null));
+    if (confirmBtn) {
+      await confirmBtn.click().catch(() => {});
+      await this.humanLikeDelay(2500, 4500);
+    }
+    const body = await page.evaluate(() => (document.body && document.body.innerText) || '').catch(() => '');
+    if (/wrong password|incorrect password|incorrect\.? try again|couldn.?t verify/i.test(body)) {
+      throw new Error('x_username_bad_password: password rejected on username change');
+    }
+    if (/locked|suspended|unusual activity|verify your identity|temporarily locked/i.test(body)) {
+      throw new Error(`account_locked: ${body.slice(0, 160)}`);
+    }
+    return { confirmed: true };
+  }
+
+  /**
+   * Rename X @handle via settings/screen_name.
+   * Cookie session for navigation; password ONLY if X prompts after Save.
    * Soft-fails (returns attempted:false) if UI unavailable — never hangs.
    */
-  async updateXUsername(page, newUsername, { accountId, currentUsername } = {}) {
+  async updateXUsername(page, newUsername, { accountId, currentUsername, password = null } = {}) {
     const want = String(newUsername || '').replace(/^@/, '').trim();
     if (!want || want.length < 4 || want.length > 15) {
       throw new Error(`Invalid X username: ${newUsername}`);
@@ -4231,15 +4277,15 @@ class PlaywrightService {
     const cur = String(currentUsername || '').replace(/^@/, '');
     if (cur && cur.toLowerCase() === want.toLowerCase()) {
       console.log(`X persona ${tag}: username already @${want}`);
-      return { usernameAttempted: true, alreadySet: true };
+      return { usernameAttempted: true, alreadySet: true, requestedUsername: want };
     }
 
     console.log(`X persona ${tag}: renaming handle → @${want} via settings`);
     await page.goto('https://x.com/settings/screen_name', {
       waitUntil: 'domcontentloaded',
-      timeout: 60000,
+      timeout: 45000,
     });
-    await this.humanLikeDelay(2500, 4000);
+    await this.humanLikeDelay(2000, 3500);
     await this.assertXProfileActionAllowed(page, { accountId });
 
     // Fallback: Your account → Username
@@ -4250,15 +4296,15 @@ class PlaywrightService {
     if (!input) {
       await page.goto('https://x.com/settings/account', {
         waitUntil: 'domcontentloaded',
-        timeout: 60000,
+        timeout: 45000,
       }).catch(() => {});
-      await this.humanLikeDelay(2000, 3500);
+      await this.humanLikeDelay(1500, 2800);
       const link =
         (await page.$('a[href*="screen_name"]')) ||
         (await page.locator('a:has-text("Username"), span:has-text("Username")').first().elementHandle().catch(() => null));
       if (link) {
         await link.click().catch(() => {});
-        await this.humanLikeDelay(2000, 3500);
+        await this.humanLikeDelay(1500, 2800);
       }
       input =
         (await page.$('input[name="username"], input[name="screen_name"], input[autocomplete="username"]')) ||
@@ -4271,16 +4317,17 @@ class PlaywrightService {
       return { usernameAttempted: false };
     }
 
+    let requested = want;
     await this.humanTypeInto(input, want, { clear: true, confirm: true });
-    await this.humanLikeDelay(1500, 2500);
+    await this.humanLikeDelay(1200, 2200);
 
     const body = await page.evaluate(() => (document.body && document.body.innerText) || '').catch(() => '');
     if (/taken|already exists|not available|unavailable/i.test(body)) {
-      // Append digit and retry once
-      const alt = `${want.slice(0, 13)}${Math.floor(Math.random() * 90 + 10)}`.slice(0, 15);
+      const alt = `${want.replace(/_+$/, '').slice(0, 11)}_${Math.floor(Math.random() * 90 + 10)}`.slice(0, 15);
       console.warn(`X persona ${tag}: @${want} taken — trying @${alt}`);
       await this.humanTypeInto(input, alt, { clear: true, confirm: true });
-      await this.humanLikeDelay(1500, 2500);
+      await this.humanLikeDelay(1200, 2200);
+      requested = alt;
     }
 
     const save =
@@ -4288,12 +4335,27 @@ class PlaywrightService {
       (await page.locator('button:has-text("Save"), button:has-text("Next"), button:has-text("Done")').first().elementHandle().catch(() => null));
     if (save) {
       await save.click().catch(() => {});
-      await this.humanLikeDelay(3000, 5000);
+      await this.humanLikeDelay(2000, 3500);
     }
+
+    // X requires current password to commit username change
+    const pwResult = await this.confirmXPasswordIfPrompted(page, password, { accountId });
+    if (pwResult.reason === 'no_password') {
+      // Prompt may or may not appear; if password field still visible, we cannot finish
+      const stillPw = await page.$('input[type="password"]');
+      if (stillPw && (await stillPw.isVisible().catch(() => false))) {
+        throw new Error('x_username_needs_password: no credentials.password for username change');
+      }
+    }
+
     await this.assertXProfileActionAllowed(page, { accountId });
     await page.screenshot({ path: `/tmp/x-username-done-${accountId || 'x'}.png` }).catch(() => {});
-    console.log(`X persona ${tag}: username rename attempted → @${want} (unverified)`);
-    return { usernameAttempted: true, requestedUsername: want };
+    console.log(`X persona ${tag}: username rename attempted → @${requested} (unverified)`);
+    return {
+      usernameAttempted: true,
+      requestedUsername: requested,
+      passwordConfirmed: !!pwResult.confirmed,
+    };
   }
 
   /**
@@ -4320,17 +4382,60 @@ class PlaywrightService {
         throw new Error(`Account ${accountId} missing credentials.x_persona — run update-x-personas.js first`);
       }
 
-      // Ensure a target username exists for rename
-      if (!persona.username && persona.rename_handle !== false) {
-        const { generateXPersona } = require('./xPersonas');
-        const generated = generateXPersona(accountId);
-        persona = { ...persona, username: generated.username, rename_handle: true };
+      const {
+        allocateDesiredUsername,
+        needsHumanHandle,
+        looksFakeUsername,
+      } = require('./xPersonas');
+
+      // Ensure a target desired_username exists for rename
+      let desired =
+        persona.desired_username ||
+        (persona.rename_handle !== false ? persona.username : null);
+      if (!desired && persona.rename_handle !== false) {
+        desired = await allocateDesiredUsername(pool, accountId);
+        persona = {
+          ...persona,
+          username: desired,
+          desired_username: desired,
+          rename_handle: true,
+        };
         await pool.query(
           `UPDATE social_accounts
            SET credentials = jsonb_set(COALESCE(credentials, '{}'::jsonb), '{x_persona}', $2::jsonb),
                updated_at = NOW()
            WHERE id = $1`,
           [accountId, JSON.stringify(persona)]
+        );
+      } else if (desired && !persona.desired_username) {
+        persona = { ...persona, desired_username: desired, username: desired };
+      }
+
+      const accountPassword =
+        (creds.password && String(creds.password).trim()) ||
+        (creds.pass && String(creds.pass).trim()) ||
+        null;
+      const wantsRename =
+        persona.rename_handle !== false &&
+        desired &&
+        needsHumanHandle(account.username, persona);
+      let renameSkippedNoPassword = false;
+      if (wantsRename && !accountPassword) {
+        renameSkippedNoPassword = true;
+        persona = {
+          ...persona,
+          rename_needs_password: true,
+          rename_skipped_at: new Date().toISOString(),
+        };
+        await pool.query(
+          `UPDATE social_accounts
+           SET credentials = jsonb_set(COALESCE(credentials, '{}'::jsonb), '{x_persona}', $2::jsonb),
+               updated_at = NOW()
+           WHERE id = $1`,
+          [accountId, JSON.stringify(persona)]
+        );
+        console.warn(
+          `X #${accountId}: skip rename — no credentials.password (need password or pre-good-handle accounts)`
         );
       }
 
@@ -4339,12 +4444,13 @@ class PlaywrightService {
       browser = result.browser;
       const page = result.page;
 
+      // Cookie-only session restore — never password-login for organic/browse path
       const loggedIn = await this.ensureLoggedIn(
         page,
         'x',
         accountId,
         account.username,
-        creds.password,
+        accountPassword,
         { allowLogin: false, totpSecret: creds.totp_secret }
       );
       if (!loggedIn) throw new Error(`no_live_session for x/${account.username}`);
@@ -4390,20 +4496,40 @@ class PlaywrightService {
         }
       }
 
-      // Rename handle after profile fields (settings path)
-      if (persona.username && persona.rename_handle !== false) {
+      // Rename handle after profile fields (settings path). Password one-shot OK here only.
+      if (wantsRename && accountPassword && desired) {
         try {
-          const renameResult = await this.updateXUsername(page, persona.username, {
+          const renameResult = await this.updateXUsername(page, desired, {
             accountId,
             currentUsername: account.username,
+            password: accountPassword,
           });
           attempts.usernameAttempted = !!(renameResult && renameResult.usernameAttempted);
           if (renameResult?.requestedUsername) {
-            persona = { ...persona, username: renameResult.requestedUsername };
+            persona = {
+              ...persona,
+              username: renameResult.requestedUsername,
+              desired_username: renameResult.requestedUsername,
+              rename_needs_password: false,
+            };
           }
         } catch (renameErr) {
-          console.warn(`X #${accountId} username rename failed: ${renameErr.message}`);
+          const msg = renameErr.message || String(renameErr);
+          console.warn(`X #${accountId} username rename failed: ${msg}`);
+          if (/account_locked|suspended|locked/i.test(msg)) {
+            throw renameErr;
+          }
+          if (/x_username_needs_password|x_username_bad_password/i.test(msg)) {
+            persona = {
+              ...persona,
+              rename_needs_password: true,
+              rename_skipped_at: new Date().toISOString(),
+            };
+            renameSkippedNoPassword = true;
+          }
         }
+      } else if (looksFakeUsername(account.username) && !desired) {
+        console.warn(`X #${accountId}: live handle looks fake but no desired_username`);
       }
 
       const verification = await this.verifyXPersonaLive(page, persona, attempts, {
@@ -4430,11 +4556,13 @@ class PlaywrightService {
 
       const nextPersona = {
         ...persona,
+        desired_username: persona.desired_username || persona.username || null,
         applied_live: !!verification.appliedLive,
         applied_live_at: verification.appliedLive ? new Date().toISOString() : null,
         photo_applied: !!verification.photoApplied,
         banner_applied: !!verification.bannerApplied,
         username_applied: !!verification.usernameApplied,
+        rename_needs_password: renameSkippedNoPassword || !!persona.rename_needs_password,
         last_verify: {
           at: new Date().toISOString(),
           verified: verification.verified,
@@ -4448,6 +4576,11 @@ class PlaywrightService {
       };
       // Strip null applied_live_at noise
       if (!nextPersona.applied_live) delete nextPersona.applied_live_at;
+      if (nextPersona.username_applied) {
+        nextPersona.rename_needs_password = false;
+        delete nextPersona.rename_skipped_at;
+      }
+      if (!nextPersona.rename_needs_password) delete nextPersona.rename_needs_password;
 
       await pool.query(
         `UPDATE social_accounts
@@ -4486,6 +4619,7 @@ class PlaywrightService {
         photo: !!verification.photoApplied,
         banner: !!verification.bannerApplied,
         username_renamed: !!verification.usernameApplied,
+        rename_skipped_no_password: renameSkippedNoPassword,
         verified: verification.verified,
         skipped: verification.skipped,
       };

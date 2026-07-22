@@ -6,7 +6,7 @@ const pool = require('./db');
 const organicCommentService = require('./organicCommentService');
 const xFollowService = require('./xFollowService');
 const proxyService = require('./proxyService');
-const { isJunkUsername } = require('./xPersonas');
+const { isJunkUsername, looksFakeUsername, needsHumanHandle } = require('./xPersonas');
 
 const PLATFORMS = ['x', 'reddit'];
 const WORKER_HARD_MS = Number(process.env.ACCOUNT_OPS_WORKER_TIMEOUT_MS || 10 * 60 * 1000);
@@ -191,6 +191,44 @@ class AccountOpsBrainService {
           metrics: { starved: xStarved },
         });
       }
+    }
+
+    // X handles that still look marketplace-fake and lack password for rename
+    const renameGap = await pool.query(`
+      SELECT
+        COUNT(*) FILTER (
+          WHERE credentials->'x_persona'->>'rename_needs_password' = 'true'
+             OR (
+               NULLIF(credentials->>'password', '') IS NULL
+               AND (
+                 credentials->'x_persona'->>'desired_username' IS NOT NULL
+                 OR credentials->'x_persona'->>'username' IS NOT NULL
+               )
+               AND COALESCE(credentials->'x_persona'->>'username_applied', 'false') <> 'true'
+             )
+        )::int AS need_password,
+        COUNT(*) FILTER (
+          WHERE COALESCE(warmup_status, 'new') = 'warmed'
+            AND COALESCE(credentials->'x_persona'->>'username_applied', 'false') <> 'true'
+        )::int AS rename_pending
+      FROM social_accounts
+      WHERE lower(platform) IN ('x', 'twitter')
+        AND status = 'active'
+        AND COALESCE(is_simulated, false) = false
+    `);
+    const needPw = renameGap.rows[0]?.need_password || 0;
+    const renamePending = renameGap.rows[0]?.rename_pending || 0;
+    if (needPw > 0) {
+      alerts.push({
+        id: 'x_rename_need_password',
+        severity: needPw >= 5 ? 'critical' : 'warn',
+        kind: 'accounts',
+        platform: 'x',
+        message: `${needPw} X account(s) need password (or pre-good-handle accounts) to rename marketplace usernames`,
+        action:
+          'Add credentials.password for username change, or import accounts that already have human handles. Cookie-only sessions cannot rename.',
+        metrics: { need_password: needPw, rename_pending: renamePending },
+      });
     }
 
     const stats = {
@@ -381,7 +419,10 @@ class AccountOpsBrainService {
       return null;
     }
 
-    const junkUser = isJunkUsername(account.username) || (xp && isJunkUsername(xp.username));
+    const junkUser =
+      looksFakeUsername(account.username) ||
+      isJunkUsername(account.username) ||
+      (xp && needsHumanHandle(account.username, xp));
     const personaLiveOn = ['1', 'true', 'yes', 'on'].includes(
       String(process.env.X_PERSONA_LIVE || '').trim().toLowerCase()
     );
@@ -394,7 +435,8 @@ class AccountOpsBrainService {
         junkUser ||
         !enrichment.photo ||
         !enrichment.banner ||
-        !xp.display_name);
+        !xp.display_name ||
+        (xp.desired_username && !xp.username_applied));
 
     if (needsPersona) {
       return { type: 'profile_gap', priority: 1 };

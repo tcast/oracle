@@ -48,7 +48,7 @@ function parseJson(value, fallback = {}) {
 function classifyApplyError(msg) {
   const m = String(msg || '');
   if (
-    /account_suspended|is suspended|has been suspended|account_does_not_exist|This account doesn.?t exist/i.test(
+    /account_suspended|is suspended|has been suspended|account_does_not_exist|This account doesn.?t exist|account_locked/i.test(
       m
     )
   ) {
@@ -61,6 +61,9 @@ function classifyApplyError(msg) {
     /no_live_session|session_not_logged_in|not.?logged.?in|login_wall|no_session/i.test(m)
   ) {
     return 'session_dead';
+  }
+  if (/x_username_needs_password|rename_needs_password/i.test(m)) {
+    return 'needs_password';
   }
   if (/x_persona_verify_failed/i.test(m)) {
     return 'verify_failed';
@@ -120,7 +123,8 @@ function resolveBannerPath(accountId) {
   return pickFromPool(BANNER_POOL, accountId + 17);
 }
 
-async function resolvePendingIds({ upgrade } = {}) {
+async function resolvePendingIds({ upgrade, renameOnly } = {}) {
+  const { needsHumanHandle } = require('../services/xPersonas');
   const { rows } = await pool.query(
     `SELECT id, username, status, warmup_status, credentials
      FROM social_accounts
@@ -134,10 +138,16 @@ async function resolvePendingIds({ upgrade } = {}) {
     const creds = parseJson(row.credentials, {});
     const xp = creds.x_persona || {};
     const applied = !!xp.applied_live;
-    const hasUser = !!xp.username;
+    const hasUser = !!(xp.desired_username || xp.username);
     const hasBanner = !!xp.banner_applied;
+    const needsRename = needsHumanHandle(row.username, xp);
+    if (renameOnly) {
+      if (needsRename) out.push(row.id);
+      continue;
+    }
     const needs =
       !applied ||
+      needsRename ||
       (upgrade && (!hasUser || !hasBanner || !xp.username_applied || !xp.photo_applied));
     if (needs) out.push(row.id);
   }
@@ -145,8 +155,11 @@ async function resolvePendingIds({ upgrade } = {}) {
 }
 
 async function parseIds() {
-  if (process.argv.includes('--pending')) {
-    return resolvePendingIds({ upgrade: process.argv.includes('--upgrade') });
+  if (process.argv.includes('--pending') || process.argv.includes('--rename-pending')) {
+    return resolvePendingIds({
+      upgrade: process.argv.includes('--upgrade'),
+      renameOnly: process.argv.includes('--rename-pending'),
+    });
   }
   const accounts = arg('--accounts');
   if (typeof accounts === 'string') {
@@ -202,8 +215,18 @@ async function ensureOfflinePersona(accountId, { dryRun }) {
 
   const creds = parseJson(row.credentials, {});
   if (creds.x_persona?.display_name && creds.x_persona?.bio) {
-    // Backfill username if missing
-    if (!creds.x_persona.username) {
+    // Backfill desired_username if missing, or refresh boring concatenated handles
+    const {
+      allocateDesiredUsername,
+      needsHumanHandle,
+    } = require('../services/xPersonas');
+    const existingDesired =
+      creds.x_persona.desired_username || creds.x_persona.username || null;
+    const staleDesired =
+      existingDesired &&
+      !existingDesired.includes('_') &&
+      /^[a-z]+\d+$/i.test(existingDesired);
+    if (!existingDesired || staleDesired || process.argv.includes('--refresh-handles')) {
       if (dryRun) {
         return {
           ok: true,
@@ -213,11 +236,13 @@ async function ensureOfflinePersona(accountId, { dryRun }) {
           dryRun: true,
         };
       }
-      const generated = generateXPersona(accountId);
+      const desired = await allocateDesiredUsername(pool, accountId);
       const nextPersona = {
         ...creds.x_persona,
-        username: generated.username,
+        username: desired,
+        desired_username: desired,
         rename_handle: true,
+        username_applied: false,
         updated_at: new Date().toISOString(),
       };
       await pool.query(
@@ -232,6 +257,31 @@ async function ensureOfflinePersona(accountId, { dryRun }) {
         username: row.username,
         persona: nextPersona,
         usernameBackfilled: true,
+        desired,
+      };
+    }
+    // Ensure desired_username key exists even when username already set
+    if (!creds.x_persona.desired_username && creds.x_persona.username) {
+      const nextPersona = {
+        ...creds.x_persona,
+        desired_username: creds.x_persona.username,
+        rename_handle: true,
+      };
+      if (!dryRun) {
+        await pool.query(
+          `UPDATE social_accounts
+           SET credentials = jsonb_set(COALESCE(credentials, '{}'::jsonb), '{x_persona}', $2::jsonb),
+               updated_at = NOW()
+           WHERE id = $1`,
+          [accountId, JSON.stringify(nextPersona)]
+        );
+      }
+      return {
+        ok: true,
+        username: row.username,
+        persona: nextPersona,
+        alreadyAssigned: true,
+        needsRename: needsHumanHandle(row.username, nextPersona),
       };
     }
     return {
@@ -239,6 +289,7 @@ async function ensureOfflinePersona(accountId, { dryRun }) {
       username: row.username,
       persona: creds.x_persona,
       alreadyAssigned: true,
+      needsRename: needsHumanHandle(row.username, creds.x_persona),
     };
   }
 
@@ -408,7 +459,8 @@ async function applyOne(accountId, { withPhoto, withBanner, dryRun, timeoutMs })
         cls === 'rate_limit' ||
         cls === 'proxy_error' ||
         cls === 'challenge' ||
-        cls === 'timeout',
+        cls === 'timeout' ||
+        cls === 'needs_password',
     };
   }
 }
@@ -460,8 +512,8 @@ async function main() {
   const withPhoto = process.argv.includes('--with-photo');
   const withBanner =
     process.argv.includes('--with-banner') || process.argv.includes('--with-photo');
-  const concurrency = Math.max(1, Number(arg('--concurrency', '4')) || 4);
-  const timeoutMs = Math.max(60000, Number(arg('--timeout-ms', '600000')) || 600000);
+  const concurrency = Math.max(1, Math.min(5, Number(arg('--concurrency', '4')) || 4));
+  const timeoutMs = Math.max(60000, Number(arg('--timeout-ms', '480000')) || 480000);
   const ids = await parseIds();
   if (!ids.length) {
     console.log('No account ids to process');
