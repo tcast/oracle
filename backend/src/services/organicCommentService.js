@@ -735,7 +735,9 @@ Write only the comment text.`;
         ) &&
         !/no_live_session|session_not_logged_in|cookie_session_dead/i.test(msg)
       ) {
-        const next = this.computeNextDue(settings, job.comments_today, { daily_target: job.daily_target });
+        // Soft miss: short cooldown only — do not burn the rest of the day via computeNextDue.
+        const softMins = 15 + Math.floor(Math.random() * 16); // 15–30m
+        const next = new Date(Date.now() + softMins * 60 * 1000);
         await pool.query(
           `UPDATE organic_comment_jobs
            SET status = 'idle', last_error = $2, next_due_at = $3, updated_at = NOW()
@@ -743,7 +745,7 @@ Write only the comment text.`;
           [job.id, msg, next]
         );
         settled = true;
-        return { skipped: true, reason: 'soft_error', error: msg };
+        return { skipped: true, reason: 'soft_error', error: msg, next_due_at: next };
       }
 
       await this.applyFailureQuarantine(job, msg);

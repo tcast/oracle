@@ -441,7 +441,23 @@ class AccountOpsBrainService {
     return results;
   }
 
-  async listActionCandidates(limit = MAX_PARALLEL * 3) {
+  _platformKey(account) {
+    const p = String(account.platform || 'reddit').toLowerCase();
+    return p === 'twitter' ? 'x' : p;
+  }
+
+  _shuffleInPlace(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+
+  async listActionCandidates(limit = MAX_PARALLEL * 3, { platforms = null } = {}) {
+    const plats = platforms && platforms.length
+      ? platforms
+      : ['x', 'twitter', 'reddit'];
     const { rows } = await pool.query(
       `SELECT sa.id, sa.platform, sa.username, sa.status, sa.warmup_status,
               sa.credentials,
@@ -489,9 +505,58 @@ class AccountOpsBrainService {
          AND COALESCE(j.failure_class, '') NOT IN ('banned', 'session_dead', 'bad_credentials')
        ORDER BY random()
        LIMIT $2`,
-      [['x', 'twitter', 'reddit'], limit]
+      [plats, limit]
     );
     return rows;
+  }
+
+  /**
+   * Plan up to `limit` workers with platform fair-share.
+   * When X has due work, reserve min(floor(limit/2), xDue) slots for X so a
+   * large Reddit pool cannot starve search_comment / follow.
+   */
+  _selectPlannedFairShare(candidates, ctx, limit) {
+    const byPlatform = new Map();
+    for (const account of candidates) {
+      const key = this._platformKey(account);
+      if (!byPlatform.has(key)) byPlatform.set(key, []);
+      byPlatform.get(key).push(account);
+    }
+    for (const list of byPlatform.values()) this._shuffleInPlace(list);
+
+    let profileBudget = ctx.profileBudget;
+    const actionable = new Map();
+    for (const [platform, list] of byPlatform) {
+      const ready = [];
+      for (const account of list) {
+        const action = this.decideAction(account, { ...ctx, profileBudget });
+        if (!action) continue;
+        if (action.type === 'profile_gap') profileBudget -= 1;
+        ready.push({ account, action });
+      }
+      actionable.set(platform, ready);
+    }
+
+    const planned = [];
+    const xList = actionable.get('x') || [];
+    const xReserve = Math.min(Math.floor(limit / 2), xList.length);
+    for (let i = 0; i < xReserve; i++) {
+      planned.push(xList.shift());
+    }
+
+    const platforms = this._shuffleInPlace([...actionable.keys()]);
+    while (planned.length < limit) {
+      let progressed = false;
+      for (const platform of platforms) {
+        if (planned.length >= limit) break;
+        const list = actionable.get(platform);
+        if (!list || !list.length) continue;
+        planned.push(list.shift());
+        progressed = true;
+      }
+      if (!progressed) break;
+    }
+    return planned;
   }
 
   decideAction(account, { quietOrganic, quietFollow, profileBudget }) {
@@ -713,28 +778,37 @@ class AccountOpsBrainService {
     const quietOrganic = organicCommentService.inQuietHours(organicSettings);
     const quietFollow = xFollowService.inQuietHours(followSettings);
 
-    const candidates = await this.listActionCandidates(MAX_PARALLEL * 4);
-    let profileBudget = PROFILE_PER_TICK;
-    const planned = [];
-
-    for (const account of candidates) {
-      if (planned.length >= MAX_PARALLEL) break;
-      const action = this.decideAction(account, { quietOrganic, quietFollow, profileBudget });
-      if (!action) continue;
-      if (action.type === 'profile_gap') profileBudget -= 1;
-      planned.push({ account, action });
-    }
+    // Per-platform fetch so ~200 Reddit cannot drown ~20 live X in one random LIMIT.
+    const perPlat = Math.max(MAX_PARALLEL, Math.ceil(MAX_PARALLEL / 2) * 3);
+    const [xCands, redditCands] = await Promise.all([
+      this.listActionCandidates(perPlat, { platforms: ['x', 'twitter'] }),
+      this.listActionCandidates(perPlat, { platforms: ['reddit'] }),
+    ]);
+    const candidates = [...xCands, ...redditCands];
+    const planned = this._selectPlannedFairShare(
+      candidates,
+      { quietOrganic, quietFollow, profileBudget: PROFILE_PER_TICK },
+      MAX_PARALLEL
+    );
 
     const results = await Promise.all(
       planned.map(({ account, action }) => this.runAction(account, action))
     );
 
+    const byPlat = {};
+    for (const r of results) {
+      const k = this._platformKey(r);
+      byPlat[k] = (byPlat[k] || 0) + 1;
+    }
+
     if (results.length || enrolledOrganic.enrolled || capacity.alerts.length) {
       console.log(
-        `AccountOpsBrain tick: workers=${results.length} enrolled_organic=${enrolledOrganic.enrolled} ` +
+        `AccountOpsBrain tick: workers=${results.length} by_platform=${JSON.stringify(byPlat)} ` +
+          `enrolled_organic=${enrolledOrganic.enrolled} ` +
           `bound_proxies=${JSON.stringify(bound)} alerts=${capacity.alerts.length}`,
         results.map((r) => ({
           id: r.accountId,
+          platform: this._platformKey(r),
           type: r.type,
           ok: r.success !== false && !r.error,
           skip: r.skipped,
