@@ -3194,6 +3194,13 @@ class PlaywrightService {
     if (username) {
       await page.waitForURL(new RegExp(`/${username}(?:\\?|$|/)`), { timeout: 15000 }).catch(() => {});
     }
+    // Wait for visible profile header before reading — empty UserName is a soft lie
+    await page
+      .waitForSelector(
+        '[data-testid="primaryColumn"] [data-testid="UserName"], main [data-testid="UserName"]',
+        { timeout: 20000 }
+      )
+      .catch(() => null);
     await this.assertXProfileActionAllowed(page, { accountId });
 
     // Visible header name scoped to primary column only (never sidebar switcher)
@@ -3325,19 +3332,21 @@ class PlaywrightService {
         `display_name expected="${persona.display_name}" edit_modal="${live.displayName || ''}" ` +
           `visible="${live.visibleDisplayName || ''}"`
       );
+    } else if (!live.visibleDisplayName) {
+      // Modal can retain typed/optimistic values while public header never updated
+      failed.push(
+        `display_name edit_modal="${live.displayName}" but visible header empty ` +
+          `(expected="${persona.display_name}")`
+      );
+    } else if (
+      this._normXPersonaText(live.visibleDisplayName) !== this._normXPersonaText(persona.display_name)
+    ) {
+      failed.push(
+        `display_name edit_modal ok but visible still="${live.visibleDisplayName}" ` +
+          `(expected="${persona.display_name}")`
+      );
     } else {
       verified.display_name = true;
-      // Visible header should also match when present (catch optimistic-only lies)
-      if (
-        live.visibleDisplayName &&
-        this._normXPersonaText(live.visibleDisplayName) !== this._normXPersonaText(persona.display_name)
-      ) {
-        failed.push(
-          `display_name edit_modal ok but visible still="${live.visibleDisplayName}" ` +
-            `(expected="${persona.display_name}")`
-        );
-        verified.display_name = false;
-      }
     }
 
     if (!attempts.bioAttempted) {
@@ -3347,6 +3356,10 @@ class PlaywrightService {
     } else if (!(live.bio || '').trim()) {
       failed.push(
         `bio empty in edit modal (expectedLen=${(persona.bio || '').length} visibleLen=${(live.visibleBio || '').length})`
+      );
+    } else if (!(live.visibleBio || '').trim()) {
+      failed.push(
+        `bio present in edit modal (len=${(live.bio || '').length}) but visible profile bio empty`
       );
     } else if (this._normXPersonaText(live.bio) !== this._normXPersonaText(persona.bio)) {
       failed.push(
