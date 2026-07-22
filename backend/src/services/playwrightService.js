@@ -4261,11 +4261,14 @@ class PlaywrightService {
   }
 
   /**
-   * Rename X @handle via settings/screen_name.
-   * Cookie session for navigation; password ONLY if X prompts after Save.
-   * Soft-fails (returns attempted:false) if UI unavailable — never hangs.
+   * Rename X @handle via settings/screen_name (cookie session).
+   * Prefer input[name="typedScreenName"]. Password/TOTP ONLY if X prompts mid-rename.
    */
-  async updateXUsername(page, newUsername, { accountId, currentUsername, password = null } = {}) {
+  async updateXUsername(
+    page,
+    newUsername,
+    { accountId, currentUsername, password = null, totpSecret = null } = {}
+  ) {
     const want = String(newUsername || '').replace(/^@/, '').trim();
     if (!want || want.length < 4 || want.length > 15) {
       throw new Error(`Invalid X username: ${newUsername}`);
@@ -4280,12 +4283,12 @@ class PlaywrightService {
       return { usernameAttempted: true, alreadySet: true, requestedUsername: want };
     }
 
-    console.log(`X persona ${tag}: renaming handle → @${want} via settings`);
+    console.log(`X persona ${tag}: renaming handle → @${want} via typedScreenName`);
     await page.goto('https://x.com/settings/screen_name', {
       waitUntil: 'domcontentloaded',
       timeout: 45000,
     });
-    await this.humanLikeDelay(2000, 3500);
+    await this.humanLikeDelay(1500, 2500);
     await this.assertXProfileActionAllowed(page, { accountId });
 
     // Prefer typedScreenName (X settings). Never fall back to first text input —
@@ -4296,6 +4299,10 @@ class PlaywrightService {
       null;
 
     let input = await findUsernameInput();
+    if (!input) {
+      await page.waitForSelector('input[name="typedScreenName"]', { timeout: 20000 }).catch(() => null);
+      input = await findUsernameInput();
+    }
 
     if (!input) {
       await page.goto('https://x.com/settings/account', {
@@ -4310,12 +4317,13 @@ class PlaywrightService {
         await link.click().catch(() => {});
         await this.humanLikeDelay(1500, 2800);
       }
+      await page.waitForSelector('input[name="typedScreenName"]', { timeout: 15000 }).catch(() => null);
       input = await findUsernameInput();
     }
 
     if (!input) {
       await page.screenshot({ path: `/tmp/x-username-noinput-${accountId || 'x'}.png` }).catch(() => {});
-      console.warn(`X persona ${tag}: username input not found — skipping rename`);
+      console.warn(`X persona ${tag}: typedScreenName not found — skipping rename`);
       return { usernameAttempted: false };
     }
 
@@ -4336,27 +4344,47 @@ class PlaywrightService {
       (await page.$('[data-testid="settingsDetailSave"]')) ||
       (await page.locator('button:has-text("Save"), button:has-text("Next"), button:has-text("Done")').first().elementHandle().catch(() => null));
     if (save) {
-      await save.click().catch(() => {});
-      await this.humanLikeDelay(2000, 3500);
+      const disabled = await save.isDisabled().catch(() => false);
+      if (!disabled) {
+        await save.click().catch(() => {});
+        await this.humanLikeDelay(2500, 4000);
+      }
     }
 
-    // X requires current password to commit username change
+    // Password only if X explicitly demands it mid-rename (cookie alone usually works)
     const pwResult = await this.confirmXPasswordIfPrompted(page, password, { accountId });
     if (pwResult.reason === 'no_password') {
-      // Prompt may or may not appear; if password field still visible, we cannot finish
       const stillPw = await page.$('input[type="password"]');
       if (stillPw && (await stillPw.isVisible().catch(() => false))) {
         throw new Error('x_username_needs_password: no credentials.password for username change');
       }
     }
+    // TOTP only if challenged after password confirm — never as password substitute
+    if (totpSecret) {
+      const totpHandled = await this.handleXTotpChallenge(page, currentUsername || want, {
+        totpSecret,
+      }).catch(() => false);
+      if (totpHandled) await this.humanLikeDelay(1500, 2500);
+    }
+
+    // Verify typedScreenName value stuck
+    const afterVal = await page
+      .evaluate(() => document.querySelector('input[name="typedScreenName"]')?.value || '')
+      .catch(() => '');
+    const verifiedLocal =
+      afterVal && afterVal.replace(/^@/, '').toLowerCase() === requested.toLowerCase();
 
     await this.assertXProfileActionAllowed(page, { accountId });
     await page.screenshot({ path: `/tmp/x-username-done-${accountId || 'x'}.png` }).catch(() => {});
-    console.log(`X persona ${tag}: username rename attempted → @${requested} (unverified)`);
+    console.log(
+      `X persona ${tag}: username rename → @${requested}` +
+        (verifiedLocal ? ' (input verified)' : afterVal ? ` (input=@${afterVal})` : '')
+    );
     return {
       usernameAttempted: true,
       requestedUsername: requested,
       passwordConfirmed: !!pwResult.confirmed,
+      inputVerified: !!verifiedLocal,
     };
   }
 
@@ -4422,24 +4450,7 @@ class PlaywrightService {
         desired &&
         needsHumanHandle(account.username, persona);
       let renameSkippedNoPassword = false;
-      if (wantsRename && !accountPassword) {
-        renameSkippedNoPassword = true;
-        persona = {
-          ...persona,
-          rename_needs_password: true,
-          rename_skipped_at: new Date().toISOString(),
-        };
-        await pool.query(
-          `UPDATE social_accounts
-           SET credentials = jsonb_set(COALESCE(credentials, '{}'::jsonb), '{x_persona}', $2::jsonb),
-               updated_at = NOW()
-           WHERE id = $1`,
-          [accountId, JSON.stringify(persona)]
-        );
-        console.warn(
-          `X #${accountId}: skip rename — no credentials.password (need password or pre-good-handle accounts)`
-        );
-      }
+      // Cookie-only rename works via typedScreenName — do NOT skip when password missing.
 
       await this.requireProxyForLive(accountId);
       const result = await this.createBrowserForAccount(accountId, 2, { requireProxy });
@@ -4498,13 +4509,14 @@ class PlaywrightService {
         }
       }
 
-      // Rename handle after profile fields (settings path). Password one-shot OK here only.
-      if (wantsRename && accountPassword && desired) {
+      // Cookie-session rename via typedScreenName. Password/TOTP only if X prompts mid-rename.
+      if (wantsRename && desired) {
         try {
           const renameResult = await this.updateXUsername(page, desired, {
             accountId,
             currentUsername: account.username,
             password: accountPassword,
+            totpSecret: creds.totp_secret || creds.totp || null,
           });
           attempts.usernameAttempted = !!(renameResult && renameResult.usernameAttempted);
           if (renameResult?.requestedUsername) {
