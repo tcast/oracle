@@ -14,6 +14,36 @@ const EXPERTISE_SUBS = {
 
 const SAFE_GENERAL = ['AskReddit', 'CasualConversation', 'NoStupidQuestions', 'todayilearned', 'LifeProTips'];
 
+/** Topic packs for X organic search (sports / DFS / tech). */
+const X_TOPIC_PACKS = {
+  sports: [
+    'NBA',
+    'NFL',
+    'MLB highlights',
+    'March Madness',
+    'UFC',
+    'fantasy football',
+    'college basketball',
+  ],
+  dfs: [
+    'DraftKings',
+    'FanDuel',
+    'PrizePicks',
+    'DFS lineup',
+    'fantasy sports',
+    'Underdog Fantasy',
+  ],
+  tech: [
+    'AI tools',
+    'startups',
+    'devtools',
+    'software engineering',
+    'product management',
+    'OpenAI',
+  ],
+  general: ['interesting take', 'breaking news', 'weekend vibes'],
+};
+
 /** Platforms with organic comment discovery + posting wired. */
 const ORGANIC_PLATFORMS = ['reddit', 'linkedin', 'x', 'instagram'];
 
@@ -186,20 +216,144 @@ class OrganicDiscoveryService {
     return pickRandom(candidates.slice(0, 5));
   }
 
+  /**
+   * Resolve X search keywords from persona / topic packs / follow-target categories /
+   * optional organic_comment_settings.x_search_keywords.
+   */
+  async getXSearchKeywords(account) {
+    const keywords = [];
+
+    let traits = account.persona_traits;
+    if (typeof traits === 'string') {
+      try { traits = JSON.parse(traits); } catch { traits = {}; }
+    }
+    traits = traits || {};
+
+    const creds = account.credentials && typeof account.credentials === 'object'
+      ? account.credentials
+      : {};
+    const xp = creds.x_persona && typeof creds.x_persona === 'object' ? creds.x_persona : {};
+
+    for (const exp of Array.isArray(traits.expertise) ? traits.expertise : []) {
+      keywords.push(String(exp));
+    }
+    for (const interest of Array.isArray(traits.interests) ? traits.interests : []) {
+      keywords.push(String(interest));
+    }
+    if (xp.interest) keywords.push(String(xp.interest));
+    if (xp.bio) {
+      const bioBits = String(xp.bio).match(/\b(NBA|NFL|DFS|AI|startup|fantasy|sports|tech)\b/gi);
+      if (bioBits) keywords.push(...bioBits);
+    }
+
+    try {
+      const settings = await pool.query(
+        `SELECT x_search_keywords FROM organic_comment_settings WHERE id = 1`
+      );
+      const globalKw = settings.rows[0]?.x_search_keywords;
+      if (Array.isArray(globalKw)) keywords.push(...globalKw.map(String));
+      else if (typeof globalKw === 'string' && globalKw.trim()) {
+        keywords.push(...globalKw.split(',').map((s) => s.trim()).filter(Boolean));
+      }
+    } catch {
+      /* column may not exist yet — ignore */
+    }
+
+    // Topic packs inferred from persona + follow-target categories
+    const packKeys = new Set();
+    const blob = `${JSON.stringify(traits)} ${JSON.stringify(xp)} ${account.username || ''}`.toLowerCase();
+    if (/sport|nba|nfl|mlb|ufc|ball|fantasy|dfs|draft/.test(blob)) {
+      packKeys.add('sports');
+      packKeys.add('dfs');
+    }
+    if (/tech|ai|code|dev|software|startup|product/.test(blob)) {
+      packKeys.add('tech');
+    }
+    if (!packKeys.size) {
+      packKeys.add('sports');
+      packKeys.add('dfs');
+      packKeys.add('tech');
+    }
+    for (const key of packKeys) {
+      keywords.push(...(X_TOPIC_PACKS[key] || []));
+    }
+
+    try {
+      const cats = await pool.query(
+        `SELECT DISTINCT category FROM x_follow_targets WHERE enabled = true LIMIT 8`
+      );
+      for (const row of cats.rows) {
+        const cat = String(row.category || '').toLowerCase();
+        if (X_TOPIC_PACKS[cat]) keywords.push(...X_TOPIC_PACKS[cat].slice(0, 3));
+        else if (cat) keywords.push(cat);
+      }
+    } catch {
+      /* ignore */
+    }
+
+    const cleaned = [...new Set(
+      keywords
+        .map((k) => String(k || '').trim())
+        .filter((k) => k.length >= 2 && k.length <= 60)
+    )];
+    return shuffle(cleaned.length ? cleaned : X_TOPIC_PACKS.sports);
+  }
+
   async findXThread(account, used) {
-    const posts = await playwrightService.listXHomePosts(account.id, { limit: 12 });
-    const candidates = this.filterUnused(posts, used).map((p) => ({
-      subreddit: p.subreddit || 'x:home',
-      title: p.title || 'X post',
-      selftext: (p.selftext || p.title || '').slice(0, 1200),
-      post_url: p.post_url,
-      score: 0,
-      num_comments: 0,
-      fit: 1,
-      platform: 'x',
-    }));
-    if (!candidates.length) throw new Error('No commentable X home posts');
-    return pickRandom(candidates.slice(0, 5));
+    const keywords = await this.getXSearchKeywords(account);
+    const tried = [];
+
+    // Prefer search (organic discovery) over home-only
+    for (const query of keywords.slice(0, 3)) {
+      tried.push(`search:${query}`);
+      try {
+        const posts = await playwrightService.listXSearchPosts(account.id, {
+          query,
+          limit: 12,
+        });
+        const candidates = this.filterUnused(posts, used).map((p) => ({
+          subreddit: p.subreddit || `x:search:${query}`,
+          title: p.title || 'X post',
+          selftext: (p.selftext || p.title || '').slice(0, 1200),
+          post_url: p.post_url,
+          score: 0,
+          num_comments: 0,
+          fit: 1.2,
+          platform: 'x',
+          discovery: 'search',
+          query,
+        }));
+        if (candidates.length) {
+          return pickRandom(candidates.slice(0, 5));
+        }
+      } catch (err) {
+        console.warn(`X search discovery "${query}":`, err.message);
+      }
+    }
+
+    // Home timeline fallback
+    tried.push('home');
+    try {
+      const posts = await playwrightService.listXHomePosts(account.id, { limit: 12 });
+      const candidates = this.filterUnused(posts, used).map((p) => ({
+        subreddit: p.subreddit || 'x:home',
+        title: p.title || 'X post',
+        selftext: (p.selftext || p.title || '').slice(0, 1200),
+        post_url: p.post_url,
+        score: 0,
+        num_comments: 0,
+        fit: 0.9,
+        platform: 'x',
+        discovery: 'home',
+      }));
+      if (candidates.length) {
+        return pickRandom(candidates.slice(0, 5));
+      }
+    } catch (err) {
+      console.warn('X home discovery:', err.message);
+    }
+
+    throw new Error(`No commentable X posts (tried: ${tried.join(', ')})`);
   }
 
   async findInstagramThread(account, used) {
@@ -240,3 +394,4 @@ class OrganicDiscoveryService {
 
 module.exports = new OrganicDiscoveryService();
 module.exports.ORGANIC_PLATFORMS = ORGANIC_PLATFORMS;
+module.exports.X_TOPIC_PACKS = X_TOPIC_PACKS;

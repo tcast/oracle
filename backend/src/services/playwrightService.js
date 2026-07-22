@@ -1882,7 +1882,9 @@ class PlaywrightService {
       throw new Error(`Account ${accountId} is ${account.platform}, expected x`);
     }
     const password = account.credentials?.password;
-    if (!password || password === 'default_password') {
+    // Cookie-only default: allowLogin=false never password-submits.
+    // Only require a real password when allowLogin is explicitly true.
+    if (allowLogin && (!password || password === 'default_password')) {
       throw new Error('Account has no real password');
     }
 
@@ -1907,7 +1909,7 @@ class PlaywrightService {
         });
         if (!loggedIn) {
           await page.screenshot({ path: `/tmp/x-follow-login-${account.username}.png`, fullPage: true }).catch(() => {});
-          throw new Error('X login failed');
+          throw new Error(allowLogin ? 'X login failed' : 'X session not alive (cookie-only)');
         }
 
         try {
@@ -3320,9 +3322,17 @@ class PlaywrightService {
           'a[href$="/photo"] img, [data-testid^="UserAvatar-Container"] img, [data-testid="UserAvatar-Container-unknown"] img'
         )
       );
-      const avatarSrc = imgs.map((i) => i.getAttribute('src') || '').find(Boolean) || '';
+      // Prefer real avatar CDN URLs — never treat profile_banners as the face.
+      const avatarSrc =
+        imgs
+          .map((i) => i.getAttribute('src') || '')
+          .find((s) => /profile_images/i.test(s) || /default_profile/i.test(s)) ||
+        imgs.map((i) => i.getAttribute('src') || '').find((s) => s && !/profile_banners/i.test(s)) ||
+        '';
       const isDefaultAvatar =
-        !avatarSrc || /default_profile|default_profile_images|\/default_profile\./i.test(avatarSrc);
+        !avatarSrc ||
+        /default_profile|default_profile_images|\/default_profile\./i.test(avatarSrc) ||
+        /profile_banners/i.test(avatarSrc);
       const bannerImg =
         col.querySelector('a[href$="/header_photo"] img') ||
         col.querySelector('[data-testid="UserProfileHeader_Items"]')?.previousElementSibling?.querySelector?.('img') ||
@@ -3421,14 +3431,23 @@ class PlaywrightService {
         dialog.querySelector(
           'textarea[name="description"], textarea[name="bio"], textarea[data-testid="Account_description"]'
         ) || dialog.querySelector('textarea');
-      const img = dialog.querySelector('img');
-      const avatarSrc = (img && img.getAttribute('src')) || '';
+      const imgs = Array.from(dialog.querySelectorAll('img'));
+      const avatarSrc =
+        imgs
+          .map((i) => i.getAttribute('src') || '')
+          .find((s) => /profile_images/i.test(s) || /default_profile/i.test(s)) ||
+        imgs
+          .map((i) => i.getAttribute('src') || '')
+          .find((s) => s && !/profile_banners/i.test(s)) ||
+        '';
       return {
         displayName: nameEl ? String(nameEl.value || '').trim() : '',
         bio: bioEl ? String(bioEl.value || '').trim() : '',
         avatarSrc,
         isDefaultAvatar:
-          !avatarSrc || /default_profile|default_profile_images|\/default_profile\./i.test(avatarSrc),
+          !avatarSrc ||
+          /default_profile|default_profile_images|\/default_profile\./i.test(avatarSrc) ||
+          /profile_banners/i.test(avatarSrc),
         nameInputFound: !!nameEl,
         bioInputFound: !!bioEl,
       };
@@ -3539,13 +3558,21 @@ class PlaywrightService {
       );
     }
 
-    // Photo is independent — never drives applied_live
+    // Photo is independent — never drives applied_live.
+    // Must be profile_images (face), never profile_banners (header CDN).
     const photoFailed = [];
+    const avatarIsFace =
+      !!live.avatarSrc &&
+      /profile_images/i.test(live.avatarSrc) &&
+      !/profile_banners/i.test(live.avatarSrc) &&
+      !live.isDefaultAvatar;
     if (!attempts.photoAttempted) skipped.push('photo');
-    else if (!live.isDefaultAvatar) {
+    else if (avatarIsFace) {
       verified.photo = true;
     } else {
-      photoFailed.push(`photo still default_profile (src=${(live.avatarSrc || '').slice(0, 80)})`);
+      photoFailed.push(
+        `photo not face profile_images (src=${(live.avatarSrc || '').slice(0, 100)})`
+      );
     }
 
     const bannerFailed = [];
@@ -4570,19 +4597,51 @@ class PlaywrightService {
       await this.humanBrowseXSession(page, { accountId });
       await this.assertXProfileActionAllowed(page, { accountId });
 
-      // Open Edit profile once
-      await page
-        .goto(`https://x.com/${account.username}`, {
+      // Open own profile via sidebar (never teleport to DB username — rename may lag).
+      console.log(`X #${accountId}: opening own profile via sidebar for media restore`);
+      if (!/x\.com|twitter\.com/i.test(page.url() || '')) {
+        await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await this.humanLikeDelay(2000, 3500);
+      }
+      const profileLink =
+        (await page.$('[data-testid="AppTabBar_Profile_Link"]')) ||
+        (await page.locator('a[aria-label="Profile"]').first().elementHandle().catch(() => null));
+      if (!profileLink) {
+        await page.waitForSelector('[data-testid="AppTabBar_Profile_Link"]', { timeout: 30000 });
+      }
+      const profileEl = profileLink || (await page.$('[data-testid="AppTabBar_Profile_Link"]'));
+      if (!profileEl) throw new Error('X Profile sidebar link not found');
+      await profileEl.click().catch(() => {});
+      await this.humanLikeDelay(2500, 4000);
+      await this.assertXProfileActionAllowed(page, { accountId });
+
+      const editBtnSel =
+        '[data-testid="editProfileButton"], [aria-label="Edit profile"], [aria-label="Set up profile"]';
+      let editBtn =
+        (await page.$(editBtnSel)) ||
+        (await page
+          .locator('button:has-text("Edit profile"), button:has-text("Set up profile")')
+          .first()
+          .elementHandle()
+          .catch(() => null));
+      if (!editBtn) {
+        await page.goto('https://x.com/settings/profile', {
           waitUntil: 'domcontentloaded',
           timeout: 60000,
-        })
-        .catch(() => {});
-      await this.humanLikeDelay(2000, 3500);
-      await this.assertXProfileActionAllowed(page, { accountId });
-      const editBtn =
-        (await page.$('[data-testid="editProfileButton"]')) ||
-        (await page.$('[aria-label="Edit profile"]'));
-      if (!editBtn) throw new Error('Edit profile button not found');
+        }).catch(() => {});
+        await this.humanLikeDelay(2000, 3500);
+        editBtn =
+          (await page.$(editBtnSel)) ||
+          (await page
+            .locator('button:has-text("Edit profile"), button:has-text("Set up profile")')
+            .first()
+            .elementHandle()
+            .catch(() => null));
+      }
+      if (!editBtn) {
+        await page.screenshot({ path: `/tmp/x-media-noedit-${accountId}.png` }).catch(() => {});
+        throw new Error('Edit profile button not found');
+      }
       await editBtn.click().catch(() => {});
       await this.humanLikeDelay(1500, 2500);
       await this.assertXProfileActionAllowed(page, { accountId });
@@ -4602,26 +4661,33 @@ class PlaywrightService {
         await this.humanLikeDelay(2500, 4000);
       }
 
+      // Re-open own profile (sidebar) for live verify + proof shot
+      const profileAgain =
+        (await page.$('[data-testid="AppTabBar_Profile_Link"]')) ||
+        (await page.locator('a[aria-label="Profile"]').first().elementHandle().catch(() => null));
+      if (profileAgain) {
+        await profileAgain.click().catch(() => {});
+        await this.humanLikeDelay(2500, 4000);
+      }
+
       const live = await this.readXLiveProfile(page, {
         accountId,
         username: account.username,
       });
-      const photoOk = !live.isDefaultAvatar;
+      const photoOk =
+        !!live.avatarSrc &&
+        /profile_images/i.test(live.avatarSrc) &&
+        !/profile_banners/i.test(live.avatarSrc) &&
+        !live.isDefaultAvatar;
       const bannerOk = !!live.hasCustomBanner;
       if (!photoOk || !bannerOk) {
+        await page.screenshot({ path: `/tmp/x-media-fail-${accountId}.png` }).catch(() => {});
         throw new Error(
           `x_media_verify_failed: photoOk=${photoOk} bannerOk=${bannerOk} ` +
-            `avatar=${(live.avatarSrc || '').slice(0, 60)} banner=${(live.bannerSrc || '').slice(0, 60)}`
+            `avatar=${(live.avatarSrc || '').slice(0, 80)} banner=${(live.bannerSrc || '').slice(0, 80)}`
         );
       }
 
-      await page
-        .goto(`https://x.com/${account.username}`, {
-          waitUntil: 'domcontentloaded',
-          timeout: 60000,
-        })
-        .catch(() => {});
-      await this.humanLikeDelay(2000, 3500);
       await page
         .screenshot({ path: `/tmp/x-media-proof-${accountId}.png`, fullPage: false })
         .catch(() => {});
@@ -5439,53 +5505,544 @@ class PlaywrightService {
     }
   }
 
+  /** Shared timeline scrape from whatever X page is loaded (home / search / explore). */
+  async xScrapeTimelinePosts(page, { limit = 10, source = 'x:timeline' } = {}) {
+    return page.evaluate((max, src) => {
+      const out = [];
+      const seen = new Set();
+      for (const a of document.querySelectorAll('a[href*="/status/"]')) {
+        const m = (a.href || '').match(/(?:x|twitter)\.com\/([^/]+)\/status\/(\d+)/i);
+        if (!m) continue;
+        const handle = m[1];
+        if (/^(i|home|explore|search|settings|messages|notifications)$/i.test(handle)) continue;
+        const url = `https://x.com/${handle}/status/${m[2]}`;
+        if (seen.has(url)) continue;
+        seen.add(url);
+        const article = a.closest('article');
+        const title = ((article && article.innerText) || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+        out.push({
+          post_url: url,
+          title,
+          selftext: title.slice(0, 400),
+          subreddit: src,
+          username: handle,
+          score: 0,
+          num_comments: 0,
+        });
+        if (out.length >= max) break;
+      }
+      return out;
+    }, limit, source);
+  }
+
+  /**
+   * Human-like keyword search on X Live tab.
+   * Lands on search URL, scrolls/pauses, returns status URLs.
+   */
+  async xSearchPosts(page, query, { limit = 12 } = {}) {
+    const q = String(query || '').trim();
+    if (!q) throw new Error('xSearchPosts requires a query');
+    const url = `https://x.com/search?q=${encodeURIComponent(q)}&src=typed_query&f=live`;
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 90000 });
+    await this.humanLikeDelay(2200, 4000);
+    await this.simulateHumanBehavior(page);
+    await this.randomScroll(page).catch(() => {});
+    await this.humanLikeDelay(900, 1800);
+    if (Math.random() < 0.55) {
+      await this.randomScroll(page).catch(() => {});
+      await this.humanLikeDelay(600, 1400);
+    }
+    return this.xScrapeTimelinePosts(page, { limit, source: `x:search:${q.slice(0, 40)}` });
+  }
+
+  /** People tab search → candidate handles. */
+  async xSearchPeople(page, query, { limit = 10 } = {}) {
+    const q = String(query || '').trim();
+    if (!q) throw new Error('xSearchPeople requires a query');
+    const url = `https://x.com/search?q=${encodeURIComponent(q)}&src=typed_query&f=user`;
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 90000 });
+    await this.humanLikeDelay(2200, 4000);
+    await this.simulateHumanBehavior(page);
+    await this.randomScroll(page).catch(() => {});
+    await this.humanLikeDelay(800, 1600);
+
+    return page.evaluate((max) => {
+      const out = [];
+      const seen = new Set();
+      const candidates = [
+        ...document.querySelectorAll('[data-testid="UserCell"] a[href^="/"]'),
+        ...document.querySelectorAll('a[href^="/"][role="link"]'),
+      ];
+      for (const a of candidates) {
+        const href = (a.getAttribute('href') || '').split('?')[0];
+        const m = href.match(/^\/([A-Za-z0-9_]{1,15})$/);
+        if (!m) continue;
+        const handle = m[1];
+        if (/^(home|explore|search|settings|messages|notifications|i|compose|login|signup|tos|privacy)$/i.test(handle)) {
+          continue;
+        }
+        const key = handle.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const cell = a.closest('[data-testid="UserCell"]') || a.closest('div');
+        const blurb = ((cell && cell.innerText) || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+        out.push({ handle, profile_url: `https://x.com/${handle}`, blurb });
+        if (out.length >= max) break;
+      }
+      return out;
+    }, limit);
+  }
+
+  /** Sidebar / connect "Who to follow" suggestions on home or connect. */
+  async xDiscoverWhoToFollow(page, { limit = 8 } = {}) {
+    const urls = [
+      'https://x.com/i/connect_people',
+      'https://x.com/home',
+    ];
+    for (const url of urls) {
+      try {
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await this.humanLikeDelay(2000, 3500);
+        await this.simulateHumanBehavior(page);
+        await this.randomScroll(page).catch(() => {});
+        const found = await page.evaluate((max) => {
+          const out = [];
+          const seen = new Set();
+          const cells = document.querySelectorAll('[data-testid="UserCell"], [data-testid="UserCell"]');
+          for (const cell of cells) {
+            const a = cell.querySelector('a[href^="/"]');
+            if (!a) continue;
+            const href = (a.getAttribute('href') || '').split('?')[0];
+            const m = href.match(/^\/([A-Za-z0-9_]{1,15})$/);
+            if (!m) continue;
+            const handle = m[1];
+            const key = handle.toLowerCase();
+            if (seen.has(key)) continue;
+            seen.add(key);
+            out.push({ handle, profile_url: `https://x.com/${handle}`, source: 'who_to_follow' });
+            if (out.length >= max) break;
+          }
+          // Aside "Who to follow" links
+          if (out.length < max) {
+            for (const a of document.querySelectorAll('aside a[href^="/"], [aria-label*="Who to follow"] a[href^="/"]')) {
+              const href = (a.getAttribute('href') || '').split('?')[0];
+              const m = href.match(/^\/([A-Za-z0-9_]{1,15})$/);
+              if (!m) continue;
+              const handle = m[1];
+              const key = handle.toLowerCase();
+              if (seen.has(key)) continue;
+              if (/^(home|explore|search|settings|i)$/i.test(handle)) continue;
+              seen.add(key);
+              out.push({ handle, profile_url: `https://x.com/${handle}`, source: 'who_to_follow' });
+              if (out.length >= max) break;
+            }
+          }
+          return out;
+        }, limit);
+        if (found.length) return found;
+      } catch (err) {
+        console.warn(`xDiscoverWhoToFollow ${url}:`, err.message);
+      }
+    }
+    return [];
+  }
+
+  /**
+   * Light following-of-following: open a seed profile's following list, skim a few handles.
+   */
+  async xDiscoverFollowingOfFollowing(page, seedHandle, { limit = 6 } = {}) {
+    const seed = String(seedHandle || '').replace(/^@/, '');
+    if (!seed) return [];
+    await page.goto(`https://x.com/${encodeURIComponent(seed)}/following`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 90000,
+    });
+    await this.humanLikeDelay(2200, 4000);
+    await this.simulateHumanBehavior(page);
+    await this.randomScroll(page).catch(() => {});
+    await this.humanLikeDelay(700, 1400);
+
+    return page.evaluate((max, seedLower) => {
+      const out = [];
+      const seen = new Set([seedLower]);
+      for (const a of document.querySelectorAll('[data-testid="UserCell"] a[href^="/"], a[href^="/"][role="link"]')) {
+        const href = (a.getAttribute('href') || '').split('?')[0];
+        const m = href.match(/^\/([A-Za-z0-9_]{1,15})$/);
+        if (!m) continue;
+        const handle = m[1];
+        const key = handle.toLowerCase();
+        if (seen.has(key)) continue;
+        if (/^(home|explore|search|settings|i|following|followers)$/i.test(handle)) continue;
+        seen.add(key);
+        out.push({
+          handle,
+          profile_url: `https://x.com/${handle}`,
+          source: 'following_of_following',
+          seed: seedLower,
+        });
+        if (out.length >= max) break;
+      }
+      return out;
+    }, limit, seed.toLowerCase());
+  }
+
+  /**
+   * Accept pending inbound follow requests (protected accounts / follower requests UI).
+   * Tries /follower_requests then notifications connect paths.
+   */
+  async xAcceptFollowRequests(page, { maxAccept = 5 } = {}) {
+    const accepted = [];
+    const screenshots = [];
+    const tryUrls = [
+      'https://x.com/follower_requests',
+      'https://x.com/i/follower_requests',
+      'https://x.com/settings/follower_requests',
+    ];
+
+    let landed = false;
+    for (const url of tryUrls) {
+      try {
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await this.humanLikeDelay(2000, 3500);
+        const path = page.url();
+        if (/login|i\/flow/i.test(path)) continue;
+        landed = true;
+        break;
+      } catch {
+        /* try next */
+      }
+    }
+
+    if (!landed) {
+      // Fallback: notifications → People you may know / requests chrome
+      try {
+        await page.goto('https://x.com/notifications', { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await this.humanLikeDelay(1800, 3000);
+        await page.evaluate(() => {
+          const links = Array.from(document.querySelectorAll('a, [role="tab"], [role="link"]'));
+          const hit = links.find((el) =>
+            /follower request|follow request|requests/i.test(
+              (el.innerText || el.getAttribute('aria-label') || '').trim()
+            )
+          );
+          if (hit) hit.click();
+        });
+        await this.humanLikeDelay(1500, 2800);
+      } catch {
+        /* empty */
+      }
+    }
+
+    await this.simulateHumanBehavior(page);
+    await this.humanLikeDelay(800, 1500);
+
+    const emptyShot = `/tmp/x-follow-requests-${Date.now()}.png`;
+    await page.screenshot({ path: emptyShot, fullPage: true }).catch(() => {});
+    screenshots.push(emptyShot);
+
+    for (let i = 0; i < maxAccept; i++) {
+      const clicked = await page.evaluate(() => {
+        const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+        for (const b of buttons) {
+          const label = (b.innerText || b.getAttribute('aria-label') || '').trim();
+          if (/^Accept$/i.test(label) || /^Approve$/i.test(label) || /Accept request/i.test(label)) {
+            const rect = b.getBoundingClientRect();
+            if (rect.width > 6 && rect.height > 6) {
+              b.click();
+              return label;
+            }
+          }
+        }
+        // data-testid variants
+        const byTest = document.querySelector(
+          '[data-testid="userFollowButton"], [data-testid*="accept"], [data-testid*="Approve"]'
+        );
+        if (byTest) {
+          byTest.click();
+          return byTest.getAttribute('data-testid') || 'testid';
+        }
+        return null;
+      });
+
+      if (!clicked) break;
+      accepted.push({ at: new Date().toISOString(), button: clicked });
+      await this.humanLikeDelay(1200, 2800);
+      if (Math.random() < 0.4) await this.simulateHumanBehavior(page);
+    }
+
+    const bodyText = await page.evaluate(() => (document.body?.innerText || '').slice(0, 400));
+    const empty =
+      accepted.length === 0 &&
+      /no (pending )?follower requests|no requests|nothing to see|when someone requests/i.test(bodyText);
+
+    return {
+      accepted: accepted.length,
+      details: accepted,
+      empty: !!empty || accepted.length === 0,
+      url: page.url(),
+      screenshots,
+    };
+  }
+
+  async _openXCookieSession(accountId, { requireProxy = true } = {}) {
+    if (requireProxy) await this.requireProxyForLive(accountId);
+    const result = await this.createBrowserForAccount(accountId, 2, {
+      requireProxy,
+      skipProxy: !requireProxy,
+    });
+    const account = await this.getAccount(accountId);
+    const creds = account.credentials || {};
+    const loggedIn = await this.ensureLoggedIn(
+      result.page,
+      'x',
+      accountId,
+      account.username,
+      creds.password,
+      { allowLogin: false, totpSecret: creds.totp_secret || creds.totp || creds.twofa }
+    );
+    if (!loggedIn) {
+      await result.browser.close().catch(() => {});
+      this._untrackBrowser(accountId);
+      throw new Error('X session not alive (cookie-only; no password login)');
+    }
+    return { ...result, account };
+  }
+
   async listXHomePosts(accountId, { limit = 8 } = {}) {
     let browser;
     try {
-      await this.requireProxyForLive(accountId);
-      const result = await this.createBrowserForAccount(accountId, 2, { requireProxy: true });
-      browser = result.browser;
-      const page = result.page;
-      const account = await this.getAccount(accountId);
-      const creds = account.credentials || {};
-      const loggedIn = await this.ensureLoggedIn(
-        page,
-        'x',
-        accountId,
-        account.username,
-        creds.password,
-        { allowLogin: false, totpSecret: creds.totp_secret }
-      );
-      if (!loggedIn) throw new Error('X session not alive for discovery');
+      const opened = await this._openXCookieSession(accountId);
+      browser = opened.browser;
+      const page = opened.page;
 
       await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 60000 });
       await this.humanLikeDelay(2000, 3500);
+      await this.simulateHumanBehavior(page);
       await this.randomScroll(page).catch(() => {});
 
-      const posts = await page.evaluate((max) => {
-        const out = [];
-        const seen = new Set();
-        for (const a of document.querySelectorAll('a[href*="/status/"]')) {
-          const m = (a.href || '').match(/(?:x|twitter)\.com\/([^/]+)\/status\/(\d+)/i);
-          if (!m) continue;
-          const url = `https://x.com/${m[1]}/status/${m[2]}`;
-          if (seen.has(url)) continue;
-          seen.add(url);
-          const article = a.closest('article');
-          const title = ((article && article.innerText) || '').replace(/\s+/g, ' ').trim().slice(0, 160);
-          out.push({
-            post_url: url,
-            title,
-            selftext: title.slice(0, 400),
-            subreddit: 'x:home',
-            score: 0,
-            num_comments: 0,
-          });
-          if (out.length >= max) break;
-        }
-        return out;
-      }, limit);
+      return this.xScrapeTimelinePosts(page, { limit, source: 'x:home' });
+    } finally {
+      if (browser) await browser.close().catch(() => {});
+      this._untrackBrowser(accountId);
+    }
+  }
+
+  async listXSearchPosts(accountId, { query, limit = 12 } = {}) {
+    let browser;
+    try {
+      const opened = await this._openXCookieSession(accountId);
+      browser = opened.browser;
+      const posts = await this.xSearchPosts(opened.page, query, { limit });
+      await this.persistSession(opened.page, 'x', accountId).catch(() => {});
       return posts;
+    } finally {
+      if (browser) await browser.close().catch(() => {});
+      this._untrackBrowser(accountId);
+    }
+  }
+
+  async listXSearchPeople(accountId, { query, limit = 10 } = {}) {
+    let browser;
+    try {
+      const opened = await this._openXCookieSession(accountId);
+      browser = opened.browser;
+      const people = await this.xSearchPeople(opened.page, query, { limit });
+      await this.persistSession(opened.page, 'x', accountId).catch(() => {});
+      return people;
+    } finally {
+      if (browser) await browser.close().catch(() => {});
+      this._untrackBrowser(accountId);
+    }
+  }
+
+  async acceptXFollowRequests(accountId, { maxAccept = 5, requireProxy = true } = {}) {
+    let browser;
+    try {
+      const opened = await this._openXCookieSession(accountId, { requireProxy });
+      browser = opened.browser;
+      const result = await this.xAcceptFollowRequests(opened.page, { maxAccept });
+      await this.persistSession(opened.page, 'x', accountId).catch(() => {});
+      return { success: true, accountId, username: opened.account.username, ...result };
+    } finally {
+      if (browser) await browser.close().catch(() => {});
+      this._untrackBrowser(accountId);
+    }
+  }
+
+  /**
+   * Discover follow targets via people search + who-to-follow + light FoF.
+   * Does not follow — returns handles for x_follow_targets insert.
+   */
+  async discoverXFollowTargets(accountId, {
+    keywords = [],
+    seedHandles = [],
+    limit = 15,
+    requireProxy = true,
+  } = {}) {
+    let browser;
+    try {
+      const opened = await this._openXCookieSession(accountId, { requireProxy });
+      browser = opened.browser;
+      const page = opened.page;
+      const found = [];
+      const seen = new Set();
+
+      const pushAll = (rows, category) => {
+        for (const row of rows || []) {
+          const handle = String(row.handle || '').replace(/^@/, '');
+          if (!handle) continue;
+          const key = handle.toLowerCase();
+          if (seen.has(key)) continue;
+          if (key === String(opened.account.username || '').toLowerCase()) continue;
+          seen.add(key);
+          found.push({
+            handle,
+            category: category || row.source || 'discovered',
+            profile_url: row.profile_url || `https://x.com/${handle}`,
+            source: row.source || category || 'search',
+          });
+        }
+      };
+
+      for (const kw of (keywords || []).slice(0, 3)) {
+        if (found.length >= limit) break;
+        try {
+          await this.humanLikeDelay(800, 1600);
+          const people = await this.xSearchPeople(page, kw, { limit: 8 });
+          pushAll(people.map((p) => ({ ...p, source: 'search_people' })), 'discovered');
+        } catch (err) {
+          console.warn(`discover people "${kw}":`, err.message);
+        }
+      }
+
+      if (found.length < limit) {
+        try {
+          const who = await this.xDiscoverWhoToFollow(page, { limit: 8 });
+          pushAll(who, 'discovered');
+        } catch (err) {
+          console.warn('who_to_follow:', err.message);
+        }
+      }
+
+      for (const seed of (seedHandles || []).slice(0, 2)) {
+        if (found.length >= limit) break;
+        try {
+          await this.humanLikeDelay(1000, 2000);
+          const fof = await this.xDiscoverFollowingOfFollowing(page, seed, { limit: 5 });
+          pushAll(fof, 'discovered');
+        } catch (err) {
+          console.warn(`fof @${seed}:`, err.message);
+        }
+      }
+
+      await this.persistSession(page, 'x', accountId).catch(() => {});
+      return {
+        success: true,
+        accountId,
+        username: opened.account.username,
+        targets: found.slice(0, limit),
+      };
+    } finally {
+      if (browser) await browser.close().catch(() => {});
+      this._untrackBrowser(accountId);
+    }
+  }
+
+  /**
+   * Cookie-only smoke: search → comment (one session).
+   */
+  async smokeTestXSearchComment(accountId, {
+    query = 'NBA',
+    comment = null,
+    requireProxy = true,
+  } = {}) {
+    let browser;
+    const steps = [];
+    try {
+      const opened = await this._openXCookieSession(accountId, { requireProxy });
+      browser = opened.browser;
+      const page = opened.page;
+      steps.push({ step: 'session', ok: true });
+
+      const posts = await this.xSearchPosts(page, query, { limit: 8 });
+      steps.push({ step: 'search', ok: posts.length > 0, count: posts.length, query, sample: posts[0]?.post_url });
+      if (!posts.length) throw new Error(`No search posts for "${query}"`);
+
+      // Browse then open one result
+      await this.humanLikeDelay(1000, 2200);
+      const target = posts[Math.floor(Math.random() * Math.min(3, posts.length))];
+      const replyText =
+        comment ||
+        this.pickRandom([
+          'fair point',
+          'hadnt thought about it that way',
+          'wild',
+          'makes sense',
+          'good look',
+          'interesting',
+        ]);
+
+      const commented = await this.xPostComment(page, target.post_url, replyText);
+      steps.push({
+        step: 'comment',
+        ok: !!commented,
+        postUrl: target.post_url,
+        comment: replyText,
+      });
+      if (!commented) throw new Error('X search comment failed');
+
+      await this.persistSession(page, 'x', accountId).catch(() => {});
+      return {
+        success: true,
+        accountId,
+        username: opened.account.username,
+        query,
+        steps,
+      };
+    } catch (error) {
+      return { success: false, accountId, error: error.message, steps };
+    } finally {
+      if (browser) await browser.close().catch(() => {});
+      this._untrackBrowser(accountId);
+    }
+  }
+
+  /**
+   * Cookie-only smoke: people search → follow one.
+   */
+  async smokeTestXSearchFollow(accountId, {
+    query = 'fantasy football',
+    requireProxy = true,
+  } = {}) {
+    let browser;
+    const steps = [];
+    try {
+      const opened = await this._openXCookieSession(accountId, { requireProxy });
+      browser = opened.browser;
+      const page = opened.page;
+      steps.push({ step: 'session', ok: true });
+
+      const people = await this.xSearchPeople(page, query, { limit: 8 });
+      steps.push({ step: 'search_people', ok: people.length > 0, count: people.length, sample: people[0]?.handle });
+      if (!people.length) throw new Error(`No people for "${query}"`);
+
+      const pick = people.find((p) => p.handle.toLowerCase() !== String(opened.account.username || '').toLowerCase())
+        || people[0];
+      await this.humanLikeDelay(1200, 2400);
+      const follow = await this.xFollowUser(page, pick.handle);
+      steps.push({ step: 'follow', ok: true, handle: pick.handle, ...follow });
+
+      await this.persistSession(page, 'x', accountId).catch(() => {});
+      return {
+        success: true,
+        accountId,
+        username: opened.account.username,
+        query,
+        handle: pick.handle,
+        steps,
+      };
+    } catch (error) {
+      return { success: false, accountId, error: error.message, steps };
     } finally {
       if (browser) await browser.close().catch(() => {});
       this._untrackBrowser(accountId);

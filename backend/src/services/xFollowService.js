@@ -190,6 +190,7 @@ class XFollowService {
   }
 
   async listEligibleAccounts() {
+    // Cookie-only path: live session + proxy required; password NOT required.
     const result = await pool.query(
       `SELECT sa.*
        FROM social_accounts sa
@@ -197,9 +198,8 @@ class XFollowService {
        WHERE sa.platform = 'x'
          AND COALESCE(sa.is_simulated, false) = false
          AND sa.status = 'active'
-         AND COALESCE(sa.credentials->>'password', '') NOT IN ('', 'default_password')
          AND (j.cooldown_until IS NULL OR j.cooldown_until <= NOW())
-         AND COALESCE(j.failure_class, '') NOT IN ('bad_credentials')
+         AND COALESCE(j.failure_class, '') NOT IN ('bad_credentials', 'banned')
          AND EXISTS (
            SELECT 1 FROM social_account_proxies sap
            JOIN proxies p ON p.id = sap.proxy_id
@@ -218,6 +218,154 @@ class XFollowService {
        ORDER BY sa.id`
     );
     return result.rows;
+  }
+
+  /** Topic keywords for people-search discovery (persona + packs). */
+  getDiscoveryKeywords(account) {
+    const { X_TOPIC_PACKS } = require('./organicDiscoveryService');
+    const packs = X_TOPIC_PACKS || {};
+    const keywords = [];
+    let traits = account.persona_traits;
+    if (typeof traits === 'string') {
+      try { traits = JSON.parse(traits); } catch { traits = {}; }
+    }
+    traits = traits || {};
+    const creds = account.credentials && typeof account.credentials === 'object'
+      ? account.credentials
+      : {};
+    const xp = creds.x_persona && typeof creds.x_persona === 'object' ? creds.x_persona : {};
+
+    for (const exp of Array.isArray(traits.expertise) ? traits.expertise : []) {
+      keywords.push(String(exp));
+    }
+    if (xp.interest) keywords.push(String(xp.interest));
+
+    const blob = `${JSON.stringify(traits)} ${JSON.stringify(xp)}`.toLowerCase();
+    if (/sport|nba|nfl|fantasy|dfs/.test(blob) || !keywords.length) {
+      keywords.push(...(packs.sports || ['NBA', 'NFL']).slice(0, 3));
+      keywords.push(...(packs.dfs || ['DraftKings']).slice(0, 2));
+    }
+    if (/tech|ai|code|startup/.test(blob) || Math.random() < 0.4) {
+      keywords.push(...(packs.tech || ['AI tools', 'startups']).slice(0, 2));
+    }
+
+    return [...new Set(keywords.map((k) => String(k).trim()).filter((k) => k.length >= 2))].slice(0, 5);
+  }
+
+  async insertDiscoveredTargets(targets, { category = 'discovered', priority = 80 } = {}) {
+    let inserted = 0;
+    for (const t of targets || []) {
+      const handle = String(t.handle || '').replace(/^@/, '').trim();
+      if (!handle || handle.length > 15) continue;
+      const cat = String(t.category || category).slice(0, 50);
+      const notes = t.source ? `source=${t.source}` : null;
+      const result = await pool.query(
+        `INSERT INTO x_follow_targets (handle, category, enabled, priority, notes)
+         VALUES ($1, $2, true, $3, $4)
+         ON CONFLICT (handle) DO NOTHING
+         RETURNING id`,
+        [handle, cat, priority, notes]
+      );
+      if (result.rowCount) inserted += 1;
+    }
+    return inserted;
+  }
+
+  /**
+   * Discover new follow targets via people search / who-to-follow / FoF.
+   * Deduped insert into x_follow_targets.
+   */
+  async discoverTargetsForAccount(account, { limit = 12 } = {}) {
+    const keywords = this.getDiscoveryKeywords(account);
+    const seeds = await pool.query(
+      `SELECT handle FROM x_follow_targets
+       WHERE enabled = true AND category IN ('sports','dfs','tech','discovered')
+       ORDER BY priority ASC, random()
+       LIMIT 3`
+    );
+    const result = await playwrightService.discoverXFollowTargets(account.id, {
+      keywords,
+      seedHandles: seeds.rows.map((r) => r.handle),
+      limit,
+      requireProxy: true,
+    });
+    const inserted = await this.insertDiscoveredTargets(result.targets || [], {
+      category: 'discovered',
+      priority: 75,
+    });
+    await pool.query(
+      `UPDATE x_follow_jobs
+       SET last_discover_at = NOW(), updated_at = NOW()
+       WHERE social_account_id = $1`,
+      [account.id]
+    ).catch(() => {});
+    return {
+      success: true,
+      accountId: account.id,
+      keywords,
+      found: (result.targets || []).length,
+      inserted,
+      sample: (result.targets || []).slice(0, 5).map((t) => t.handle),
+    };
+  }
+
+  /**
+   * Accept pending inbound follow requests (daily cap).
+   */
+  async acceptFollowsForAccount(account, { maxAccept = 5, dailyCap = 10 } = {}) {
+    let job = await this.ensureJob(account.id);
+    const today = new Date().toISOString().slice(0, 10);
+    const dayKey = job.accepts_day_key
+      ? new Date(job.accepts_day_key).toISOString().slice(0, 10)
+      : null;
+    let acceptsToday = job.accepts_today || 0;
+    if (dayKey !== today) {
+      acceptsToday = 0;
+      await pool.query(
+        `UPDATE x_follow_jobs
+         SET accepts_today = 0, accepts_day_key = CURRENT_DATE, updated_at = NOW()
+         WHERE id = $1`,
+        [job.id]
+      ).catch(() => {});
+    }
+    if (acceptsToday >= dailyCap) {
+      return { skipped: true, reason: 'accept_daily_cap', acceptsToday };
+    }
+
+    const room = Math.min(maxAccept, dailyCap - acceptsToday);
+    const result = await playwrightService.acceptXFollowRequests(account.id, {
+      maxAccept: room,
+      requireProxy: true,
+    });
+
+    const n = result.accepted || 0;
+    if (n > 0) {
+      await pool.query(
+        `UPDATE x_follow_jobs
+         SET accepts_today = COALESCE(accepts_today, 0) + $2,
+             accepts_day_key = CURRENT_DATE,
+             last_accept_at = NOW(),
+             updated_at = NOW()
+         WHERE social_account_id = $1`,
+        [account.id, n]
+      ).catch(() => {});
+    } else {
+      await pool.query(
+        `UPDATE x_follow_jobs
+         SET last_accept_at = NOW(), updated_at = NOW()
+         WHERE social_account_id = $1`,
+        [account.id]
+      ).catch(() => {});
+    }
+
+    return {
+      success: true,
+      accountId: account.id,
+      accepted: n,
+      empty: !!result.empty,
+      screenshots: result.screenshots || [],
+      acceptsToday: acceptsToday + n,
+    };
   }
 
   /**

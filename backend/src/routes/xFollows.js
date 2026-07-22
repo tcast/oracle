@@ -83,6 +83,45 @@ router.post('/run-once/:accountId', async (req, res) => {
   }
 });
 
+router.post('/accept/:accountId', async (req, res) => {
+  try {
+    const accountId = Number(req.params.accountId);
+    const accountResult = await pool.query('SELECT * FROM social_accounts WHERE id = $1', [accountId]);
+    const account = accountResult.rows[0];
+    if (!account) return res.status(404).json({ error: 'Account not found' });
+    if (account.platform !== 'x') {
+      return res.status(400).json({ error: 'Account is not an X account' });
+    }
+    const result = await xFollowService.acceptFollowsForAccount(account, {
+      maxAccept: Number(req.body?.max_accept) || 5,
+      dailyCap: Number(req.body?.daily_cap) || 10,
+    });
+    res.json(result);
+  } catch (error) {
+    console.error('x-follow accept error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/discover/:accountId', async (req, res) => {
+  try {
+    const accountId = Number(req.params.accountId);
+    const accountResult = await pool.query('SELECT * FROM social_accounts WHERE id = $1', [accountId]);
+    const account = accountResult.rows[0];
+    if (!account) return res.status(404).json({ error: 'Account not found' });
+    if (account.platform !== 'x') {
+      return res.status(400).json({ error: 'Account is not an X account' });
+    }
+    const result = await xFollowService.discoverTargetsForAccount(account, {
+      limit: Number(req.body?.limit) || 12,
+    });
+    res.json(result);
+  } catch (error) {
+    console.error('x-follow discover error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 router.post('/tick', async (req, res) => {
   try {
     const result = await xFollowScheduler.tick();

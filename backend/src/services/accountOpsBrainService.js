@@ -382,7 +382,10 @@ class AccountOpsBrainService {
               fj.follows_today,
               fj.daily_target AS follow_target,
               fj.cooldown_until AS follow_cooldown,
-              fj.status AS follow_status
+              fj.status AS follow_status,
+              fj.accepts_today,
+              fj.last_accept_at,
+              fj.last_discover_at
        FROM social_accounts sa
        LEFT JOIN organic_comment_jobs j ON j.social_account_id = sa.id
        LEFT JOIN x_follow_jobs fj ON fj.social_account_id = sa.id
@@ -403,6 +406,7 @@ class AccountOpsBrainService {
   }
 
   decideAction(account, { quietOrganic, quietFollow, profileBudget }) {
+    // Order: profile_gap → accept_follows → discover_targets → follow → search/home comment
     const platform = String(account.platform || '').toLowerCase() === 'twitter'
       ? 'x'
       : String(account.platform || '').toLowerCase();
@@ -443,6 +447,30 @@ class AccountOpsBrainService {
     }
 
     const now = Date.now();
+    const sixHours = 6 * 60 * 60 * 1000;
+    const lastAccept = account.last_accept_at ? new Date(account.last_accept_at).getTime() : 0;
+    const lastDiscover = account.last_discover_at ? new Date(account.last_discover_at).getTime() : 0;
+    const acceptsToday = account.accepts_today || 0;
+
+    if (
+      platform === 'x' &&
+      !quietFollow &&
+      acceptsToday < 10 &&
+      (!lastAccept || now - lastAccept > sixHours) &&
+      Math.random() < 0.35
+    ) {
+      return { type: 'accept_follows', priority: 2 };
+    }
+
+    if (
+      platform === 'x' &&
+      !quietFollow &&
+      (!lastDiscover || now - lastDiscover > 12 * 60 * 60 * 1000) &&
+      Math.random() < 0.3
+    ) {
+      return { type: 'discover_targets', priority: 3 };
+    }
+
     const followDue =
       platform === 'x' &&
       !quietFollow &&
@@ -451,8 +479,8 @@ class AccountOpsBrainService {
       (!account.follow_due || new Date(account.follow_due).getTime() <= now) &&
       (account.follows_today || 0) < (account.follow_target || 5);
 
-    if (followDue && Math.random() < 0.45) {
-      return { type: 'network', priority: 2 };
+    if (followDue && Math.random() < 0.5) {
+      return { type: 'network', priority: 4 };
     }
 
     const organicDue =
@@ -464,21 +492,22 @@ class AccountOpsBrainService {
       (account.comments_today || 0) < (account.daily_target || 3);
 
     if (organicDue) {
-      return { type: 'organic_comment', priority: 3 };
+      // organicDiscoveryService prefers search over home for X
+      return { type: 'search_comment', priority: 5 };
     }
 
     if (followDue) {
-      return { type: 'network', priority: 2 };
+      return { type: 'network', priority: 4 };
     }
 
-    // Light engage: browse/warm via organic path when under daily cap but due soon
+    // Light engage: browse/warm via organic path when under daily cap
     if (
       !quietOrganic &&
       account.organic_enabled &&
       (account.comments_today || 0) < (account.daily_target || 3) &&
       Math.random() < 0.2
     ) {
-      return { type: 'organic_comment', priority: 4 };
+      return { type: 'home_comment', priority: 6 };
     }
 
     return null;
@@ -497,6 +526,24 @@ class AccountOpsBrainService {
         );
         return { type: action.type, accountId: account.id, platform: account.platform, ...result, ms: Date.now() - started };
       }
+      if (action.type === 'accept_follows') {
+        const full = await pool.query('SELECT * FROM social_accounts WHERE id = $1', [account.id]);
+        const result = await withTimeout(
+          xFollowService.acceptFollowsForAccount(full.rows[0] || account, { maxAccept: 5, dailyCap: 10 }),
+          WORKER_HARD_MS,
+          'accept_follows'
+        );
+        return { type: action.type, accountId: account.id, platform: account.platform, ...result, ms: Date.now() - started };
+      }
+      if (action.type === 'discover_targets') {
+        const full = await pool.query('SELECT * FROM social_accounts WHERE id = $1', [account.id]);
+        const result = await withTimeout(
+          xFollowService.discoverTargetsForAccount(full.rows[0] || account, { limit: 12 }),
+          WORKER_HARD_MS,
+          'discover_targets'
+        );
+        return { type: action.type, accountId: account.id, platform: account.platform, ...result, ms: Date.now() - started };
+      }
       if (action.type === 'network') {
         const result = await withTimeout(
           xFollowService.runOneForAccount(account, { dryRun: false }),
@@ -505,7 +552,7 @@ class AccountOpsBrainService {
         );
         return { type: action.type, accountId: account.id, platform: account.platform, ...result, ms: Date.now() - started };
       }
-      if (action.type === 'organic_comment') {
+      if (action.type === 'search_comment' || action.type === 'home_comment' || action.type === 'organic_comment') {
         const result = await withTimeout(
           organicCommentService.runOneForAccount(account, { dryRun: false }),
           WORKER_HARD_MS,
