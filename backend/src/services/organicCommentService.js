@@ -732,7 +732,8 @@ Write only the comment text.`;
       if (
         /No commentable|gate_failed|duplicate key|has been closed|Target closed|browser.*closed/i.test(
           msg
-        )
+        ) &&
+        !/no_live_session|session_not_logged_in|cookie_session_dead/i.test(msg)
       ) {
         const next = this.computeNextDue(settings, job.comments_today, { daily_target: job.daily_target });
         await pool.query(

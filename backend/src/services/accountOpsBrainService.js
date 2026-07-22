@@ -473,6 +473,20 @@ class AccountOpsBrainService {
            WHERE sap.social_account_id = sa.id AND sap.is_active = true
              AND p.is_active = true
          )
+         AND EXISTS (
+           SELECT 1 FROM browser_sessions bs
+           WHERE bs.account_id = sa.id
+             AND (
+               lower(sa.platform) NOT IN ('x', 'twitter')
+               OR (
+                 bs.platform = 'x'
+                 AND bs.cookies IS NOT NULL
+                 AND jsonb_array_length(bs.cookies) > 0
+                 AND bs.updated_at > NOW() - INTERVAL '72 hours'
+               )
+             )
+         )
+         AND COALESCE(j.failure_class, '') NOT IN ('banned', 'session_dead', 'bad_credentials')
        ORDER BY random()
        LIMIT $2`,
       [['x', 'twitter', 'reddit'], limit]

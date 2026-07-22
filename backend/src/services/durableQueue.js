@@ -515,9 +515,9 @@ class DurableQueue {
 
   accountOpsBrainDelayMs(overrideMs = null) {
     if (overrideMs != null) return overrideMs;
-    // ~2–4 min — faster than organic so enrollment/profile gaps close quickly
-    const base = 2 * 60 * 1000;
-    const jitter = Math.random() * 2 * 60 * 1000;
+    // ~45–90s — keep comment/follow workers busy
+    const base = 45 * 1000;
+    const jitter = Math.random() * 45 * 1000;
     return base + jitter;
   }
 

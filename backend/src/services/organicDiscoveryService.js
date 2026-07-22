@@ -328,6 +328,9 @@ class OrganicDiscoveryService {
         }
       } catch (err) {
         console.warn(`X search discovery "${query}":`, err.message);
+        if (/no_live_session|session_not_logged_in|cookie_session_dead/i.test(err.message || '')) {
+          throw err;
+        }
       }
     }
 
@@ -351,6 +354,9 @@ class OrganicDiscoveryService {
       }
     } catch (err) {
       console.warn('X home discovery:', err.message);
+      if (/no_live_session|session_not_logged_in|cookie_session_dead/i.test(err.message || '')) {
+        throw err;
+      }
     }
 
     throw new Error(`No commentable X posts (tried: ${tried.join(', ')})`);
