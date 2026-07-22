@@ -4149,9 +4149,7 @@ class PlaywrightService {
     }
 
     await this.humanLikeDelay(2500, 4000);
-    await this._applyXMediaCropAndSave(page, {
-      saveProfile: options.saveProfile !== false,
-    });
+    await this._applyXMediaCropAndSave(page, { saveProfile });
     await this.assertXProfileActionAllowed(page, { accountId });
   }
 
