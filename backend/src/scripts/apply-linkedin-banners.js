@@ -66,12 +66,17 @@ async function main() {
   let limit = 50;
   let parallel = 4;
   let ids = null;
-  for (const a of args) {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
     if (a.startsWith('--limit=')) limit = Number(a.split('=')[1]);
-    else if (a === '--limit') limit = Number(args[args.indexOf(a) + 1]);
-    else if (a.startsWith('--parallel=')) parallel = Number(a.split('=')[1]);
-    else if (a === '--parallel') parallel = Number(args[args.indexOf(a) + 1]);
-    else if (/^\d+(,\d+)*$/.test(a)) ids = a.split(',').map(Number);
+    else if (a === '--limit') {
+      limit = Number(args[++i]);
+    } else if (a.startsWith('--parallel=')) parallel = Number(a.split('=')[1]);
+    else if (a === '--parallel') {
+      parallel = Number(args[++i]);
+    } else if (/^\d+(,\d+)*$/.test(a)) {
+      ids = a.split(',').map(Number);
+    }
   }
   parallel = Math.min(5, Math.max(1, parallel || 4));
 
