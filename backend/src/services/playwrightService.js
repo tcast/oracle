@@ -2844,21 +2844,15 @@ class PlaywrightService {
       await this.dismissLinkedInModals(page).catch(() => {});
       await this.randomScroll(page).catch(() => {});
 
-      // Open Edit/Add background — NEVER profile photo controls
+      // Camera on cover → menu → "Add cover image" / "Change cover image"
+      // (NOT profile photo controls)
       let opened = false;
-      const bgCandidates = await page.$$(
-        'button[aria-label*="Edit background" i], button[aria-label*="Add background" i], a[aria-label*="Edit background" i], a[aria-label*="Add background" i], button[aria-label*="background photo" i], a[aria-label*="background photo" i], button[aria-label*="cover photo" i]'
-      );
-      for (const el of bgCandidates) {
-        const label = ((await el.getAttribute('aria-label').catch(() => '')) || '').toLowerCase();
-        if (/profile photo|edit photo|add photo|change photo/i.test(label) && !/background|cover|banner/i.test(label)) {
-          continue;
-        }
-        if (await el.isVisible().catch(() => false)) {
-          await el.click({ force: true });
-          opened = true;
-          break;
-        }
+      const bgBtn = page.locator(
+        'button[aria-label*="background" i], button[aria-label*="Edit background" i], button[aria-label*="Add background" i], a[aria-label*="background" i], button[aria-label*="cover" i]'
+      ).first();
+      if (await bgBtn.isVisible().catch(() => false)) {
+        await bgBtn.click({ force: true });
+        opened = true;
       }
       if (!opened) {
         opened = await page.evaluate(() => {
@@ -2884,33 +2878,43 @@ class PlaywrightService {
         await page.screenshot({ path: `/tmp/linkedin-banner-no-edit-${accountId}.png` }).catch(() => {});
         throw new Error('Edit background control not found');
       }
-      await this.humanLikeDelay(1500, 2500);
+      await this.humanLikeDelay(700, 1400);
+
+      // Second click: menu item "Add cover image"
+      const coverItem = page.locator(
+        '[aria-label="Add cover image"], [aria-label*="Add cover image" i], [aria-label*="Change cover image" i], [aria-label*="Edit cover image" i]'
+      ).first();
+      const coverVisible = await coverItem.isVisible().catch(() => false);
 
       try {
         const [chooser] = await Promise.all([
-          page.waitForEvent('filechooser', { timeout: 12000 }),
-          page.evaluate(() => {
-            const buttons = [...document.querySelectorAll('button, [role="button"], label')];
-            const b =
-              buttons.find((x) =>
-                /upload (photo|image|background|cover)|change (photo|image|background)|select (image|photo)/i.test(
-                  (x.innerText || x.getAttribute('aria-label') || '').trim()
-                )
-              ) ||
-              buttons.find((x) => /^Upload photo$/i.test((x.innerText || '').trim()));
-            if (b) b.click();
-          }),
+          page.waitForEvent('filechooser', { timeout: 15000 }),
+          coverVisible
+            ? coverItem.click({ force: true })
+            : page.evaluate(() => {
+                const els = [
+                  ...document.querySelectorAll('[aria-label], button, a, div[role="menuitem"], li, span'),
+                ];
+                const el = els.find((e) => {
+                  const label = `${e.getAttribute('aria-label') || ''} ${(e.innerText || '').trim()}`;
+                  return /^(Add|Change|Edit) cover image$/i.test(label.trim()) ||
+                    (/cover image/i.test(label) && !/slideshow|premium/i.test(label));
+                });
+                if (!el) throw new Error('Add cover image menu item not found');
+                el.click();
+              }),
         ]);
         await chooser.setFiles(bannerPath);
-        console.log(`LinkedIn #${accountId}: banner file set via chooser`);
+        console.log(`LinkedIn #${accountId}: banner file set via cover menu chooser`);
       } catch (e) {
-        console.warn(`LinkedIn #${accountId}: banner filechooser failed (${e.message}), trying input`);
+        console.warn(`LinkedIn #${accountId}: cover chooser failed (${e.message}), trying input`);
         const inputs = await page.$$('input[type="file"]');
         let set = false;
         for (const input of inputs) {
           const lab = (
             (await input.getAttribute('aria-label').catch(() => '')) ||
             (await input.getAttribute('name').catch(() => '')) ||
+            (await input.getAttribute('accept').catch(() => '')) ||
             ''
           ).toLowerCase();
           if (/avatar|profile.?photo|profile.?picture/i.test(lab) && !/background|cover|banner/i.test(lab)) {
@@ -2919,6 +2923,10 @@ class PlaywrightService {
           await input.setInputFiles(bannerPath);
           set = true;
           break;
+        }
+        if (!set && inputs[0]) {
+          await inputs[0].setInputFiles(bannerPath);
+          set = true;
         }
         if (!set) {
           await page.screenshot({ path: `/tmp/linkedin-banner-no-input-${accountId}.png` }).catch(() => {});
@@ -2996,13 +3004,15 @@ class PlaywrightService {
           ) ||
           imgs.find((i) => /media\.licdn\.com.*(?:bg|background|cover)/i.test(i.src));
         let bannerBg = null;
-        const bgEl = [...document.querySelectorAll('div, section, figure')].find((el) => {
+        for (const el of document.querySelectorAll('div, section, figure, span')) {
           const s = getComputedStyle(el).backgroundImage || '';
-          return /media\.licdn\.com/i.test(s) && /background|cover|banner|profile-displaybackground/i.test(s + el.className);
-        });
-        if (bgEl) {
-          const m = (getComputedStyle(bgEl).backgroundImage || '').match(/url\(["']?([^"')]+)/);
-          bannerBg = m ? m[1] : null;
+          if (!/media\.licdn\.com/i.test(s)) continue;
+          const r = el.getBoundingClientRect();
+          if (r.width > 400 && r.height > 80 && r.top < 450) {
+            const m = s.match(/url\(["']?([^"')]+)/);
+            bannerBg = m ? m[1] : null;
+            break;
+          }
         }
         const bannerSrc = bannerImg?.src || bannerBg || null;
         return {
