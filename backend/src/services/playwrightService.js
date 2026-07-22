@@ -2844,94 +2844,74 @@ class PlaywrightService {
       await this.dismissLinkedInModals(page).catch(() => {});
       await this.randomScroll(page).catch(() => {});
 
-      // Camera on cover → menu → "Add cover image" / "Change cover image"
-      // (NOT profile photo controls)
-      let opened = false;
+      // Step 1: camera on cover → menu
       const bgBtn = page.locator(
         'button[aria-label*="background" i], button[aria-label*="Edit background" i], button[aria-label*="Add background" i], a[aria-label*="background" i], button[aria-label*="cover" i]'
       ).first();
-      if (await bgBtn.isVisible().catch(() => false)) {
-        await bgBtn.click({ force: true });
-        opened = true;
-      }
-      if (!opened) {
-        opened = await page.evaluate(() => {
-          const els = [...document.querySelectorAll('a, button, [role="button"]')];
-          const el = els.find((e) => {
-            const label = `${e.getAttribute('aria-label') || ''} ${e.innerText || ''}`;
-            if (!/background|cover (photo|image)|banner/i.test(label)) return false;
-            if (/profile photo|add photo|edit photo/i.test(label) && !/background|cover|banner/i.test(label)) {
-              return false;
-            }
-            const r = e.getBoundingClientRect();
-            return r.width > 0 && r.height > 0;
-          });
-          if (el) {
-            el.scrollIntoView({ block: 'center' });
-            el.click();
-            return true;
-          }
-          return false;
-        });
-      }
-      if (!opened) {
+      if (!(await bgBtn.isVisible().catch(() => false))) {
         await page.screenshot({ path: `/tmp/linkedin-banner-no-edit-${accountId}.png` }).catch(() => {});
         throw new Error('Edit background control not found');
       }
+      await bgBtn.click({ force: true });
       await this.humanLikeDelay(700, 1400);
 
-      // Second click: menu item "Add cover image"
+      // Step 2: "Add cover image" opens cover modal (not a filechooser yet)
       const coverItem = page.locator(
-        '[aria-label="Add cover image"], [aria-label*="Add cover image" i], [aria-label*="Change cover image" i], [aria-label*="Edit cover image" i]'
+        'div[aria-label="Add cover image"], [aria-label="Add cover image"], [aria-label*="Add cover image" i], [aria-label*="Change cover image" i]'
       ).first();
-      const coverVisible = await coverItem.isVisible().catch(() => false);
+      if (await coverItem.isVisible().catch(() => false)) {
+        await coverItem.click({ noWaitAfter: true }).catch(() => coverItem.click({ force: true }));
+      } else {
+        await page.evaluate(() => {
+          const el = [...document.querySelectorAll('[aria-label], button, a, div')].find((e) =>
+            /Add cover image|Change cover image/i.test(
+              `${e.getAttribute('aria-label') || ''} ${(e.innerText || '').trim()}`
+            )
+          );
+          if (!el) throw new Error('Add cover image menu item not found');
+          el.click();
+        });
+      }
+      await this.humanLikeDelay(2000, 3500);
 
+      // Step 3: modal "Upload single photo" / "Choose an image" → filechooser
       try {
         const [chooser] = await Promise.all([
           page.waitForEvent('filechooser', { timeout: 15000 }),
-          coverVisible
-            ? coverItem.click({ force: true })
-            : page.evaluate(() => {
-                const els = [
-                  ...document.querySelectorAll('[aria-label], button, a, div[role="menuitem"], li, span'),
-                ];
-                const el = els.find((e) => {
-                  const label = `${e.getAttribute('aria-label') || ''} ${(e.innerText || '').trim()}`;
-                  return /^(Add|Change|Edit) cover image$/i.test(label.trim()) ||
-                    (/cover image/i.test(label) && !/slideshow|premium/i.test(label));
-                });
-                if (!el) throw new Error('Add cover image menu item not found');
-                el.click();
-              }),
+          page.evaluate(() => {
+            const buttons = [...document.querySelectorAll('button, [role="button"], a, label, div')];
+            const order = [
+              /^Upload single photo$/i,
+              /^Choose an image$/i,
+              /Upload single photo/i,
+              /Choose an image/i,
+              /Upload your own/i,
+            ];
+            for (const re of order) {
+              const b = buttons.find((x) => {
+                const t = (x.innerText || x.getAttribute('aria-label') || '').trim();
+                if (!re.test(t)) return false;
+                const r = x.getBoundingClientRect();
+                return r.width > 0 && r.height > 0;
+              });
+              if (b) {
+                b.click();
+                return (b.innerText || '').trim().slice(0, 40);
+              }
+            }
+            throw new Error('Upload single photo control not found');
+          }),
         ]);
         await chooser.setFiles(bannerPath);
-        console.log(`LinkedIn #${accountId}: banner file set via cover menu chooser`);
+        console.log(`LinkedIn #${accountId}: banner file set via cover modal chooser`);
       } catch (e) {
         console.warn(`LinkedIn #${accountId}: cover chooser failed (${e.message}), trying input`);
         const inputs = await page.$$('input[type="file"]');
-        let set = false;
-        for (const input of inputs) {
-          const lab = (
-            (await input.getAttribute('aria-label').catch(() => '')) ||
-            (await input.getAttribute('name').catch(() => '')) ||
-            (await input.getAttribute('accept').catch(() => '')) ||
-            ''
-          ).toLowerCase();
-          if (/avatar|profile.?photo|profile.?picture/i.test(lab) && !/background|cover|banner/i.test(lab)) {
-            continue;
-          }
-          await input.setInputFiles(bannerPath);
-          set = true;
-          break;
-        }
-        if (!set && inputs[0]) {
-          await inputs[0].setInputFiles(bannerPath);
-          set = true;
-        }
-        if (!set) {
+        if (!inputs.length) {
           await page.screenshot({ path: `/tmp/linkedin-banner-no-input-${accountId}.png` }).catch(() => {});
           throw new Error('LinkedIn banner file input not found');
         }
+        await inputs[0].setInputFiles(bannerPath);
       }
 
       await this.humanLikeDelay(3000, 5000);
@@ -2998,14 +2978,14 @@ class PlaywrightService {
           ) || null;
         const bannerImg =
           imgs.find((i) =>
-            /profile-displaybackground|background|cover|banner/i.test(
+            /profile-displaybackground|background-display|cover-img|profile-background/i.test(
               `${i.className} ${i.alt} ${i.src}`
             )
-          ) ||
-          imgs.find((i) => /media\.licdn\.com.*(?:bg|background|cover)/i.test(i.src));
+          ) || null;
         let bannerBg = null;
-        for (const el of document.querySelectorAll('div, section, figure, span')) {
-          const s = getComputedStyle(el).backgroundImage || '';
+        for (const el of document.querySelectorAll('div, section, figure, span, img')) {
+          const s = el.tagName === 'IMG' ? '' : getComputedStyle(el).backgroundImage || '';
+          if (el.tagName === 'IMG') continue;
           if (!/media\.licdn\.com/i.test(s)) continue;
           const r = el.getBoundingClientRect();
           if (r.width > 400 && r.height > 80 && r.top < 450) {
@@ -3014,12 +2994,28 @@ class PlaywrightService {
             break;
           }
         }
-        const bannerSrc = bannerImg?.src || bannerBg || null;
+        // Also treat wide top-of-profile images (not avatar) as banner
+        const wideTop =
+          imgs.find((i) => {
+            const r = i.getBoundingClientRect();
+            return r.width > 400 && r.height > 80 && r.top < 350 && /media\.licdn\.com/i.test(i.src);
+          }) || null;
+        const addStill = [...document.querySelectorAll('button, a')].some((e) =>
+          /^Add background image$/i.test((e.getAttribute('aria-label') || '').trim())
+        );
+        const editBg = [...document.querySelectorAll('button, a')].some((e) =>
+          /Edit background|Change background|Edit cover/i.test(e.getAttribute('aria-label') || '')
+        );
+        const bannerSrc = bannerImg?.src || bannerBg || wideTop?.src || null;
+        const hasBanner =
+          (!!bannerSrc && /media\.licdn\.com/i.test(bannerSrc)) || (editBg && !addStill);
         return {
           url: location.href,
           avatarSrc: avatar?.src || null,
           bannerSrc,
-          hasBanner: !!(bannerSrc && /media\.licdn\.com/i.test(bannerSrc)),
+          hasBanner,
+          addStill,
+          editBg,
           avatarIsBanner: !!(avatar?.src && bannerSrc && avatar.src === bannerSrc),
         };
       }).catch(() => ({}));
