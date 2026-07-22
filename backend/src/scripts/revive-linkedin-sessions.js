@@ -230,14 +230,18 @@ async function main() {
     params.push(LIMIT);
     limitClause = `LIMIT $${params.length}`;
   }
-  const deadFilter = ALL
-    ? `AND ((credentials->>'session_dead') = 'true' OR credentials ? 'login_failed_reason' OR credentials ? 'linkedin_restriction')`
-    : `AND (credentials->>'session_dead') = 'true'`;
+  // Explicit --ids bypasses status/dead filters so flaky-active retries work.
+  const statusFilter = IDS ? '' : `AND status = 'inactive'`;
+  const deadFilter = IDS
+    ? ''
+    : ALL
+      ? `AND ((credentials->>'session_dead') = 'true' OR credentials ? 'login_failed_reason' OR credentials ? 'linkedin_restriction')`
+      : `AND (credentials->>'session_dead') = 'true'`;
   const { rows } = await pool.query(
     `SELECT id, email, username
      FROM social_accounts
      WHERE platform = 'linkedin'
-       AND status = 'inactive'
+       ${statusFilter}
        ${deadFilter}
        AND COALESCE(credentials->>'password', '') NOT IN ('', 'default_password')
        ${idFilter}
