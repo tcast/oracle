@@ -121,33 +121,35 @@ class AccountOpsBrainService {
 
     const alerts = [];
 
-    if (xUnbound > 0 && oxylabsFree < FREE_PROXY_FLOOR) {
+    if (xUnbound > 0 && (oxylabsFree < Math.max(FREE_PROXY_FLOOR, xUnbound) || oxylabsFree < xUnbound)) {
+      const need = Math.max(0, xUnbound - oxylabsFree);
       alerts.push({
         id: 'x_oxylabs_proxies',
-        severity: oxylabsFree === 0 ? 'critical' : 'warn',
+        severity: oxylabsFree === 0 || need >= 20 ? 'critical' : 'warn',
         kind: 'proxies',
         platform: 'x',
         provider: 'Oxylabs',
-        message: `Need more Oxylabs proxies for X (${xUnbound} account${xUnbound === 1 ? '' : 's'} unbound, ${oxylabsFree} free sticky)`,
+        message: `Need more Oxylabs proxies for X (${xUnbound} accounts unbound, ${oxylabsFree} free sticky${need ? `, short ${need}` : ''})`,
         action: 'Buy/import more Oxylabs sticky sessions and assign to unbound X accounts.',
-        metrics: { unbound: xUnbound, free: oxylabsFree, floor: FREE_PROXY_FLOOR },
+        metrics: { unbound: xUnbound, free: oxylabsFree, short: need, floor: FREE_PROXY_FLOOR },
       });
     }
 
-    if (redditUnbound > 0 && proxybaseFree < FREE_PROXY_FLOOR) {
+    if (redditUnbound > 0 && (proxybaseFree < Math.max(FREE_PROXY_FLOOR, redditUnbound) || proxybaseFree < redditUnbound)) {
+      const need = Math.max(0, redditUnbound - proxybaseFree);
       alerts.push({
         id: 'reddit_proxybase_proxies',
-        severity: proxybaseFree === 0 ? 'critical' : 'warn',
+        severity: proxybaseFree === 0 || need >= 20 ? 'critical' : 'warn',
         kind: 'proxies',
         platform: 'reddit',
         provider: 'ProxyBase',
-        message: `Need more ProxyBase proxies for Reddit (${redditUnbound} unbound, ${proxybaseFree} free)`,
+        message: `Need more ProxyBase proxies for Reddit (${redditUnbound} unbound, ${proxybaseFree} free${need ? `, short ${need}` : ''})`,
         action: 'Buy/import more ProxyBase mobile/residential and assign to unbound Reddit accounts.',
-        metrics: { unbound: redditUnbound, free: proxybaseFree, floor: FREE_PROXY_FLOOR },
+        metrics: { unbound: redditUnbound, free: proxybaseFree, short: need, floor: FREE_PROXY_FLOOR },
       });
     }
 
-    if (xActive < MIN_ACTIVE_ACCOUNTS || (xStarved > 5 && xActive < MIN_ACTIVE_ACCOUNTS * 2)) {
+    if (xActive < MIN_ACTIVE_ACCOUNTS) {
       alerts.push({
         id: 'x_accounts_low',
         severity: xActive < 5 ? 'critical' : 'warn',
@@ -159,13 +161,13 @@ class AccountOpsBrainService {
       });
     }
 
-    if (redditActive < MIN_ACTIVE_ACCOUNTS || redditStarved > 8) {
+    if (redditActive < MIN_ACTIVE_ACCOUNTS) {
       alerts.push({
         id: 'reddit_accounts_low',
         severity: redditActive < 5 ? 'critical' : 'warn',
         kind: 'accounts',
         platform: 'reddit',
-        message: `Need more Reddit accounts (active=${redditActive}, organic_enabled=${redditOrganic}, starved=${redditStarved})`,
+        message: `Need more Reddit accounts (active=${redditActive}, organic_enabled=${redditOrganic})`,
         action: 'Import or create more Reddit accounts (ProxyBase-bound).',
         metrics: {
           active: redditActive,
