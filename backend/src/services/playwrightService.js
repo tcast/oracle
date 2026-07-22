@@ -3342,7 +3342,7 @@ class PlaywrightService {
         }
       }
       const hasCustomBanner =
-        !!bannerSrc && /profile_banners/i.test(bannerSrc) && !/default_profile_banners|600x200/i.test(bannerSrc);
+        !!bannerSrc && /profile_banners/i.test(bannerSrc) && !/default_profile_banners/i.test(bannerSrc);
       return { displayName, bio, avatarSrc, isDefaultAvatar, bannerSrc, hasCustomBanner };
     });
 
