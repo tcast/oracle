@@ -8,6 +8,13 @@ router.use(authMiddleware);
 
 async function enrichSnapshot() {
   try {
+    if (!brainLiveState._hydrated) {
+      await brainLiveState.hydrate();
+    }
+  } catch (err) {
+    console.warn('brain hydrate:', err.message);
+  }
+  try {
     await accountOpsBrainService.refreshLivePools();
   } catch (err) {
     console.warn('brain enrich pools:', err.message);

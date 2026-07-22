@@ -207,10 +207,24 @@ const BrainDashboard = () => {
     }
   }, [snap.recent_events, feedFlash.length]);
 
+  // Recompute ages off `clock` so idle ticks don't freeze at snapshot time
+  void clock;
   const activeWorkers = (snap.in_flight || []).length || (snap.workers || []).filter((w) => w.status === 'running').length;
-  const tickAge = snap.tick?.status === 'running'
-    ? Date.now() - new Date(snap.tick.started_at).getTime()
-    : snap.tick_age_ms;
+  const tickAge = (() => {
+    if (snap.tick?.status === 'running' && snap.tick.started_at) {
+      const ms = Date.now() - new Date(snap.tick.started_at).getTime();
+      return Number.isNaN(ms) ? null : ms;
+    }
+    if (snap.tick?.finished_at) {
+      const ms = Date.now() - new Date(snap.tick.finished_at).getTime();
+      return Number.isNaN(ms) ? null : ms;
+    }
+    if (snap.tick?.started_at) {
+      const ms = Date.now() - new Date(snap.tick.started_at).getTime();
+      return Number.isNaN(ms) ? null : ms;
+    }
+    return snap.tick_age_ms != null && !Number.isNaN(snap.tick_age_ms) ? snap.tick_age_ms : null;
+  })();
   const byPlat = snap.tick?.by_platform || {};
   const xShare = byPlat.x || 0;
   const rShare = byPlat.reddit || 0;
@@ -336,13 +350,20 @@ const BrainDashboard = () => {
           <div className="brain-panel-head px-1 mb-2 flex justify-between">
             <span>WORKER MESH · {snap.parallel || 10} SLOTS</span>
             <span className={activeWorkers ? 'brain-live-pulse' : ''}>
-              {activeWorkers ? `${activeWorkers} ACTIVE` : 'IDLE'}
+              {activeWorkers
+                ? `${activeWorkers} ACTIVE`
+                : tickAge != null
+                  ? `IDLE · last tick ${ago(tickAge)}`
+                  : 'IDLE'}
             </span>
           </div>
           <div className="brain-workers">
             {(snap.workers || []).map((w) => {
               const running = w.status === 'running';
               const plat = PLAT[w.platform] || PLAT.unknown;
+              const lastForSlot = !running
+                ? (snap.recent_events || []).find((e) => e.slot === w.slot)
+                : null;
               return (
                 <div
                   key={w.slot}
@@ -367,7 +388,13 @@ const BrainDashboard = () => {
                       <div className="brain-node-pulse" style={{ background: plat.accent }} />
                     </>
                   ) : (
-                    <div className="brain-node-idle">STANDBY</div>
+                    <div className="brain-node-idle">
+                      {lastForSlot?.finished_at
+                        ? `IDLE · ${ago(lastForSlot.finished_at)}`
+                        : tickAge != null
+                          ? `IDLE · ${ago(tickAge)}`
+                          : 'IDLE'}
+                    </div>
                   )}
                 </div>
               );

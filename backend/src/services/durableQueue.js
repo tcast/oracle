@@ -38,6 +38,17 @@ class DurableQueue {
       connection: this.connection,
     });
 
+    // Orphaned active brain ticks (process restart mid-tick) block reseeding until
+    // lockDuration expires — clear them before the worker starts consuming.
+    await this.clearOrphanedActiveJobs(ACCOUNT_OPS_BRAIN_QUEUE);
+
+    try {
+      const brainLiveState = require('./brainLiveState');
+      await brainLiveState.hydrate();
+    } catch (err) {
+      console.warn('brainLiveState hydrate failed:', err.message);
+    }
+
     const organicCommentScheduler = require('./organicCommentScheduler');
     const accountStatsScheduler = require('./accountStatsScheduler');
     const xFollowScheduler = require('./xFollowScheduler');
@@ -119,7 +130,11 @@ class DurableQueue {
       {
         connection: this.connection,
         concurrency: 1,
-        lockDuration: 25 * 60 * 1000,
+        // Tick hard-cap is ~10m workers; keep lock slightly above that so stalls
+        // recover in minutes after a crash (was 25m — left feed blank on restart).
+        lockDuration: 12 * 60 * 1000,
+        stalledInterval: 30 * 1000,
+        maxStalledCount: 1,
       }
     );
 
@@ -321,6 +336,39 @@ class DurableQueue {
     if (!q) return 0;
     const counts = await q.getJobCounts('delayed', 'waiting', 'active', 'paused');
     return (counts.delayed || 0) + (counts.waiting || 0) + (counts.active || 0) + (counts.paused || 0);
+  }
+
+  /**
+   * Remove active jobs left by a dead worker. Call before starting the Worker so
+   * ensure*Loop does not skip seeding because pendingCount includes zombies.
+   */
+  async clearOrphanedActiveJobs(queueName) {
+    const q = this.queues[queueName];
+    if (!q) return 0;
+    let removed = 0;
+    try {
+      const active = await q.getActive(0, 100);
+      for (const job of active) {
+        const id = job?.id;
+        try {
+          const client = await q.client;
+          await client.del(`bull:${queueName}:${id}:lock`);
+          await client.lrem(`bull:${queueName}:active`, 0, String(id));
+          try {
+            await job.remove();
+          } catch (_) {
+            /* lock gone — job hash may remain; ignore */
+          }
+          removed += 1;
+          console.warn(`Cleared orphaned active job ${queueName}:${id}`);
+        } catch (err) {
+          console.warn(`Failed clearing orphaned ${queueName}:${id}:`, err.message);
+        }
+      }
+    } catch (err) {
+      console.warn(`clearOrphanedActiveJobs(${queueName}) failed:`, err.message);
+    }
+    return removed;
   }
 
   async scheduleOrganicTick(overrideMs = null) {
@@ -541,6 +589,24 @@ class DurableQueue {
     if (!enabled) {
       console.log('Account ops brain disabled (set ACCOUNT_OPS_BRAIN=1 to enable)');
       return;
+    }
+    // Safety net: if an active tick is older than lock window remnant, clear it.
+    try {
+      const q = this.queues[ACCOUNT_OPS_BRAIN_QUEUE];
+      const active = q ? await q.getActive(0, 20) : [];
+      const now = Date.now();
+      for (const job of active) {
+        const age = now - (job.processedOn || job.timestamp || now);
+        if (age > 11 * 60 * 1000) {
+          console.warn(
+            `Account ops brain job ${job.id} active for ${Math.round(age / 1000)}s — treating as orphan`
+          );
+          await this.clearOrphanedActiveJobs(ACCOUNT_OPS_BRAIN_QUEUE);
+          break;
+        }
+      }
+    } catch (err) {
+      console.warn('Brain orphan check failed:', err.message);
     }
     const pending = await this.pendingCount(ACCOUNT_OPS_BRAIN_QUEUE);
     if (pending > 0) {
