@@ -23,6 +23,13 @@ const SCREENSHOT_DIR = '/tmp';
 function detectChallenge(url, bodyText) {
   const u = String(url || '');
   const t = String(bodyText || '').slice(0, 5000);
+  if (
+    /account.?suspended|has been suspended|Account suspended|This account doesn.?t exist|account_does_not_exist|Account locked/i.test(
+      t
+    )
+  ) {
+    return 'banned';
+  }
   if (/rate.?limit|try again later|something went wrong/i.test(t)) {
     return 'rate_limit';
   }
@@ -36,6 +43,12 @@ function detectChallenge(url, bodyText) {
     return 'challenge';
   }
   return null;
+}
+
+function isTunnelError(msg) {
+  return /proxy|oxylabs|ECONNREFUSED|ETIMEDOUT|tunnel|ERR_PROXY|ERR_TUNNEL|net::ERR_/i.test(
+    String(msg || '')
+  );
 }
 
 async function smokeTestXCookieSession(accountId) {
@@ -126,6 +139,29 @@ async function smokeTestXCookieSession(accountId) {
 
     await page.screenshot({ path: shotPath, fullPage: true }).catch(() => {});
 
+    if (challenge === 'banned') {
+      const organicCommentService = require('../services/organicCommentService');
+      await organicCommentService
+        .markBannedAccount(accountId, 'cookie_smoke: suspended_or_missing')
+        .catch(() => {});
+      return {
+        success: false,
+        accountId,
+        username: account.username,
+        restored: true,
+        loggedIn: false,
+        homeFeedVisible,
+        url,
+        challenge: 'banned',
+        stopBatch: false,
+        softSkip: false,
+        proxyServer,
+        screenshot: shotPath,
+        error: 'banned',
+        accountMarkedBanned: true,
+      };
+    }
+
     if (challenge === 'rate_limit' || challenge === 'challenge') {
       if (proxyId) {
         await proxyService.updateProxyStats(proxyId, false, { reason: challenge }).catch(() => {});
@@ -140,6 +176,7 @@ async function smokeTestXCookieSession(accountId) {
         url,
         challenge,
         stopBatch: true,
+        softSkip: true,
         proxyServer,
         screenshot: shotPath,
         error: challenge,
@@ -203,12 +240,15 @@ async function smokeTestXCookieSession(accountId) {
       await proxyService.updateProxyStats(proxyId, false, { reason: error.message }).catch(() => {});
     }
     const msg = error.message || String(error);
+    const tunnel = isTunnelError(msg);
     const stopBatch = /rate.?limit|challenge|unusual activity/i.test(msg);
     return {
       success: false,
       accountId,
       error: msg,
       stopBatch,
+      softSkip: tunnel,
+      tunnel,
       screenshot: fs.existsSync(shotPath) ? shotPath : null,
     };
   } finally {

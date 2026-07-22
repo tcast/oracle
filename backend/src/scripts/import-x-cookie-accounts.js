@@ -1,18 +1,18 @@
 #!/usr/bin/env node
 /**
- * Import X accounts that ship with a FULL browser cookie string (the reliable,
- * scalable path — no password login, no FunCaptcha).
+ * Import X accounts that ship with auth cookies (no password login).
  *
- * Line format (pipe-delimited), one per line:
+ * Formats (auto-detected), one account per line:
+ *
+ * 1) Pipe + full cookie string:
  *   username|password|totp_secret|email|email_password|<cookie_string>
+ *   cookie_string must include auth_token and ct0.
  *
- * <cookie_string> is a normal "k=v; k=v; ..." document.cookie dump and must
- * contain at least auth_token and ct0 (guest_id / twid / personalization_id
- * are stored too when present). Real X auth_token cookies are 40-hex (NOT the
- * old "M." AccsMarket form), so we store the raw cookie values as-is.
+ * 2) Colon token dump:
+ *   login:pass:email:emailpass:2fa:auth_token:ct0:phone
  *
- * Stores the complete cookie set on both .x.com and .twitter.com so
- * restoreSession/verifySessionAlive get a full, coherent session.
+ * Dual-domain cookies (.x.com + .twitter.com) are written for auth_token/ct0
+ * so restoreSession/verifySessionAlive get a coherent session.
  *
  * Usage (in whisper-backend, no browser needed):
  *   node src/scripts/import-x-cookie-accounts.js /app/private/x-cookie-accounts.txt
@@ -26,6 +26,20 @@ const pool = require('../services/db');
 const DUAL_DOMAIN = new Set(['auth_token', 'ct0', 'guest_id', 'twid', 'personalization_id']);
 const HTTP_ONLY = new Set(['auth_token', 'guest_id', '__cf_bm']);
 
+function cookieEntry(name, value) {
+  const base = {
+    name,
+    value,
+    path: '/',
+    secure: true,
+    httpOnly: HTTP_ONLY.has(name),
+    sameSite: name === 'ct0' ? 'Lax' : 'None',
+  };
+  const out = [{ ...base, domain: '.x.com' }];
+  if (DUAL_DOMAIN.has(name)) out.push({ ...base, domain: '.twitter.com' });
+  return out;
+}
+
 function parseCookieString(str) {
   const out = [];
   const seen = new Set();
@@ -38,25 +52,43 @@ function parseCookieString(str) {
     let value = s.slice(eq + 1).trim();
     if (!name || seen.has(name)) continue;
     seen.add(name);
-    // Playwright rejects surrounding quotes in some cases; keep as-is (X sets
-    // personalization_id quoted and expects it back quoted), just trim spaces.
-    const base = {
-      name,
-      value,
-      path: '/',
-      secure: true,
-      httpOnly: HTTP_ONLY.has(name),
-      sameSite: name === 'ct0' ? 'Lax' : 'None',
-    };
-    out.push({ ...base, domain: '.x.com' });
-    if (DUAL_DOMAIN.has(name)) out.push({ ...base, domain: '.twitter.com' });
+    out.push(...cookieEntry(name, value));
   }
   return out;
 }
 
-function parseLine(line) {
-  const raw = String(line || '').trim();
-  if (!raw || raw.startsWith('#')) return null;
+function parseColonTokenLine(raw) {
+  // login:pass:email:emailpass:2fa:auth_token:ct0:phone
+  // Values themselves contain no colons; email may have none; split carefully.
+  const f = raw.split(':');
+  if (f.length < 7) throw new Error(`Expected ≥7 colon fields, got ${f.length}`);
+  const username = f[0].trim();
+  const password = f[1].trim();
+  const email = f[2].trim();
+  const email_password = f[3].trim();
+  const totp_secret = f[4].trim();
+  const authToken = f[5].trim();
+  const ct0 = f[6].trim();
+  const phone = (f[7] || '').trim() || null;
+  if (!username) throw new Error('missing username');
+  if (!authToken) throw new Error('missing auth_token');
+  if (!ct0) throw new Error('missing ct0');
+  const cookies = [...cookieEntry('auth_token', authToken), ...cookieEntry('ct0', ct0)];
+  return {
+    username,
+    password,
+    totp_secret,
+    email,
+    email_password,
+    phone,
+    cookies,
+    authToken,
+    ct0,
+    source: 'manual_colon_token_import',
+  };
+}
+
+function parsePipeCookieLine(raw) {
   const f = raw.split('|');
   if (f.length < 6) throw new Error(`Expected 6 pipe fields, got ${f.length}`);
   const username = f[0].trim();
@@ -64,7 +96,7 @@ function parseLine(line) {
   const totp_secret = f[2].trim();
   const email = f[3].trim();
   const email_password = f[4].trim();
-  const cookieStr = f.slice(5).join('|').trim(); // cookie has no pipes, but be safe
+  const cookieStr = f.slice(5).join('|').trim();
 
   const cookies = parseCookieString(cookieStr);
   const auth = cookies.find((c) => c.name === 'auth_token');
@@ -72,7 +104,26 @@ function parseLine(line) {
   if (!auth) throw new Error('no auth_token in cookie string');
   if (!ct0) throw new Error('no ct0 in cookie string');
 
-  return { username, password, totp_secret, email, email_password, cookies, authToken: auth.value, ct0: ct0.value };
+  return {
+    username,
+    password,
+    totp_secret,
+    email,
+    email_password,
+    phone: null,
+    cookies,
+    authToken: auth.value,
+    ct0: ct0.value,
+    source: 'manual_cookie_import',
+  };
+}
+
+function parseLine(line) {
+  const raw = String(line || '').trim();
+  if (!raw || raw.startsWith('#')) return null;
+  if (raw.includes('|')) return parsePipeCookieLine(raw);
+  if (raw.includes(':')) return parseColonTokenLine(raw);
+  throw new Error('unrecognized line format (need | cookies or : tokens)');
 }
 
 async function upsert(row) {
@@ -83,9 +134,10 @@ async function upsert(row) {
     totp_secret: row.totp_secret,
     auth_token: row.authToken,
     ct0: row.ct0,
+    phone: row.phone || null,
     has_cookies: true,
     cookie_only: true,
-    source: 'manual_cookie_import',
+    source: row.source || 'manual_cookie_import',
   };
 
   const existing = await pool.query(
@@ -136,7 +188,10 @@ async function main() {
       const p = parseLine(line);
       if (p) rows.push(p);
     } catch (e) {
-      if (line.trim()) console.error(`  SKIP: ${e.message} :: ${line.slice(0, 40)}…`);
+      if (line.trim()) {
+        const u = line.split(/[|:]/)[0] || '?';
+        console.error(`  SKIP @${u}: ${e.message}`);
+      }
     }
   }
   console.log(`Parsed ${rows.length} cookie accounts`);
