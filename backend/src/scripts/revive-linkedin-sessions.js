@@ -23,7 +23,16 @@ const DRY = process.argv.includes('--dry');
 const CONCURRENCY = Number(
   (process.argv.find((a) => a.startsWith('--concurrency=')) || '').split('=')[1] || 5
 );
-const PER_ACCOUNT_TIMEOUT_MS = 150000; // hard timeout per login attempt
+// LinkedIn fresh password logins from the server's datacenter IP trip a reCAPTCHA
+// "quick security check". Owned accounts must re-login through their assigned
+// residential proxy (matches the identity's normal geo/fingerprint). Default ON.
+const USE_PROXY = !process.argv.includes('--direct');
+// --all also picks up accounts already touched by earlier attempts (whose
+// session_dead flag was cleared) so a single pass covers the whole cohort.
+const ALL = process.argv.includes('--all');
+const LIMIT = Number((process.argv.find((a) => a.startsWith('--limit=')) || '').split('=')[1] || 0);
+const IDS = (process.argv.find((a) => a.startsWith('--ids=')) || '').split('=')[1];
+const PER_ACCOUNT_TIMEOUT_MS = 180000; // hard timeout per login attempt (proxy is slower)
 
 function parseCreds(account) {
   const c = account.credentials;
@@ -44,6 +53,10 @@ const BAN_RE = /suspend|restricted|account.?banned|\bbanned\b|doesn.?t exist|dea
 
 function classifyPageFailure(info) {
   const t = String(info?.text || '');
+  // LinkedIn hard restriction: passed 2FA but account flagged, demands gov ID.
+  if (/temporarily restricted|verify your identity|government-issued ID|submit a government/i.test(t)) {
+    return 'id_verification_restricted';
+  }
   if (/wrong email or password|password is incorrect|incorrect|doesn.?t match|couldn.?t find (a|your) linkedin account/i.test(t)) {
     return 'bad_credentials';
   }
@@ -69,13 +82,20 @@ async function attemptLogin(accountId) {
   };
 
   let opened;
-  try {
-    opened = await playwrightService.createBrowserForAccount(accountId, 2, { skipProxy: true });
-  } catch (_) {
-    opened = await playwrightService.createBrowserForAccount(accountId);
+  if (USE_PROXY) {
+    // Assigned residential proxy — required to avoid the datacenter-IP reCAPTCHA.
+    opened = await playwrightService.createBrowserForAccount(accountId, 2, { requireProxy: true });
+  } else {
+    try {
+      opened = await playwrightService.createBrowserForAccount(accountId, 2, { skipProxy: true });
+    } catch (_) {
+      opened = await playwrightService.createBrowserForAccount(accountId);
+    }
   }
   const browser = opened.browser;
   const page = opened.page;
+  // Proxy-bind the checkpoint reCAPTCHA solve to the account's residential IP.
+  extras.proxyConfig = opened.proxyConfig || null;
 
   try {
     const loggedIn = await withTimeout(
@@ -87,14 +107,21 @@ async function attemptLogin(accountId) {
       await playwrightService.persistSession(page, 'linkedin', accountId).catch(() => {});
       return { accountId, email: loginEmail, outcome: 'revived' };
     }
-    // Login was attempted but no live session — inspect page to classify why.
+    // Login was attempted but no live session — land on the canonical feed check
+    // to read the true account state (logged-out vs restricted vs checkpoint).
+    await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+    await new Promise((r) => setTimeout(r, 2500));
     const info = await page
       .evaluate(() => ({ url: location.href, text: (document.body?.innerText || '').slice(0, 2000) }))
       .catch(() => ({ url: '', text: '' }));
+    await page.screenshot({ path: `/tmp/li-final-${accountId}.png` }).catch(() => {});
     const reason = classifyPageFailure(info);
     return { accountId, email: loginEmail, outcome: 'failed', reason, url: info.url };
   } catch (e) {
     const msg = e?.message || String(e);
+    if (/id_verification_restricted|government-ID|verify your identity|temporarily restricted/i.test(msg)) {
+      return { accountId, email: loginEmail, outcome: 'failed', reason: 'id_verification_restricted' };
+    }
     if (FLAKY_RE.test(msg)) {
       return { accountId, email: loginEmail, outcome: 'flaky', reason: msg.slice(0, 200) };
     }
@@ -144,17 +171,26 @@ async function reviveAccount(accountId) {
 
 // Genuine login failure — leave inactive, record reason, disable jobs, report.
 async function markFailed(accountId, reason) {
+  const isIdRestriction = /id_verification_restricted/.test(reason);
+  const extra = isIdRestriction
+    ? { linkedin_restriction: 'id_verification_required', restriction_detected_at: new Date().toISOString() }
+    : {};
   await pool.query(
     `UPDATE social_accounts
      SET status = 'inactive',
          credentials = (COALESCE(credentials, '{}'::jsonb)
            - 'session_dead' - 'session_dead_at' - 'session_dead_reason')
-           || jsonb_build_object('login_failed_reason', $2::text, 'login_failed_at', NOW()::text),
+           || jsonb_build_object('login_failed_reason', $2::text, 'login_failed_at', NOW()::text)
+           || $3::jsonb,
          updated_at = NOW()
      WHERE id = $1`,
-    [accountId, String(reason).slice(0, 300)]
+    [accountId, String(reason).slice(0, 300), JSON.stringify(extra)]
   );
-  const jobFailureClass = /bad_credentials|banned/.test(reason) ? reason.split(':')[0] : 'login_failed';
+  const jobFailureClass = isIdRestriction
+    ? 'id_verification'
+    : /bad_credentials|banned/.test(reason)
+      ? reason.split(':')[0]
+      : 'login_failed';
   await pool.query(
     `UPDATE organic_comment_jobs
      SET enabled = false, status = 'error', failure_class = $2, last_error = $3, updated_at = NOW()
@@ -183,20 +219,56 @@ async function runPool(items, worker, concurrency) {
 }
 
 async function main() {
+  const params = [];
+  let idFilter = '';
+  if (IDS) {
+    params.push(IDS.split(',').map((s) => Number(s.trim())).filter(Boolean));
+    idFilter = `AND id = ANY($${params.length}::int[])`;
+  }
+  let limitClause = '';
+  if (LIMIT > 0) {
+    params.push(LIMIT);
+    limitClause = `LIMIT $${params.length}`;
+  }
+  const deadFilter = ALL
+    ? `AND ((credentials->>'session_dead') = 'true' OR credentials ? 'login_failed_reason' OR credentials ? 'linkedin_restriction')`
+    : `AND (credentials->>'session_dead') = 'true'`;
   const { rows } = await pool.query(
     `SELECT id, email, username
      FROM social_accounts
      WHERE platform = 'linkedin'
        AND status = 'inactive'
-       AND (credentials->>'session_dead') = 'true'
+       ${deadFilter}
        AND COALESCE(credentials->>'password', '') NOT IN ('', 'default_password')
-     ORDER BY id`
+       ${idFilter}
+     ORDER BY id
+     ${limitClause}`,
+    params
   );
-  console.log(`Found ${rows.length} session_dead LinkedIn accounts with passwords to revive`);
+  console.log(`Found ${rows.length} session_dead LinkedIn accounts with passwords to revive (proxy=${USE_PROXY})`);
   if (!rows.length) return;
   if (DRY) {
     console.log('DRY RUN — would attempt login for:', rows.map((r) => r.email || r.username).join(', '));
     return;
+  }
+
+  // Reactivate assigned residential proxy bindings so logins go out on each
+  // account's normal IP (avoids the datacenter-IP reCAPTCHA). Harmless if the
+  // login later fails — brain ignores inactive accounts regardless.
+  if (USE_PROXY) {
+    const ids = rows.map((r) => r.id);
+    const r = await pool.query(
+      `UPDATE social_account_proxies SET is_active = true
+       WHERE social_account_id = ANY($1::int[]) AND is_active = false`,
+      [ids]
+    );
+    await pool.query(
+      `UPDATE proxies SET cooldown_until = NULL
+       WHERE id IN (SELECT proxy_id FROM social_account_proxies WHERE social_account_id = ANY($1::int[]))
+         AND cooldown_until IS NOT NULL AND cooldown_until > NOW()`,
+      [ids]
+    );
+    console.log(`Reactivated ${r.rowCount} proxy binding(s) for login`);
   }
 
   const startedAt = Date.now();
