@@ -14,7 +14,7 @@ const authMiddleware = (req, res, next) => {
     return next();
   }
 
-  // Get token from header (support both formats)
+  // Get token from header (support both formats) or ?token= for SSE/EventSource
   const tokenFromXAuth = req.header('x-auth-token');
   const authHeader = req.header('Authorization');
   let token = tokenFromXAuth;
@@ -22,6 +22,9 @@ const authMiddleware = (req, res, next) => {
   // Extract token from Authorization header if present
   if (!token && authHeader && authHeader.startsWith('Bearer ')) {
     token = authHeader.split(' ')[1];
+  }
+  if (!token && req.query && (req.query.token || req.query.access_token)) {
+    token = String(req.query.token || req.query.access_token);
   }
 
   // Check if no token

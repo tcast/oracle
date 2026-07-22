@@ -7,6 +7,7 @@ const organicCommentService = require('./organicCommentService');
 const xFollowService = require('./xFollowService');
 const proxyService = require('./proxyService');
 const oxylabsStickyService = require('./oxylabsStickyService');
+const brainLiveState = require('./brainLiveState');
 const { isJunkUsername, looksFakeUsername, needsHumanHandle } = require('./xPersonas');
 
 const PLATFORMS = ['x', 'reddit'];
@@ -36,9 +37,127 @@ class AccountOpsBrainService {
     return lastCapacity;
   }
 
+  getParallel() {
+    return MAX_PARALLEL;
+  }
+
   isEnabled() {
     const v = String(process.env.ACCOUNT_OPS_BRAIN || '').trim().toLowerCase();
     return v === '1' || v === 'true' || v === 'yes' || v === 'on';
+  }
+
+  /** Map internal action types to brain UI labels. */
+  _publicActionType(type) {
+    if (type === 'network') return 'follow';
+    if (type === 'organic_comment') return 'search_comment';
+    return type;
+  }
+
+  _classifyResult(result) {
+    if (result?.skipped || result?.reason === 'profile_soft_skip_24h') {
+      return {
+        status: 'soft_skip',
+        reason: String(result.reason || result.error || 'skipped').slice(0, 160),
+      };
+    }
+    if (result?.success === false || result?.error) {
+      return {
+        status: 'fail',
+        reason: String(result.error || result.reason || 'failed').slice(0, 160),
+      };
+    }
+    return {
+      status: 'success',
+      reason: result?.reason ? String(result.reason).slice(0, 160) : null,
+    };
+  }
+
+  /**
+   * Lightweight pool + 15m activity counts for /brain. Non-blocking for workers
+   * when called from SSE enrich (fire after tick is fine).
+   */
+  async refreshLivePools() {
+    brainLiveState.setMeta({ enabled: this.isEnabled(), parallel: MAX_PARALLEL });
+    const [xCookies, redditDue, organicEn, followEn, comments15, follows15, byPlat15] =
+      await Promise.all([
+        pool.query(`
+          SELECT COUNT(DISTINCT sa.id)::int AS n
+          FROM social_accounts sa
+          JOIN browser_sessions bs ON bs.account_id = sa.id
+          WHERE sa.status = 'active'
+            AND COALESCE(sa.is_simulated, false) = false
+            AND lower(sa.platform) IN ('x', 'twitter')
+            AND bs.platform = 'x'
+            AND bs.cookies IS NOT NULL
+            AND jsonb_array_length(bs.cookies) > 0
+            AND bs.updated_at > NOW() - INTERVAL '72 hours'
+        `),
+        pool.query(`
+          SELECT COUNT(*)::int AS n
+          FROM organic_comment_jobs j
+          JOIN social_accounts sa ON sa.id = j.social_account_id
+          WHERE j.enabled = true
+            AND lower(sa.platform) = 'reddit'
+            AND sa.status = 'active'
+            AND (j.next_due_at IS NULL OR j.next_due_at <= NOW())
+            AND (j.cooldown_until IS NULL OR j.cooldown_until <= NOW())
+        `),
+        pool.query(`
+          SELECT COUNT(*)::int AS n
+          FROM organic_comment_jobs j
+          JOIN social_accounts sa ON sa.id = j.social_account_id
+          WHERE j.enabled = true AND sa.status = 'active'
+            AND COALESCE(sa.is_simulated, false) = false
+            AND lower(sa.platform) IN ('x', 'twitter', 'reddit')
+        `),
+        pool.query(`
+          SELECT COUNT(*)::int AS n
+          FROM x_follow_jobs j
+          JOIN social_accounts sa ON sa.id = j.social_account_id
+          WHERE j.enabled = true AND sa.status = 'active'
+            AND COALESCE(sa.is_simulated, false) = false
+        `),
+        pool.query(`
+          SELECT COUNT(*)::int AS n
+          FROM organic_comments
+          WHERE status = 'posted'
+            AND created_at >= NOW() - INTERVAL '15 minutes'
+        `),
+        pool.query(`
+          SELECT COUNT(*)::int AS n
+          FROM x_follows
+          WHERE created_at >= NOW() - INTERVAL '15 minutes'
+        `).catch(() => ({ rows: [{ n: 0 }] })),
+        pool.query(`
+          SELECT
+            CASE WHEN lower(sa.platform) IN ('twitter','x') THEN 'x' ELSE lower(sa.platform) END AS platform,
+            COUNT(*)::int AS n
+          FROM organic_comments oc
+          JOIN social_accounts sa ON sa.id = oc.social_account_id
+          WHERE oc.status = 'posted'
+            AND oc.created_at >= NOW() - INTERVAL '15 minutes'
+          GROUP BY 1
+        `),
+      ]);
+
+    brainLiveState.setPools({
+      live_x_cookies: xCookies.rows[0]?.n || 0,
+      reddit_due: redditDue.rows[0]?.n || 0,
+      organic_enabled: organicEn.rows[0]?.n || 0,
+      follows_enabled: followEn.rows[0]?.n || 0,
+    });
+
+    const byPlat = { x: 0, reddit: 0 };
+    for (const row of byPlat15.rows || []) {
+      if (row.platform === 'x' || row.platform === 'reddit') byPlat[row.platform] = row.n;
+    }
+    brainLiveState.setStats15m({
+      comments: comments15.rows[0]?.n || 0,
+      follows: follows15.rows[0]?.n || 0,
+      by_platform: byPlat,
+    });
+
+    return brainLiveState.getSnapshot();
   }
 
   /**
@@ -669,9 +788,19 @@ class AccountOpsBrainService {
     return null;
   }
 
-  async runAction(account, action) {
+  async runAction(account, action, slot = 0) {
     lockedAccounts.add(account.id);
     const started = Date.now();
+    const platform = this._platformKey(account);
+    const actionType = this._publicActionType(action.type);
+    brainLiveState.actionStart({
+      slot,
+      account_id: account.id,
+      username: account.username,
+      platform,
+      action_type: actionType,
+      started_at: new Date().toISOString(),
+    });
     try {
       if (action.type === 'profile_gap') {
         // One attempt then 24h skip so flaky profile never monopolizes workers.
@@ -684,53 +813,100 @@ class AccountOpsBrainService {
         );
         const ok = result && result.success !== false && !result.error;
         if (!ok) {
-          return {
+          const out = {
             type: action.type,
             accountId: account.id,
+            username: account.username,
             platform: account.platform,
             skipped: true,
             reason: 'profile_soft_skip_24h',
             error: result?.error || result?.reason,
             ms: Date.now() - started,
           };
+          const cls = this._classifyResult(out);
+          brainLiveState.actionEnd({
+            slot,
+            account_id: account.id,
+            username: account.username,
+            platform,
+            action_type: actionType,
+            status: cls.status,
+            reason: cls.reason,
+            ms: out.ms,
+          });
+          return out;
         }
-        return { type: action.type, accountId: account.id, platform: account.platform, ...result, ms: Date.now() - started };
+        const out = {
+          type: action.type,
+          accountId: account.id,
+          username: account.username,
+          platform: account.platform,
+          ...result,
+          ms: Date.now() - started,
+        };
+        const cls = this._classifyResult(out);
+        brainLiveState.actionEnd({
+          slot,
+          account_id: account.id,
+          username: account.username,
+          platform,
+          action_type: actionType,
+          status: cls.status,
+          reason: cls.reason,
+          ms: out.ms,
+        });
+        return out;
       }
+      let result;
       if (action.type === 'accept_follows') {
         const full = await pool.query('SELECT * FROM social_accounts WHERE id = $1', [account.id]);
-        const result = await withTimeout(
+        result = await withTimeout(
           xFollowService.acceptFollowsForAccount(full.rows[0] || account, { maxAccept: 5, dailyCap: 10 }),
           WORKER_HARD_MS,
           'accept_follows'
         );
-        return { type: action.type, accountId: account.id, platform: account.platform, ...result, ms: Date.now() - started };
-      }
-      if (action.type === 'discover_targets') {
+      } else if (action.type === 'discover_targets') {
         const full = await pool.query('SELECT * FROM social_accounts WHERE id = $1', [account.id]);
-        const result = await withTimeout(
+        result = await withTimeout(
           xFollowService.discoverTargetsForAccount(full.rows[0] || account, { limit: 12 }),
           WORKER_HARD_MS,
           'discover_targets'
         );
-        return { type: action.type, accountId: account.id, platform: account.platform, ...result, ms: Date.now() - started };
-      }
-      if (action.type === 'network') {
-        const result = await withTimeout(
+      } else if (action.type === 'network') {
+        result = await withTimeout(
           xFollowService.runOneForAccount(account, { dryRun: false }),
           WORKER_HARD_MS,
           'follow'
         );
-        return { type: action.type, accountId: account.id, platform: account.platform, ...result, ms: Date.now() - started };
-      }
-      if (action.type === 'search_comment' || action.type === 'home_comment' || action.type === 'organic_comment') {
-        const result = await withTimeout(
+      } else if (action.type === 'search_comment' || action.type === 'home_comment' || action.type === 'organic_comment') {
+        result = await withTimeout(
           organicCommentService.runOneForAccount(account, { dryRun: false }),
           WORKER_HARD_MS,
           'organic'
         );
-        return { type: action.type, accountId: account.id, platform: account.platform, ...result, ms: Date.now() - started };
+      } else {
+        result = { skipped: true, reason: 'unknown_action' };
       }
-      return { type: action.type, accountId: account.id, skipped: true, reason: 'unknown_action' };
+      const out = {
+        type: action.type,
+        accountId: account.id,
+        username: account.username,
+        platform: account.platform,
+        ...result,
+        ms: Date.now() - started,
+      };
+      const cls = this._classifyResult(out);
+      brainLiveState.actionEnd({
+        slot,
+        account_id: account.id,
+        username: account.username,
+        platform,
+        action_type: actionType,
+        status: cls.status,
+        reason: cls.reason,
+        ms: out.ms,
+      });
+      return out;
     } catch (err) {
       const msg = err?.message || String(err);
       if (/no_live_session|session_not_logged_in|cookie_session_dead/i.test(msg)) {
@@ -746,26 +922,42 @@ class AccountOpsBrainService {
           console.warn('Brain markBanned failed:', e.message);
         }
       }
-      return {
+      const out = {
         type: action.type,
         accountId: account.id,
+        username: account.username,
         platform: account.platform,
         success: false,
         error: msg.slice(0, 300),
         ms: Date.now() - started,
       };
+      brainLiveState.actionEnd({
+        slot,
+        account_id: account.id,
+        username: account.username,
+        platform,
+        action_type: actionType,
+        status: 'fail',
+        reason: out.error,
+        ms: out.ms,
+      });
+      return out;
     } finally {
       lockedAccounts.delete(account.id);
     }
   }
 
   async tick() {
+    brainLiveState.setMeta({ enabled: this.isEnabled(), parallel: MAX_PARALLEL });
+
     if (!this.isEnabled()) {
       const capacity = await this.computeCapacity();
+      brainLiveState.setCapacity(capacity);
       return { skipped: true, reason: 'disabled', capacity };
     }
 
     const capacity = await this.computeCapacity();
+    brainLiveState.setCapacity(capacity);
     // Oxylabs mint is cheap (DB rows) — clear unbound backlog quickly; ProxyBase still capped by free pool.
     const [bound, enrolledOrganic, enrolledFollow] = await Promise.all([
       this.bindFreeProxies(80),
@@ -791,8 +983,28 @@ class AccountOpsBrainService {
       MAX_PARALLEL
     );
 
+    const plannedPublic = planned.map(({ account, action }, i) => ({
+      slot: i,
+      account_id: account.id,
+      username: account.username,
+      platform: this._platformKey(account),
+      action_type: this._publicActionType(action.type),
+    }));
+    const byPlatPlanned = {};
+    for (const p of plannedPublic) {
+      byPlatPlanned[p.platform] = (byPlatPlanned[p.platform] || 0) + 1;
+    }
+    brainLiveState.tickStart({
+      workers: planned.length,
+      by_platform: byPlatPlanned,
+      planned: plannedPublic,
+    });
+
+    // Refresh pools in background — do not await before workers.
+    this.refreshLivePools().catch((e) => console.warn('Brain pool refresh:', e.message));
+
     const results = await Promise.all(
-      planned.map(({ account, action }) => this.runAction(account, action))
+      planned.map(({ account, action }, i) => this.runAction(account, action, i))
     );
 
     const byPlat = {};
@@ -800,6 +1012,28 @@ class AccountOpsBrainService {
       const k = this._platformKey(r);
       byPlat[k] = (byPlat[k] || 0) + 1;
     }
+
+    const results_summary = results.map((r) => {
+      const cls = this._classifyResult(r);
+      return {
+        account_id: r.accountId,
+        username: r.username,
+        platform: this._platformKey(r),
+        action_type: this._publicActionType(r.type),
+        status: cls.status,
+        reason: cls.reason,
+        ms: r.ms,
+      };
+    });
+
+    brainLiveState.tickEnd({
+      workers: results.length,
+      by_platform: byPlat,
+      results_summary,
+      quiet: { organic: quietOrganic, follow: quietFollow },
+      enrolled: { organic: enrolledOrganic.enrolled, follow: enrolledFollow.enrolled },
+      bound,
+    });
 
     if (results.length || enrolledOrganic.enrolled || capacity.alerts.length) {
       console.log(

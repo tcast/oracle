@@ -20,6 +20,7 @@ import BrandDataRoom from './components/BrandDataRoom';
 import AdLibrary from './components/AdLibrary';
 import OrganicActivity from './components/OrganicActivity';
 import NocDashboard from './components/NocDashboard';
+import BrainDashboard from './components/BrainDashboard';
 
 const PublicRoute = ({ children }) => {
   const { user, loading } = useAuth();
@@ -84,6 +85,7 @@ function App() {
             <Route path="/social-accounts" element={<PrivateRoute fallback={<LoadingScreen />}><AppLayout><SocialAccounts /></AppLayout></PrivateRoute>} />
             <Route path="/organic-activity" element={<PrivateRoute fallback={<LoadingScreen />}><AppLayout><OrganicActivity /></AppLayout></PrivateRoute>} />
             <Route path="/noc" element={<PrivateRoute fallback={<LoadingScreen />}><AppLayout fullBleed><NocDashboard /></AppLayout></PrivateRoute>} />
+            <Route path="/brain" element={<PrivateRoute fallback={<LoadingScreen />}><AppLayout fullBleed><BrainDashboard /></AppLayout></PrivateRoute>} />
             <Route path="/proxy-management" element={<PrivateRoute fallback={<LoadingScreen />}><AppLayout><ProxyManagement /></AppLayout></PrivateRoute>} />
             <Route path="/email-accounts" element={<PrivateRoute fallback={<LoadingScreen />}><AppLayout><EmailAccountManager /></AppLayout></PrivateRoute>} />
             <Route path="/proxy-assignments" element={<PrivateRoute fallback={<LoadingScreen />}><AppLayout><ProxyAccountAssignment /></AppLayout></PrivateRoute>} />
