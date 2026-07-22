@@ -8622,12 +8622,14 @@ class PlaywrightService {
       };
 
       let loggedIn = false;
+      let lastError = null;
       // LinkedIn frequently serves captcha on residential/mobile proxies for fresh logins.
       // Prefer direct first when proxy is optional; then retry via sticky proxy for session reuse.
       if (!requireProxy) {
         try {
           loggedIn = await tryOnce(false);
         } catch (err) {
+          lastError = err;
           console.warn(`LinkedIn direct login path failed (${err.message}); retrying with proxy`);
         }
       }
@@ -8635,6 +8637,7 @@ class PlaywrightService {
         try {
           loggedIn = await tryOnce(true);
         } catch (err) {
+          lastError = err;
           console.warn(`LinkedIn proxy login path failed (${err.message})`);
         }
       }
@@ -8660,16 +8663,43 @@ class PlaywrightService {
         email: loginEmail,
         profileUrl: creds.profile_url || null,
         usedProxy: !!proxyId,
+        error: loggedIn ? null : (lastError?.message || 'login_failed'),
+        classification: loggedIn
+          ? 'ok'
+          : this.classifyLinkedInLoginFailure(lastError?.message),
       };
     } catch (error) {
       if (proxyId) {
         await proxyService.updateProxyStats(proxyId, false, { reason: error.message }).catch(() => {});
       }
-      return { success: false, accountId, error: error.message };
+      return {
+        success: false,
+        accountId,
+        error: error.message,
+        classification: this.classifyLinkedInLoginFailure(error.message),
+      };
     } finally {
       if (browser) await browser.close();
       this._untrackBrowser(accountId);
     }
+  }
+
+  /** Map a LinkedIn login failure message to a coarse, safety-relevant class. */
+  classifyLinkedInLoginFailure(message) {
+    const msg = String(message || '');
+    if (/id_verification_restricted|government-ID|verify your identity|restricted/i.test(msg)) {
+      return 'id_verification_required';
+    }
+    if (/checkpoint|captcha|security check|challenge|2fa|totp|pin|app.?push/i.test(msg)) {
+      return 'checkpoint';
+    }
+    if (/tunnel|timed_out|timeout|proxy|ECONN|ENOTFOUND|socket|net::/i.test(msg)) {
+      return 'connect_error';
+    }
+    if (/wrong email or password|bad credentials|doesn.?t match|incorrect/i.test(msg)) {
+      return 'bad_credentials';
+    }
+    return 'login_failed';
   }
 
   async requireProxyForLive(accountId) {
