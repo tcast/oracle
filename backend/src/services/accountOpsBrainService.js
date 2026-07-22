@@ -6,6 +6,7 @@ const pool = require('./db');
 const organicCommentService = require('./organicCommentService');
 const xFollowService = require('./xFollowService');
 const proxyService = require('./proxyService');
+const oxylabsStickyService = require('./oxylabsStickyService');
 const { isJunkUsername, looksFakeUsername, needsHumanHandle } = require('./xPersonas');
 
 const PLATFORMS = ['x', 'reddit'];
@@ -121,18 +122,35 @@ class AccountOpsBrainService {
 
     const alerts = [];
 
-    if (xUnbound > 0 && (oxylabsFree < Math.max(FREE_PROXY_FLOOR, xUnbound) || oxylabsFree < xUnbound)) {
-      const need = Math.max(0, xUnbound - oxylabsFree);
-      alerts.push({
-        id: 'x_oxylabs_proxies',
-        severity: oxylabsFree === 0 || need >= 20 ? 'critical' : 'warn',
-        kind: 'proxies',
-        platform: 'x',
-        provider: 'Oxylabs',
-        message: `Need more Oxylabs proxies for X (${xUnbound} accounts unbound, ${oxylabsFree} free sticky${need ? `, short ${need}` : ''})`,
-        action: 'Buy/import more Oxylabs sticky sessions and assign to unbound X accounts.',
-        metrics: { unbound: xUnbound, free: oxylabsFree, short: need, floor: FREE_PROXY_FLOOR },
-      });
+    // Oxylabs concurrent stickies are unlimited — empty free pool is NOT a buy-more alert.
+    // Alert only when we cannot mint (missing creds) or the last provision attempt failed.
+    if (xUnbound > 0) {
+      const canMint = await oxylabsStickyService.hasCredentials();
+      const provisionErr = oxylabsStickyService.getLastProvisionError();
+      if (!canMint) {
+        alerts.push({
+          id: 'x_oxylabs_creds',
+          severity: 'critical',
+          kind: 'proxies',
+          platform: 'x',
+          provider: 'Oxylabs',
+          message: `Oxylabs credentials missing — cannot mint stickies for ${xUnbound} unbound X account(s)`,
+          action: 'Set OXYLABS_USERNAME / OXYLABS_PASSWORD (and optional HOST/PORT/COUNTRY/SESSTIME) then re-run bind.',
+          metrics: { unbound: xUnbound, free: oxylabsFree, can_mint: false },
+        });
+      } else if (provisionErr) {
+        alerts.push({
+          id: 'x_oxylabs_provision_failed',
+          severity: 'critical',
+          kind: 'proxies',
+          platform: 'x',
+          provider: 'Oxylabs',
+          message: `Oxylabs sticky provision failed (${xUnbound} unbound X): ${String(provisionErr).slice(0, 160)}`,
+          action: 'Check OXYLABS_* creds / gateway, then let Account Ops Brain re-mint stickies.',
+          metrics: { unbound: xUnbound, free: oxylabsFree, can_mint: true, error: String(provisionErr).slice(0, 300) },
+        });
+      }
+      // else: free pool empty is fine — bindFreeProxies will mint on demand
     }
 
     if (redditUnbound > 0 && (proxybaseFree < Math.max(FREE_PROXY_FLOOR, redditUnbound) || proxybaseFree < redditUnbound)) {
@@ -231,10 +249,17 @@ class AccountOpsBrainService {
       });
     }
 
+    const oxylabsCanMint = await oxylabsStickyService.hasCredentials();
     const stats = {
       thresholds: { free_proxy_floor: FREE_PROXY_FLOOR, min_active_accounts: MIN_ACTIVE_ACCOUNTS },
       proxies: {
-        Oxylabs: { free_healthy: oxylabsFree, active: proxies.Oxylabs?.active || 0 },
+        Oxylabs: {
+          free_healthy: oxylabsFree,
+          active: proxies.Oxylabs?.active || 0,
+          unlimited_stickies: true,
+          can_mint: oxylabsCanMint,
+          last_provision_error: oxylabsStickyService.getLastProvisionError(),
+        },
         ProxyBase: { free_healthy: proxybaseFree, active: proxies.ProxyBase?.active || 0 },
       },
       accounts: {
@@ -316,53 +341,100 @@ class AccountOpsBrainService {
     return { enrolled, eligible: accounts.length };
   }
 
-  /** Bind free provider proxies to unbound active accounts (1:1). */
+  /**
+   * Bind proxies to unbound active accounts (1:1).
+   * X/Oxylabs: mint sticky sessids on demand (unlimited concurrent sessions).
+   * Reddit/ProxyBase: finite purchased pool only.
+   */
   async bindFreeProxies(limit = 20) {
-    const results = { x: 0, reddit: 0 };
+    const results = { x: 0, reddit: 0, oxylabs_minted: null };
 
-    const assignBatch = async (platform, provider, key) => {
-      const unbound = await pool.query(
-        `SELECT sa.id
-         FROM social_accounts sa
-         WHERE sa.status = 'active'
-           AND COALESCE(sa.is_simulated, false) = false
-           AND lower(sa.platform) = ANY($1::text[])
-           AND NOT EXISTS (
-             SELECT 1 FROM social_account_proxies sap
-             WHERE sap.social_account_id = sa.id AND sap.is_active = true
-           )
-         ORDER BY sa.id
-         LIMIT $2`,
-        [platform === 'x' ? ['x', 'twitter'] : ['reddit'], limit]
-      );
-      const free = await pool.query(
-        `SELECT p.id
-         FROM proxies p
-         WHERE p.is_active = true
-           AND p.provider = $1
-           AND (p.cooldown_until IS NULL OR p.cooldown_until <= NOW())
-           AND COALESCE(p.consecutive_failures, 0) = 0
-           AND NOT EXISTS (
-             SELECT 1 FROM social_account_proxies sap
-             WHERE sap.proxy_id = p.id AND sap.is_active = true
-           )
-         ORDER BY p.id
-         LIMIT $2`,
-        [provider, unbound.rows.length]
-      );
-      const n = Math.min(unbound.rows.length, free.rows.length);
-      for (let i = 0; i < n; i++) {
-        try {
-          await proxyService.assignProxiesToAccount(unbound.rows[i].id, [free.rows[i].id]);
-          results[key] += 1;
-        } catch (err) {
-          console.warn(`Brain proxy bind failed account=${unbound.rows[i].id}:`, err.message);
-        }
+    // Prefer free Oxylabs rows if any, then mint stickies for the rest.
+    const xUnbound = await pool.query(
+      `SELECT sa.id
+       FROM social_accounts sa
+       WHERE sa.status = 'active'
+         AND COALESCE(sa.is_simulated, false) = false
+         AND lower(sa.platform) = ANY($1::text[])
+         AND NOT EXISTS (
+           SELECT 1 FROM social_account_proxies sap
+           WHERE sap.social_account_id = sa.id AND sap.is_active = true
+         )
+       ORDER BY sa.id
+       LIMIT $2`,
+      [['x', 'twitter'], limit]
+    );
+    const freeOx = await pool.query(
+      `SELECT p.id
+       FROM proxies p
+       WHERE p.is_active = true
+         AND p.provider = 'Oxylabs'
+         AND (p.cooldown_until IS NULL OR p.cooldown_until <= NOW())
+         AND COALESCE(p.consecutive_failures, 0) = 0
+         AND NOT EXISTS (
+           SELECT 1 FROM social_account_proxies sap
+           WHERE sap.proxy_id = p.id AND sap.is_active = true
+         )
+       ORDER BY p.id
+       LIMIT $1`,
+      [xUnbound.rows.length]
+    );
+    const reuseN = Math.min(xUnbound.rows.length, freeOx.rows.length);
+    for (let i = 0; i < reuseN; i++) {
+      try {
+        await proxyService.assignProxiesToAccount(xUnbound.rows[i].id, [freeOx.rows[i].id]);
+        results.x += 1;
+      } catch (err) {
+        console.warn(`Brain Oxylabs reuse bind failed account=${xUnbound.rows[i].id}:`, err.message);
       }
-    };
+    }
+    const stillNeed = xUnbound.rows.length - reuseN;
+    if (stillNeed > 0) {
+      const minted = await oxylabsStickyService.bindUnboundXAccounts(stillNeed, { concurrency: 8 });
+      results.oxylabs_minted = minted;
+      results.x += minted.bound || 0;
+    }
 
-    await assignBatch('x', 'Oxylabs', 'x');
-    await assignBatch('reddit', 'ProxyBase', 'reddit');
+    // ProxyBase remains a finite pool.
+    const redditUnbound = await pool.query(
+      `SELECT sa.id
+       FROM social_accounts sa
+       WHERE sa.status = 'active'
+         AND COALESCE(sa.is_simulated, false) = false
+         AND lower(sa.platform) = 'reddit'
+         AND NOT EXISTS (
+           SELECT 1 FROM social_account_proxies sap
+           WHERE sap.social_account_id = sa.id AND sap.is_active = true
+         )
+       ORDER BY sa.id
+       LIMIT $1`,
+      [limit]
+    );
+    const freePb = await pool.query(
+      `SELECT p.id
+       FROM proxies p
+       WHERE p.is_active = true
+         AND p.provider = 'ProxyBase'
+         AND (p.cooldown_until IS NULL OR p.cooldown_until <= NOW())
+         AND COALESCE(p.consecutive_failures, 0) = 0
+         AND NOT EXISTS (
+           SELECT 1 FROM social_account_proxies sap
+           WHERE sap.proxy_id = p.id AND sap.is_active = true
+         )
+       ORDER BY p.id
+       LIMIT $1`,
+      [redditUnbound.rows.length]
+    );
+    const pbN = Math.min(redditUnbound.rows.length, freePb.rows.length);
+    for (let i = 0; i < pbN; i++) {
+      try {
+        await proxyService.assignProxiesToAccount(redditUnbound.rows[i].id, [freePb.rows[i].id]);
+        results.reddit += 1;
+      } catch (err) {
+        console.warn(`Brain ProxyBase bind failed account=${redditUnbound.rows[i].id}:`, err.message);
+      }
+    }
+
     return results;
   }
 
@@ -590,8 +662,9 @@ class AccountOpsBrainService {
     }
 
     const capacity = await this.computeCapacity();
+    // Oxylabs mint is cheap (DB rows) — clear unbound backlog quickly; ProxyBase still capped by free pool.
     const [bound, enrolledOrganic, enrolledFollow] = await Promise.all([
-      this.bindFreeProxies(15),
+      this.bindFreeProxies(80),
       this.enrollOrganicGap(ENROLL_BATCH),
       this.enrollFollowGap(ENROLL_BATCH),
     ]);

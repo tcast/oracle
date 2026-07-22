@@ -8,7 +8,6 @@ const HEALTHY_PROXY_WARN = 8;
 const ACTIVE_ACCOUNT_WARN = 15;
 const ACCOUNTS_WITHOUT_PROXY_WARN = 3;
 
-const isOxylabs = (p) => /oxylabs/i.test(String(p || ''));
 const isProxyBase = (p) => /proxybase/i.test(String(p || ''));
 
 const HREF_BY_KIND = {
@@ -19,6 +18,7 @@ const HREF_BY_KIND = {
 
 /**
  * Build human-facing capacity warnings from a /api/noc/dashboard payload.
+ * Oxylabs stickies are minted on demand — never alert "buy more Oxylabs" from free-count=0.
  */
 export function buildCapacityAlerts(data) {
   if (!data) return [];
@@ -33,30 +33,28 @@ export function buildCapacityAlerts(data) {
   const withoutProxy = Number(mapping.accounts_without_proxy ?? 0) || 0;
   const activeAccounts = byPlatform.reduce((s, r) => s + (Number(r.active) || 0), 0);
 
-  const oxylabs = byProvider.filter((r) => isOxylabs(r.provider));
   const proxybase = byProvider.filter((r) => isProxyBase(r.provider));
-  const oxFree = oxylabs.reduce((s, r) => s + (Number(r.free) || 0), 0);
-  const oxActive = oxylabs.reduce((s, r) => s + (Number(r.active) || 0), 0);
   const pbFree = proxybase.reduce((s, r) => s + (Number(r.free) || 0), 0);
   const pbActive = proxybase.reduce((s, r) => s + (Number(r.active) || 0), 0);
 
   const alerts = [];
 
-  if (free === 0) {
+  // Finite pools only (ProxyBase). Oxylabs is unlimited — ignore global free=0 for buy-more.
+  if (pbActive > 0 && pbFree === 0) {
     alerts.push({
       id: 'proxies-empty',
       level: 'critical',
-      title: 'No free proxies left',
-      body: 'Get more Oxylabs / ProxyBase proxies now — new account work and sticky sessions will stall.',
+      title: 'No free ProxyBase proxies left',
+      body: 'Buy/import more ProxyBase mobile/residential — Reddit bind will stall until the pool has free rows.',
       href: '/proxy-management',
       hrefLabel: 'Proxy management',
     });
-  } else if (free <= FREE_PROXY_WARN) {
+  } else if (pbActive > 0 && pbFree <= FREE_PROXY_WARN) {
     alerts.push({
       id: 'proxies-low',
       level: 'warn',
-      title: `Only ${free} free prox${free === 1 ? 'y' : 'ies'}`,
-      body: 'Running low on unused proxies. Get more Oxylabs / ProxyBase before the next batch.',
+      title: `Only ${pbFree} free ProxyBase prox${pbFree === 1 ? 'y' : 'ies'}`,
+      body: 'Running low on unused ProxyBase. Top up before the next Reddit batch.',
       href: '/proxy-management',
       hrefLabel: 'Proxy management',
     });
@@ -67,20 +65,9 @@ export function buildCapacityAlerts(data) {
       id: 'proxies-unhealthy',
       level: 'warn',
       title: `Only ${healthy} healthy prox${healthy === 1 ? 'y' : 'ies'}`,
-      body: `${activeProxies} active but many are cooling down or degraded. Top up Oxylabs / ProxyBase.`,
+      body: `${activeProxies} active but many are cooling down or degraded. Check ProxyBase health; Oxylabs stickies mint on demand.`,
       href: '/proxy-management',
       hrefLabel: 'Proxy management',
-    });
-  }
-
-  if (oxActive > 0 && oxFree <= 2) {
-    alerts.push({
-      id: 'oxylabs-low',
-      level: oxFree === 0 ? 'critical' : 'warn',
-      title: oxFree === 0 ? 'Oxylabs pool exhausted' : `Oxylabs free: ${oxFree}`,
-      body: 'Get more Oxylabs sticky residential proxies for X / social live work.',
-      href: '/proxy-management',
-      hrefLabel: 'Add Oxylabs',
     });
   }
 
@@ -100,7 +87,7 @@ export function buildCapacityAlerts(data) {
       id: 'accounts-no-proxy',
       level: 'warn',
       title: `${withoutProxy} accounts have no proxy`,
-      body: 'Assign proxies or buy more Oxylabs / ProxyBase, then map them 1:1.',
+      body: 'X: Account Ops Brain mints Oxylabs stickies on demand. Reddit: assign free ProxyBase or buy more.',
       href: '/proxy-assignments',
       hrefLabel: 'Proxy assignments',
     });
@@ -173,13 +160,15 @@ export function mapOpsCapacityAlerts(ops) {
 function mergeAlerts(opsAlerts, dashAlerts) {
   const out = [...opsAlerts];
   const seen = new Set(out.map((a) => a.id));
-  // Drop generic oxylabs/proxybase/accounts-low when ops already covers them
+  // Drop generic proxybase/accounts-low when ops already covers them
   const opsCoversOx = opsAlerts.some((a) => /oxylabs|x_oxylabs/i.test(a.id));
   const opsCoversPb = opsAlerts.some((a) => /proxybase|reddit_proxybase/i.test(a.id));
   const opsCoversAcct = opsAlerts.some((a) => /accounts_low|x_accounts|reddit_accounts/i.test(a.id));
 
   for (const a of dashAlerts) {
     if (seen.has(a.id)) continue;
+    // Never surface legacy oxylabs free-pool nags from dashboard heuristics
+    if (/oxylabs/i.test(a.id)) continue;
     if (opsCoversOx && /oxylabs/i.test(a.id)) continue;
     if (opsCoversPb && /proxybase/i.test(a.id)) continue;
     if (opsCoversAcct && /^accounts-low/.test(a.id)) continue;
