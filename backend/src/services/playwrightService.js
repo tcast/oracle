@@ -714,7 +714,7 @@ class PlaywrightService {
   /**
    * Type into an already-focused element with human-ish cadence (not fill()).
    */
-  async humanTypeInto(el, text, { clear = true } = {}) {
+  async humanTypeInto(el, text, { clear = true, confirm = false } = {}) {
     if (!el) return false;
     await el.click({ clickCount: clear ? 3 : 1 }).catch(() => {});
     await this.humanLikeDelay(200, 500);
@@ -738,7 +738,19 @@ class PlaywrightService {
       }
     }
     await this.humanLikeDelay(400, 900);
-    return true;
+    if (!confirm) return true;
+    const got = await el
+      .inputValue()
+      .catch(async () =>
+        el.evaluate((n) => n.value || n.textContent || '').catch(() => '')
+      );
+    return (
+      String(got || '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase() ===
+      value.replace(/\s+/g, ' ').trim().toLowerCase()
+    );
   }
 
   /**
@@ -3160,90 +3172,142 @@ class PlaywrightService {
   }
 
   /**
-   * Read live X profile (sidebar → Profile) or fall back to open Edit modal fields.
+   * Read Name/Bio from the Edit profile modal inputs (authoritative).
+   * Never trust bare document.querySelector('[data-testid="UserName"]') —
+   * that hits switcher / stale optimistic nodes and false-positives applied_live.
    */
   async readXLiveProfile(page, { accountId, username } = {}) {
     const tag = accountId ? `#${accountId}` : '';
     console.log(`X persona ${tag}: reading back live profile for verification`);
 
-    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForSelector('[data-testid="AppTabBar_Profile_Link"]', { timeout: 30000 });
-    await this.humanLikeDelay(1200, 2000);
-    await page.click('[data-testid="AppTabBar_Profile_Link"]');
-    await this.humanLikeDelay(2500, 4000);
+    // Hard navigation to own profile (bust SPA optimistic cache from the edit we just did)
+    const profileUrl = username
+      ? `https://x.com/${username}?persona_verify=${Date.now()}`
+      : 'https://x.com/home';
+    await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    if (!username) {
+      await page.waitForSelector('[data-testid="AppTabBar_Profile_Link"]', { timeout: 30000 });
+      await this.humanLikeDelay(1000, 1800);
+      await page.click('[data-testid="AppTabBar_Profile_Link"]');
+    }
+    await this.humanLikeDelay(3000, 4500);
     if (username) {
       await page.waitForURL(new RegExp(`/${username}(?:\\?|$|/)`), { timeout: 15000 }).catch(() => {});
     }
-
     await this.assertXProfileActionAllowed(page, { accountId });
 
-    let live = await page.evaluate(() => {
-      const userNameRoot = document.querySelector('[data-testid="UserName"]');
+    // Visible header name scoped to primary column only (never sidebar switcher)
+    const visible = await page.evaluate(() => {
+      const col =
+        document.querySelector('[data-testid="primaryColumn"]') ||
+        document.querySelector('main') ||
+        document.body;
+      const userNameRoot = col.querySelector('[data-testid="UserName"]');
       const displayName = userNameRoot
         ? (userNameRoot.innerText || '').split('\n').map((s) => s.trim()).filter(Boolean)[0] || ''
         : '';
-      const bio = ((document.querySelector('[data-testid="UserDescription"]') || {}).innerText || '')
-        .trim();
+      const bio = ((col.querySelector('[data-testid="UserDescription"]') || {}).innerText || '').trim();
       const imgs = Array.from(
-        document.querySelectorAll(
+        col.querySelectorAll(
           'a[href$="/photo"] img, [data-testid^="UserAvatar-Container"] img, [data-testid="UserAvatar-Container-unknown"] img'
         )
       );
       const avatarSrc = imgs.map((i) => i.getAttribute('src') || '').find(Boolean) || '';
       const isDefaultAvatar =
         !avatarSrc || /default_profile|default_profile_images|\/default_profile\./i.test(avatarSrc);
-      return { displayName, bio, avatarSrc, isDefaultAvatar, source: 'profile_page' };
+      return { displayName, bio, avatarSrc, isDefaultAvatar };
     });
 
-    // If profile page name is empty / still looking like a stub, try Edit modal fields
-    if (!live.displayName) {
-      const editBtn =
-        (await page.$('[data-testid="editProfileButton"], [aria-label="Edit profile"]')) ||
-        (await page
-          .locator('button:has-text("Edit profile")')
-          .first()
-          .elementHandle()
-          .catch(() => null));
-      if (editBtn) {
-        await editBtn.click().catch(() => {});
-        await this.humanLikeDelay(1500, 2500);
-        await this.assertXProfileActionAllowed(page, { accountId });
-        const modal = await page.evaluate(() => {
-          const nameEl =
-            document.querySelector('input[name="displayName"], input[name="name"]') ||
-            document.querySelector('[role="dialog"] input[type="text"]');
-          const bioEl =
-            document.querySelector(
-              'textarea[name="description"], textarea[name="bio"], textarea[data-testid="Account_description"]'
-            ) || document.querySelector('[role="dialog"] textarea');
-          const img =
-            document.querySelector('[role="dialog"] img') ||
-            document.querySelector('input[type="file"]')?.closest('[role="dialog"]')?.querySelector('img');
-          const avatarSrc = img?.getAttribute('src') || '';
-          return {
-            displayName: nameEl ? String(nameEl.value || '').trim() : '',
-            bio: bioEl ? String(bioEl.value || '').trim() : '',
-            avatarSrc,
-            isDefaultAvatar:
-              !avatarSrc || /default_profile|default_profile_images|\/default_profile\./i.test(avatarSrc),
-            source: 'edit_modal',
-          };
-        });
-        live = { ...live, ...modal, source: modal.source || 'edit_modal' };
-        // Close modal if open
-        await page.keyboard.press('Escape').catch(() => {});
-      }
+    // Authoritative: open Edit profile and read Name / Bio INPUT values
+    const editBtn =
+      (await page.$('[data-testid="editProfileButton"], [aria-label="Edit profile"]')) ||
+      (await page
+        .locator('button:has-text("Edit profile")')
+        .first()
+        .elementHandle()
+        .catch(() => null));
+    if (!editBtn) {
+      await page.screenshot({ path: `/tmp/x-persona-verify-noedit-${accountId || 'x'}.png` }).catch(() => {});
+      throw new Error('x_persona_verify_failed: Edit profile button not found for read-back');
     }
+    await editBtn.click();
+    await this.humanLikeDelay(2000, 3500);
+    await this.assertXProfileActionAllowed(page, { accountId });
+    await page
+      .waitForSelector(
+        '[role="dialog"] input[name="displayName"], [role="dialog"] input[name="name"], [role="dialog"] input[type="text"]',
+        { timeout: 15000 }
+      )
+      .catch(() => null);
+
+    const modal = await page.evaluate(() => {
+      const dialog = document.querySelector('[role="dialog"]') || document.body;
+      // Prefer explicit name fields — never the first random text input (location/url)
+      let nameEl =
+        dialog.querySelector('input[name="displayName"]') ||
+        dialog.querySelector('input[name="name"]') ||
+        dialog.querySelector('input[data-testid="DisplayNameInput"]');
+      if (!nameEl) {
+        const inputs = Array.from(dialog.querySelectorAll('input[type="text"], input:not([type])'));
+        nameEl =
+          inputs.find((el) => {
+            const labeled =
+              (el.getAttribute('aria-label') || '') +
+              ' ' +
+              (el.getAttribute('placeholder') || '') +
+              ' ' +
+              (el.labels && el.labels[0] ? el.labels[0].innerText : '');
+            return /\bname\b/i.test(labeled) && !/user.?name|handle|location|website|url/i.test(labeled);
+          }) || null;
+      }
+      const bioEl =
+        dialog.querySelector(
+          'textarea[name="description"], textarea[name="bio"], textarea[data-testid="Account_description"]'
+        ) || dialog.querySelector('textarea');
+      const img = dialog.querySelector('img');
+      const avatarSrc = (img && img.getAttribute('src')) || '';
+      return {
+        displayName: nameEl ? String(nameEl.value || '').trim() : '',
+        bio: bioEl ? String(bioEl.value || '').trim() : '',
+        avatarSrc,
+        isDefaultAvatar:
+          !avatarSrc || /default_profile|default_profile_images|\/default_profile\./i.test(avatarSrc),
+        nameInputFound: !!nameEl,
+        bioInputFound: !!bioEl,
+      };
+    });
+
+    await page.screenshot({ path: `/tmp/x-persona-verify-modal-${accountId || 'x'}.png` }).catch(() => {});
+    await page.keyboard.press('Escape').catch(() => {});
+    await this.humanLikeDelay(800, 1400);
+
+    // Modal inputs are source of truth; visible header is a cross-check only
+    const live = {
+      displayName: modal.displayName,
+      bio: modal.bio,
+      avatarSrc: modal.avatarSrc || visible.avatarSrc,
+      isDefaultAvatar:
+        modal.avatarSrc != null && modal.avatarSrc !== ''
+          ? modal.isDefaultAvatar
+          : visible.isDefaultAvatar,
+      source: 'edit_modal',
+      visibleDisplayName: visible.displayName,
+      visibleBio: visible.bio,
+      nameInputFound: !!modal.nameInputFound,
+      bioInputFound: !!modal.bioInputFound,
+    };
 
     console.log(
-      `X persona ${tag}: live read (${live.source}) name="${live.displayName}" ` +
-        `bioLen=${(live.bio || '').length} defaultAvatar=${!!live.isDefaultAvatar}`
+      `X persona ${tag}: live read (edit_modal) name="${live.displayName}" ` +
+        `visible="${live.visibleDisplayName}" bioLen=${(live.bio || '').length} ` +
+        `visibleBioLen=${(live.visibleBio || '').length} defaultAvatar=${!!live.isDefaultAvatar}`
     );
     return live;
   }
 
   /**
-   * Confirm attempted fields actually landed. Does not invent success for skipped fields.
+   * Confirm attempted fields actually landed. Name+bio must both verify for applied_live.
+   * Photo is independent (photo_applied only).
    */
   async verifyXPersonaLive(page, persona, attempts = {}, { accountId, username } = {}) {
     const tag = accountId ? `#${accountId}` : '';
@@ -3252,24 +3316,47 @@ class PlaywrightService {
     const skipped = [];
     const failed = [];
 
-    if (!attempts.nameAttempted) skipped.push('display_name');
-    else if (this._normXPersonaText(live.displayName) === this._normXPersonaText(persona.display_name)) {
-      verified.display_name = true;
-    } else {
+    if (!live.nameInputFound) {
+      failed.push('display_name: Edit profile Name input not found');
+    } else if (!attempts.nameAttempted) {
+      failed.push('display_name: name field was never filled (nameAttempted=false)');
+    } else if (this._normXPersonaText(live.displayName) !== this._normXPersonaText(persona.display_name)) {
       failed.push(
-        `display_name expected="${persona.display_name}" live="${live.displayName || ''}"`
+        `display_name expected="${persona.display_name}" edit_modal="${live.displayName || ''}" ` +
+          `visible="${live.visibleDisplayName || ''}"`
       );
-    }
-
-    if (!attempts.bioAttempted) skipped.push('bio');
-    else if (this._normXPersonaText(live.bio) === this._normXPersonaText(persona.bio)) {
-      verified.bio = true;
     } else {
-      failed.push(`bio mismatch (expectedLen=${(persona.bio || '').length} liveLen=${(live.bio || '').length})`);
+      verified.display_name = true;
+      // Visible header should also match when present (catch optimistic-only lies)
+      if (
+        live.visibleDisplayName &&
+        this._normXPersonaText(live.visibleDisplayName) !== this._normXPersonaText(persona.display_name)
+      ) {
+        failed.push(
+          `display_name edit_modal ok but visible still="${live.visibleDisplayName}" ` +
+            `(expected="${persona.display_name}")`
+        );
+        verified.display_name = false;
+      }
     }
 
-    // Photo is independent: never claim photo_applied on default avatar, but do not
-    // block applied_live when name/bio verified.
+    if (!attempts.bioAttempted) {
+      failed.push('bio: bio field was never filled (bioAttempted=false)');
+    } else if (!(persona.bio || '').trim()) {
+      skipped.push('bio');
+    } else if (!(live.bio || '').trim()) {
+      failed.push(
+        `bio empty in edit modal (expectedLen=${(persona.bio || '').length} visibleLen=${(live.visibleBio || '').length})`
+      );
+    } else if (this._normXPersonaText(live.bio) !== this._normXPersonaText(persona.bio)) {
+      failed.push(
+        `bio mismatch (expectedLen=${(persona.bio || '').length} liveLen=${(live.bio || '').length})`
+      );
+    } else {
+      verified.bio = true;
+    }
+
+    // Photo is independent — never drives applied_live
     const photoFailed = [];
     if (!attempts.photoAttempted) skipped.push('photo');
     else if (!live.isDefaultAvatar) {
@@ -3283,24 +3370,22 @@ class PlaywrightService {
         `skipped=[${skipped.join(',')}] failed=[${failed.concat(photoFailed).join(' | ')}]`
     );
 
-    if (failed.length) {
+    if (failed.length || photoFailed.length) {
       await page.screenshot({ path: `/tmp/x-persona-verify-fail-${accountId || 'x'}.png` }).catch(() => {});
-      throw new Error(`x_persona_verify_failed: ${failed.join('; ')}`);
     }
     if (photoFailed.length) {
       console.warn(`X persona ${tag}: photo not verified — ${photoFailed.join('; ')}`);
     }
 
-    const appliedLive = !!(
-      (attempts.nameAttempted ? verified.display_name : true) &&
-      (attempts.bioAttempted ? verified.bio : true) &&
-      (attempts.nameAttempted || attempts.bioAttempted)
-    );
+    // applied_live ONLY when name AND bio both verified — never photo-only / bio-only
+    const appliedLive = !!(verified.display_name && verified.bio);
 
     return {
       live,
       verified,
       skipped,
+      failed,
+      photoFailed,
       appliedLive,
       photoApplied: !!verified.photo,
     };
@@ -3381,7 +3466,7 @@ class PlaywrightService {
       if (!el) return false;
       await this.randomMouseMove(page);
       await this.humanLikeDelay(600, 1400);
-      return this.humanTypeInto(el, String(value).slice(0, maxLen), { clear: true });
+      return this.humanTypeInto(el, String(value).slice(0, maxLen), { clear: true, confirm: true });
     };
 
     let nameAttempted = false;
@@ -3498,36 +3583,95 @@ class PlaywrightService {
       await page.screenshot({ path: `/tmp/x-persona-saved-${accountId || 'x'}.png` }).catch(() => {});
       console.log(`X persona ${tag}: setup saved bio/location (display_name may need Edit pass)`);
 
-      // Second pass: Edit profile for display_name if button now says Edit
+      // Second pass: classic Edit profile modal for Name + Bio (authoritative path)
       await this.humanLikeDelay(2000, 3000);
-      await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
-      await page.waitForSelector('[data-testid="AppTabBar_Profile_Link"]', { timeout: 20000 }).catch(() => null);
-      await page.click('[data-testid="AppTabBar_Profile_Link"]').catch(() => {});
+      const editProfileUrl = username
+        ? `https://x.com/${username}`
+        : 'https://x.com/home';
+      await page.goto(editProfileUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+      if (!username) {
+        await page.waitForSelector('[data-testid="AppTabBar_Profile_Link"]', { timeout: 20000 }).catch(() => null);
+        await page.click('[data-testid="AppTabBar_Profile_Link"]').catch(() => {});
+      }
       await this.humanLikeDelay(2500, 4000);
       await this.assertXProfileActionAllowed(page, { accountId });
       const editAgain =
         (await page.$('[data-testid="editProfileButton"]')) ||
         (await page.locator('button:has-text("Edit profile")').first().elementHandle().catch(() => null));
-      if (editAgain) {
-        const label = (await editAgain.innerText().catch(() => '')).trim();
-        if (/edit profile/i.test(label)) {
-          await editAgain.click();
-          await this.humanLikeDelay(2000, 3500);
-          await this.assertXProfileActionAllowed(page, { accountId });
-          const nameEl =
-            (await page.$('input[name="displayName"], input[name="name"]')) ||
-            (await page.locator('[role="dialog"] input[type="text"]').first().elementHandle().catch(() => null));
-          if (nameEl) {
-            await nameEl.click({ clickCount: 3 }).catch(() => {});
-            await nameEl.fill('');
-            await this.humanTypeInto(nameEl, persona.display_name.slice(0, 50), { clear: true });
-            nameAttempted = true;
-            await clickTextButton('Save');
-            await this.assertXProfileActionAllowed(page, { accountId });
-            console.log(`X persona ${tag}: display_name edit attempted via Edit profile (unverified)`);
-          }
-        }
+      if (!editAgain) {
+        console.warn(`X persona ${tag}: Edit profile not available after setup — name/bio unverified`);
+        console.log(
+          `X persona ${tag}: attempts name=${nameAttempted} bio=${bioAttempted} photo=${photoAttempted}`
+        );
+        return { nameAttempted, bioAttempted, photoAttempted };
       }
+      await editAgain.click();
+      await this.humanLikeDelay(2000, 3500);
+      await this.assertXProfileActionAllowed(page, { accountId });
+
+      const nameElHandle = await page.evaluateHandle(() => {
+        const dialog = document.querySelector('[role="dialog"]') || document.body;
+        let nameEl =
+          dialog.querySelector('input[name="displayName"]') ||
+          dialog.querySelector('input[name="name"]') ||
+          dialog.querySelector('input[data-testid="DisplayNameInput"]');
+        if (!nameEl) {
+          const inputs = Array.from(dialog.querySelectorAll('input[type="text"], input:not([type])'));
+          nameEl =
+            inputs.find((el) => {
+              const labeled =
+                (el.getAttribute('aria-label') || '') +
+                ' ' +
+                (el.getAttribute('placeholder') || '') +
+                ' ' +
+                (el.labels && el.labels[0] ? el.labels[0].innerText : '');
+              return /\bname\b/i.test(labeled) && !/user.?name|handle|location|website|url/i.test(labeled);
+            }) || null;
+        }
+        return nameEl;
+      });
+      const nameEl = nameElHandle.asElement();
+      if (!nameEl) {
+        await page.screenshot({ path: `/tmp/x-persona-noform-${accountId || 'x'}.png` }).catch(() => {});
+        throw new Error('X Edit profile Name input not found after setup');
+      }
+      nameAttempted = await this.humanTypeInto(nameEl, persona.display_name.slice(0, 50), {
+        clear: true,
+        confirm: true,
+      });
+      if (!nameAttempted) {
+        throw new Error('X Edit profile Name input did not accept persona.display_name');
+      }
+
+      const bioEl =
+        (await page.$('[role="dialog"] textarea[name="description"]')) ||
+        (await page.$('[role="dialog"] textarea[data-testid="Account_description"]')) ||
+        (await page.$('[role="dialog"] textarea[name="bio"]')) ||
+        (await page.locator('[role="dialog"] textarea').first().elementHandle().catch(() => null));
+      if (bioEl) {
+        bioAttempted = await this.humanTypeInto(bioEl, persona.bio.slice(0, 160), {
+          clear: true,
+          confirm: true,
+        });
+      }
+      if (!bioAttempted) {
+        throw new Error('X Edit profile Bio input did not accept persona.bio');
+      }
+
+      await page.screenshot({ path: `/tmp/x-persona-presave-${accountId || 'x'}.png` }).catch(() => {});
+      const savedEdit = await clickTextButton('Save');
+      if (!savedEdit) {
+        const saveBtn =
+          (await page.$('[data-testid="Profile_Save_Button"]')) ||
+          (await page.$('[data-testid="settingsDetailSave"]')) ||
+          (await page.locator('[role="dialog"] button:has-text("Save")').first().elementHandle().catch(() => null));
+        if (!saveBtn) throw new Error('X profile Save button not found after Edit fill');
+        await saveBtn.click().catch(() => {});
+        await this.humanLikeDelay(3000, 5500);
+      }
+      await this.assertXProfileActionAllowed(page, { accountId });
+      await page.screenshot({ path: `/tmp/x-persona-saved-${accountId || 'x'}.png` }).catch(() => {});
+      console.log(`X persona ${tag}: Edit profile name+bio submitted (unverified)`);
 
       console.log(
         `X persona ${tag}: attempts name=${nameAttempted} bio=${bioAttempted} photo=${photoAttempted}`
@@ -3549,7 +3693,7 @@ class PlaywrightService {
         const ok = await this.humanTypeInto(
           el,
           String(value).slice(0, label === 'bio' ? 160 : 50),
-          { clear: true }
+          { clear: true, confirm: true }
         );
         if (ok) return true;
       }
@@ -3557,30 +3701,39 @@ class PlaywrightService {
       return false;
     };
 
+    // Name only — never fall back to first text input (that hits Location/URL)
     nameAttempted = await fillField(
       [
+        '[role="dialog"] input[name="displayName"]',
+        '[role="dialog"] input[data-testid="DisplayNameInput"]',
+        '[role="dialog"] input[name="name"]',
         'input[name="displayName"]',
         'input[data-testid="DisplayNameInput"]',
         'input[name="name"]',
-        'div[role="dialog"] input[type="text"]',
       ],
       persona.display_name.slice(0, 50),
       'display_name'
     );
     if (!nameAttempted) {
       await page.screenshot({ path: `/tmp/x-persona-noform-${accountId || 'x'}.png` }).catch(() => {});
-      throw new Error('X profile edit form not found (display name input)');
+      throw new Error('X profile edit form not found (display name input) or value did not stick');
     }
     bioAttempted = await fillField(
       [
+        '[role="dialog"] textarea[name="description"]',
+        '[role="dialog"] textarea[data-testid="Account_description"]',
+        '[role="dialog"] textarea[name="bio"]',
         'textarea[name="description"]',
         'textarea[data-testid="Account_description"]',
         'textarea[name="bio"]',
-        'textarea[data-testid="ocfEnterTextTextInput"]',
       ],
       persona.bio.slice(0, 160),
       'bio'
     );
+    if (!bioAttempted) {
+      await page.screenshot({ path: `/tmp/x-persona-nobio-${accountId || 'x'}.png` }).catch(() => {});
+      throw new Error('X profile bio input not found or value did not stick');
+    }
     await fillField(
       ['input[name="location"]', 'input[data-testid="LocationInput"]'],
       persona.location,
@@ -3608,12 +3761,13 @@ class PlaywrightService {
       }
     }
 
+    await page.screenshot({ path: `/tmp/x-persona-presave-${accountId || 'x'}.png` }).catch(() => {});
     await this.humanLikeDelay(1200, 2500);
     await this.randomMouseMove(page);
     const save =
       (await page.$('[data-testid="settingsDetailSave"]')) ||
       (await page.$('[data-testid="Profile_Save_Button"]')) ||
-      (await page.locator('button:has-text("Save")').first().elementHandle().catch(() => null));
+      (await page.locator('[role="dialog"] button:has-text("Save")').first().elementHandle().catch(() => null));
     if (!save) {
       await page.screenshot({ path: `/tmp/x-persona-nosave-${accountId || 'x'}.png` }).catch(() => {});
       throw new Error('X profile Save button not found');
@@ -3786,7 +3940,10 @@ class PlaywrightService {
           at: new Date().toISOString(),
           verified: verification.verified,
           skipped: verification.skipped,
+          failed: verification.failed || [],
           live_name: verification.live?.displayName || null,
+          visible_name: verification.live?.visibleDisplayName || null,
+          live_bio_len: (verification.live?.bio || '').length,
         },
       };
       // Strip null applied_live_at noise
@@ -3812,10 +3969,12 @@ class PlaywrightService {
       );
 
       if (!verification.appliedLive) {
-        throw new Error(
-          'x_persona_verify_failed: no text fields verified after apply ' +
-            `(verified=${JSON.stringify(verification.verified)} skipped=[${verification.skipped.join(',')}])`
-        );
+        const detail =
+          (verification.failed && verification.failed.length
+            ? verification.failed.join('; ')
+            : null) ||
+          `no text fields verified (verified=${JSON.stringify(verification.verified)} skipped=[${verification.skipped.join(',')}])`;
+        throw new Error(`x_persona_verify_failed: ${detail}`);
       }
 
       return {
