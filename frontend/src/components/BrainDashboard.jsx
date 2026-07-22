@@ -4,6 +4,7 @@ import api from '../utils/api';
 const PLAT = {
   x: { color: '#e7e9ea', accent: '#1d9bf0', label: 'X' },
   reddit: { color: '#ff4500', accent: '#ff8717', label: 'REDDIT' },
+  linkedin: { color: '#0a66c2', accent: '#70b5f9', label: 'LINKEDIN' },
   unknown: { color: '#64748b', accent: '#94a3b8', label: '?' },
 };
 
