@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import CreateAccountsForm from './CreateAccountsForm';
 import ImportAccountsForm from './ImportAccountsForm';
 import OrganicCommentsPanel from './OrganicCommentsPanel';
+import CapacityAlerts from './CapacityAlerts';
 import api from '../utils/api';
 
 const TABS = [
@@ -426,6 +427,8 @@ const SocialAccounts = () => {
           </div>
         )}
       </div>
+
+      <CapacityAlerts variant="light" pollMs={60000} />
 
       <div className="flex gap-1 border-b border-gray-200">
         {TABS.map((t) => (

@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import api from '../utils/api';
+import CapacityAlerts from './CapacityAlerts';
 import usConusGeo from '../data/us-states-conus.json';
 
 const POLL_MS = 3000;
@@ -666,6 +667,8 @@ const NocDashboard = () => {
           Last refresh failed: {error}
         </div>
       )}
+
+      <CapacityAlerts data={data} variant="dark" pollMs={0} />
 
       <div className="noc-gauges">
         <Gauge label="PROXY HEALTH" value={gauges.proxy_health_pct ?? 0} tone={(gauges.proxy_health_pct ?? 0) < 60 ? 'warn' : 'good'} />
