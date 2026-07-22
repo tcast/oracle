@@ -4288,10 +4288,14 @@ class PlaywrightService {
     await this.humanLikeDelay(2000, 3500);
     await this.assertXProfileActionAllowed(page, { accountId });
 
-    // Fallback: Your account → Username
-    let input =
+    // Prefer typedScreenName (X settings). Never fall back to first text input —
+    // that is often the Settings search box and silently no-ops the rename.
+    const findUsernameInput = async () =>
+      (await page.$('input[name="typedScreenName"]')) ||
       (await page.$('input[name="username"], input[name="screen_name"], input[autocomplete="username"]')) ||
-      (await page.locator('input[type="text"]').first().elementHandle().catch(() => null));
+      null;
+
+    let input = await findUsernameInput();
 
     if (!input) {
       await page.goto('https://x.com/settings/account', {
@@ -4306,9 +4310,7 @@ class PlaywrightService {
         await link.click().catch(() => {});
         await this.humanLikeDelay(1500, 2800);
       }
-      input =
-        (await page.$('input[name="username"], input[name="screen_name"], input[autocomplete="username"]')) ||
-        (await page.locator('input[type="text"]').first().elementHandle().catch(() => null));
+      input = await findUsernameInput();
     }
 
     if (!input) {
