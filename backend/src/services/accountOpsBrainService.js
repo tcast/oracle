@@ -6,6 +6,7 @@ const pool = require('./db');
 const organicCommentService = require('./organicCommentService');
 const xFollowService = require('./xFollowService');
 const linkedinFollowService = require('./linkedinFollowService');
+const redditFollowService = require('./redditFollowService');
 const proxyService = require('./proxyService');
 const oxylabsStickyService = require('./oxylabsStickyService');
 const brainLiveState = require('./brainLiveState');
@@ -79,7 +80,7 @@ class AccountOpsBrainService {
    */
   async refreshLivePools() {
     brainLiveState.setMeta({ enabled: this.isEnabled(), parallel: MAX_PARALLEL });
-    const [xCookies, redditDue, organicEn, followEn, liFollowEn, comments15, follows15, liFollows15, byPlat15] =
+    const [xCookies, redditDue, organicEn, followEn, liFollowEn, redditFollowEn, comments15, follows15, liFollows15, redditFollows15, byPlat15] =
       await Promise.all([
         pool.query(`
           SELECT COUNT(DISTINCT sa.id)::int AS n
@@ -127,6 +128,13 @@ class AccountOpsBrainService {
         `).catch(() => ({ rows: [{ n: 0 }] })),
         pool.query(`
           SELECT COUNT(*)::int AS n
+          FROM reddit_follow_jobs j
+          JOIN social_accounts sa ON sa.id = j.social_account_id
+          WHERE j.enabled = true AND sa.status = 'active'
+            AND COALESCE(sa.is_simulated, false) = false
+        `).catch(() => ({ rows: [{ n: 0 }] })),
+        pool.query(`
+          SELECT COUNT(*)::int AS n
           FROM organic_comments
           WHERE status = 'posted'
             AND created_at >= NOW() - INTERVAL '15 minutes'
@@ -139,6 +147,11 @@ class AccountOpsBrainService {
         pool.query(`
           SELECT COUNT(*)::int AS n
           FROM linkedin_follows
+          WHERE created_at >= NOW() - INTERVAL '15 minutes'
+        `).catch(() => ({ rows: [{ n: 0 }] })),
+        pool.query(`
+          SELECT COUNT(*)::int AS n
+          FROM reddit_follows
           WHERE created_at >= NOW() - INTERVAL '15 minutes'
         `).catch(() => ({ rows: [{ n: 0 }] })),
         pool.query(`
@@ -157,8 +170,9 @@ class AccountOpsBrainService {
       live_x_cookies: xCookies.rows[0]?.n || 0,
       reddit_due: redditDue.rows[0]?.n || 0,
       organic_enabled: organicEn.rows[0]?.n || 0,
-      follows_enabled: (followEn.rows[0]?.n || 0) + (liFollowEn.rows[0]?.n || 0),
+      follows_enabled: (followEn.rows[0]?.n || 0) + (liFollowEn.rows[0]?.n || 0) + (redditFollowEn.rows[0]?.n || 0),
       linkedin_follows_enabled: liFollowEn.rows[0]?.n || 0,
+      reddit_follows_enabled: redditFollowEn.rows[0]?.n || 0,
     });
 
     const byPlat = { x: 0, reddit: 0, linkedin: 0 };
@@ -169,7 +183,7 @@ class AccountOpsBrainService {
     }
     brainLiveState.setStats15m({
       comments: comments15.rows[0]?.n || 0,
-      follows: (follows15.rows[0]?.n || 0) + (liFollows15.rows[0]?.n || 0),
+      follows: (follows15.rows[0]?.n || 0) + (liFollows15.rows[0]?.n || 0) + (redditFollows15.rows[0]?.n || 0),
       by_platform: byPlat,
     });
 
@@ -505,12 +519,12 @@ class AccountOpsBrainService {
     return { enrolled, sample: rows.slice(0, 5).map((r) => r.id) };
   }
 
-  /** Enable X + LinkedIn follow jobs for active proxied accounts with live sessions. */
+  /** Enable X + LinkedIn + Reddit follow jobs for eligible proxied accounts. */
   async enrollFollowGap(limit = ENROLL_BATCH) {
-    const half = Math.max(1, Math.floor(limit / 2));
+    const third = Math.max(1, Math.floor(limit / 3));
     const xAccounts = await xFollowService.listEligibleAccounts();
     let enrolled = 0;
-    for (const account of xAccounts.slice(0, half)) {
+    for (const account of xAccounts.slice(0, third)) {
       const job = await xFollowService.ensureJob(account.id);
       if (!job.enabled) {
         await xFollowService.setAccountEnabled(account.id, true);
@@ -523,7 +537,7 @@ class AccountOpsBrainService {
     try {
       const liAccounts = await linkedinFollowService.listEligibleAccounts();
       liEligible = liAccounts.length;
-      for (const account of liAccounts.slice(0, half)) {
+      for (const account of liAccounts.slice(0, third)) {
         const job = await linkedinFollowService.ensureJob(account.id);
         if (!job.enabled) {
           await linkedinFollowService.setAccountEnabled(account.id, true);
@@ -534,11 +548,28 @@ class AccountOpsBrainService {
       console.warn('Brain LinkedIn follow enroll skipped:', err.message);
     }
 
+    let redditEnrolled = 0;
+    let redditEligible = 0;
+    try {
+      const redditAccounts = await redditFollowService.listEligibleAccounts();
+      redditEligible = redditAccounts.length;
+      for (const account of redditAccounts.slice(0, Math.max(third, limit - third * 2))) {
+        const job = await redditFollowService.ensureJob(account.id);
+        if (!job.enabled) {
+          await redditFollowService.setAccountEnabled(account.id, true);
+          redditEnrolled += 1;
+        }
+      }
+    } catch (err) {
+      console.warn('Brain Reddit follow enroll skipped:', err.message);
+    }
+
     return {
-      enrolled: enrolled + liEnrolled,
-      eligible: xAccounts.length + liEligible,
+      enrolled: enrolled + liEnrolled + redditEnrolled,
+      eligible: xAccounts.length + liEligible + redditEligible,
       x: enrolled,
       linkedin: liEnrolled,
+      reddit: redditEnrolled,
     };
   }
 
@@ -666,21 +697,23 @@ class AccountOpsBrainService {
               j.daily_target,
               j.cooldown_until AS organic_cooldown,
               j.failure_class AS organic_failure,
-              COALESCE(xfj.enabled, lfj.enabled) AS follow_enabled,
-              COALESCE(xfj.next_due_at, lfj.next_due_at) AS follow_due,
-              COALESCE(xfj.follows_today, lfj.follows_today) AS follows_today,
-              COALESCE(xfj.daily_target, lfj.daily_target) AS follow_target,
-              COALESCE(xfj.cooldown_until, lfj.cooldown_until) AS follow_cooldown,
-              COALESCE(xfj.status, lfj.status) AS follow_status,
+              COALESCE(xfj.enabled, lfj.enabled, rfj.enabled) AS follow_enabled,
+              COALESCE(xfj.next_due_at, lfj.next_due_at, rfj.next_due_at) AS follow_due,
+              COALESCE(xfj.follows_today, lfj.follows_today, rfj.follows_today) AS follows_today,
+              COALESCE(xfj.daily_target, lfj.daily_target, rfj.daily_target) AS follow_target,
+              COALESCE(xfj.cooldown_until, lfj.cooldown_until, rfj.cooldown_until) AS follow_cooldown,
+              COALESCE(xfj.status, lfj.status, rfj.status) AS follow_status,
               COALESCE(xfj.accepts_today, lfj.accepts_today) AS accepts_today,
               COALESCE(xfj.last_accept_at, lfj.last_accept_at) AS last_accept_at,
-              COALESCE(xfj.last_discover_at, lfj.last_discover_at) AS last_discover_at
+              COALESCE(xfj.last_discover_at, lfj.last_discover_at, rfj.last_discover_at) AS last_discover_at
        FROM social_accounts sa
        LEFT JOIN organic_comment_jobs j ON j.social_account_id = sa.id
        LEFT JOIN x_follow_jobs xfj ON xfj.social_account_id = sa.id
          AND lower(sa.platform) IN ('x', 'twitter')
        LEFT JOIN linkedin_follow_jobs lfj ON lfj.social_account_id = sa.id
          AND lower(sa.platform) = 'linkedin'
+       LEFT JOIN reddit_follow_jobs rfj ON rfj.social_account_id = sa.id
+         AND lower(sa.platform) = 'reddit'
        WHERE sa.status = 'active'
          AND COALESCE(sa.is_simulated, false) = false
          AND lower(sa.platform) = ANY($1::text[])
@@ -739,7 +772,7 @@ class AccountOpsBrainService {
 
     const planned = [];
     const reserveShare = Math.max(1, Math.floor(limit / 3));
-    for (const key of ['x', 'linkedin']) {
+    for (const key of ['x', 'linkedin', 'reddit']) {
       const list = actionable.get(key) || [];
       const n = Math.min(reserveShare, list.length);
       for (let i = 0; i < n; i++) planned.push(list.shift());
@@ -784,10 +817,12 @@ class AccountOpsBrainService {
     const lastAccept = account.last_accept_at ? new Date(account.last_accept_at).getTime() : 0;
     const lastDiscover = account.last_discover_at ? new Date(account.last_discover_at).getTime() : 0;
     const acceptsToday = account.accepts_today || 0;
-    const networkPlatform = platform === 'x' || platform === 'linkedin';
+    // Reddit has no follow-request inbox — accept only for X / LinkedIn.
+    const acceptPlatform = platform === 'x' || platform === 'linkedin';
+    const followPlatform = platform === 'x' || platform === 'linkedin' || platform === 'reddit';
 
     if (
-      networkPlatform &&
+      acceptPlatform &&
       !quietFollow &&
       acceptsToday < 10 &&
       (!lastAccept || now - lastAccept > sixHours) &&
@@ -797,7 +832,7 @@ class AccountOpsBrainService {
     }
 
     if (
-      networkPlatform &&
+      followPlatform &&
       !quietFollow &&
       (!lastDiscover || now - lastDiscover > 12 * 60 * 60 * 1000) &&
       Math.random() < 0.3
@@ -806,7 +841,7 @@ class AccountOpsBrainService {
     }
 
     const followDue =
-      networkPlatform &&
+      followPlatform &&
       !quietFollow &&
       account.follow_enabled !== false &&
       (!account.follow_cooldown || new Date(account.follow_cooldown).getTime() <= now) &&
@@ -940,12 +975,16 @@ class AccountOpsBrainService {
         });
         return out;
       }
+      const followSvcFor = (plat) => {
+        if (plat === 'linkedin') return linkedinFollowService;
+        if (plat === 'reddit') return redditFollowService;
+        return xFollowService;
+      };
       let result;
       if (action.type === 'accept_follows') {
         const full = await pool.query('SELECT * FROM social_accounts WHERE id = $1', [account.id]);
         const acc = full.rows[0] || account;
-        const svc =
-          this._platformKey(acc) === 'linkedin' ? linkedinFollowService : xFollowService;
+        const svc = followSvcFor(this._platformKey(acc));
         result = await withTimeout(
           svc.acceptFollowsForAccount(acc, { maxAccept: 5, dailyCap: 10 }),
           WORKER_HARD_MS,
@@ -954,16 +993,14 @@ class AccountOpsBrainService {
       } else if (action.type === 'discover_targets') {
         const full = await pool.query('SELECT * FROM social_accounts WHERE id = $1', [account.id]);
         const acc = full.rows[0] || account;
-        const svc =
-          this._platformKey(acc) === 'linkedin' ? linkedinFollowService : xFollowService;
+        const svc = followSvcFor(this._platformKey(acc));
         result = await withTimeout(
           svc.discoverTargetsForAccount(acc, { limit: 12 }),
           WORKER_HARD_MS,
           'discover_targets'
         );
       } else if (action.type === 'network') {
-        const svc =
-          this._platformKey(account) === 'linkedin' ? linkedinFollowService : xFollowService;
+        const svc = followSvcFor(this._platformKey(account));
         result = await withTimeout(
           svc.runOneForAccount(account, { dryRun: false }),
           WORKER_HARD_MS,
@@ -1064,10 +1101,17 @@ class AccountOpsBrainService {
     } catch {
       /* migration may not be applied yet */
     }
+    let redditFollowSettings = { quiet_hours_start: 1, quiet_hours_end: 8 };
+    try {
+      redditFollowSettings = await redditFollowService.getSettings();
+    } catch {
+      /* migration may not be applied yet */
+    }
     const quietOrganic = organicCommentService.inQuietHours(organicSettings);
     const quietFollow =
       xFollowService.inQuietHours(followSettings) &&
-      linkedinFollowService.inQuietHours(liFollowSettings);
+      linkedinFollowService.inQuietHours(liFollowSettings) &&
+      redditFollowService.inQuietHours(redditFollowSettings);
 
     // Per-platform fetch so Reddit cannot drown X / LinkedIn in one random LIMIT.
     const perPlat = Math.max(MAX_PARALLEL, Math.ceil(MAX_PARALLEL / 2) * 3);
