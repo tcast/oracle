@@ -3128,6 +3128,35 @@ class PlaywrightService {
    */
   async assertXProfileActionAllowed(page, { accountId } = {}) {
     const tag = accountId ? `#${accountId}` : '';
+
+    // Transient "Oops" modal — dismiss once and re-check (not a ban)
+    const dismissOops = async () => {
+      const oops = await page
+        .locator('[role="dialog"]')
+        .filter({ hasText: /Oops,\s*something went wrong/i })
+        .first()
+        .elementHandle()
+        .catch(() => null);
+      if (!oops) return false;
+      const ok =
+        (await page
+          .locator('[role="dialog"] button:has-text("OK"), [role="dialog"] [role="button"]:has-text("OK")')
+          .first()
+          .elementHandle()
+          .catch(() => null)) ||
+        (await page.locator('button:has-text("OK")').first().elementHandle().catch(() => null));
+      if (ok) {
+        await ok.click().catch(() => {});
+        await this.humanLikeDelay(1200, 2200);
+        console.warn(`X persona ${tag}: dismissed transient Oops modal`);
+        return true;
+      }
+      await page.keyboard.press('Escape').catch(() => {});
+      await this.humanLikeDelay(800, 1400);
+      return true;
+    };
+    await dismissOops();
+
     const text = await page
       .evaluate(() => {
         const dialog = document.querySelector('[role="dialog"]');
@@ -3146,6 +3175,7 @@ class PlaywrightService {
       );
     }
     if (/Oops,\s*something went wrong/i.test(text)) {
+      // Second look after dismiss — still present → soft fail (NOT ban)
       await page.screenshot({ path: `/tmp/x-persona-oops-${accountId || 'x'}.png` }).catch(() => {});
       throw new Error('x_profile_error: Oops, something went wrong. Please try again later.');
     }
@@ -3180,20 +3210,61 @@ class PlaywrightService {
     const tag = accountId ? `#${accountId}` : '';
     console.log(`X persona ${tag}: reading back live profile for verification`);
 
-    // Hard navigation to own profile (bust SPA optimistic cache from the edit we just did)
-    const profileUrl = username
-      ? `https://x.com/${username}?persona_verify=${Date.now()}`
-      : 'https://x.com/home';
-    await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    if (!username) {
-      await page.waitForSelector('[data-testid="AppTabBar_Profile_Link"]', { timeout: 30000 });
-      await this.humanLikeDelay(1000, 1800);
-      await page.click('[data-testid="AppTabBar_Profile_Link"]');
+    // Prefer sidebar Profile (same human path as edit). DB username is often stale
+    // after AccsMarket handle renames — URL-teleport then false-fails with
+    // "This account doesn't exist" + missing Edit button while the live session
+    // already shows the correct persona in the switcher.
+    const openOwnProfileViaSidebar = async () => {
+      if (!/x\.com|twitter\.com/i.test(page.url() || '')) {
+        await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await this.humanLikeDelay(1500, 2500);
+      }
+      const profileLink =
+        (await page.$('[data-testid="AppTabBar_Profile_Link"]')) ||
+        (await page.locator('a[aria-label="Profile"]').first().elementHandle().catch(() => null));
+      if (!profileLink) {
+        await page.waitForSelector('[data-testid="AppTabBar_Profile_Link"]', { timeout: 30000 });
+      }
+      const el = profileLink || (await page.$('[data-testid="AppTabBar_Profile_Link"]'));
+      if (!el) throw new Error('X Profile sidebar link not found for verify read-back');
+      await el.click();
+      await this.humanLikeDelay(3000, 4500);
+    };
+
+    const pageSaysMissingAccount = async () => {
+      await this.humanLikeDelay(800, 1400);
+      const text = await page
+        .evaluate(() => ((document.body && document.body.innerText) || '').slice(0, 4000))
+        .catch(() => '');
+      return /This account doesn.?t exist/i.test(text);
+    };
+
+    await openOwnProfileViaSidebar();
+
+    // Soft cache-bust WITHOUT using DB username (handles are often renamed).
+    // Reload the live profile URL from the address bar after sidebar navigation.
+    const livePath = await page.evaluate(() => window.location.pathname || '').catch(() => '');
+    if (/^\/[A-Za-z0-9_]{1,15}\/?$/.test(livePath)) {
+      const bustUrl = `https://x.com${livePath.replace(/\/$/, '')}?persona_verify=${Date.now()}`;
+      await page.goto(bustUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+      await this.humanLikeDelay(2000, 3500);
+      if (await pageSaysMissingAccount()) {
+        console.warn(`X persona ${tag}: live path ${livePath} 404 — reopening via sidebar`);
+        await openOwnProfileViaSidebar();
+      }
+    } else if (username) {
+      // Last resort: DB username only if sidebar did not land on a profile path
+      const bustUrl = `https://x.com/${username}?persona_verify=${Date.now()}`;
+      await page.goto(bustUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+      await this.humanLikeDelay(2000, 3500);
+      if (await pageSaysMissingAccount()) {
+        console.warn(
+          `X persona ${tag}: DB username @${username} 404 — falling back to sidebar Profile (handle likely renamed)`
+        );
+        await openOwnProfileViaSidebar();
+      }
     }
-    await this.humanLikeDelay(3000, 4500);
-    if (username) {
-      await page.waitForURL(new RegExp(`/${username}(?:\\?|$|/)`), { timeout: 15000 }).catch(() => {});
-    }
+
     // Wait for visible profile header before reading — empty UserName is a soft lie
     await page
       .waitForSelector(
@@ -3202,6 +3273,36 @@ class PlaywrightService {
       )
       .catch(() => null);
     await this.assertXProfileActionAllowed(page, { accountId });
+
+    // Soft-reconcile live handle when DB username is stale (no password / no rename)
+    let liveHandle = await page
+      .evaluate(() => {
+        const m = (window.location.pathname || '').match(/^\/([A-Za-z0-9_]{1,15})(?:\/|$|\?)/);
+        if (!m) return null;
+        const h = m[1];
+        if (/^(home|explore|search|i|settings|messages|notifications|compose)$/i.test(h)) return null;
+        return h;
+      })
+      .catch(() => null);
+
+    // If URL teleport 404'd or profile never painted, force sidebar once more
+    if ((await pageSaysMissingAccount()) || !liveHandle) {
+      console.warn(`X persona ${tag}: profile missing/unnavigable after open — forcing sidebar Profile`);
+      await openOwnProfileViaSidebar();
+      liveHandle = await page
+        .evaluate(() => {
+          const m = (window.location.pathname || '').match(/^\/([A-Za-z0-9_]{1,15})(?:\/|$|\?)/);
+          if (!m) return null;
+          const h = m[1];
+          if (/^(home|explore|search|i|settings|messages|notifications|compose)$/i.test(h)) return null;
+          return h;
+        })
+        .catch(() => null);
+    }
+
+    if (liveHandle && username && liveHandle.toLowerCase() !== String(username).toLowerCase()) {
+      console.warn(`X persona ${tag}: live handle @${liveHandle} ≠ DB @${username}`);
+    }
 
     // Visible header name scoped to primary column only (never sidebar switcher)
     const visible = await page.evaluate(() => {
@@ -3222,20 +3323,66 @@ class PlaywrightService {
       const avatarSrc = imgs.map((i) => i.getAttribute('src') || '').find(Boolean) || '';
       const isDefaultAvatar =
         !avatarSrc || /default_profile|default_profile_images|\/default_profile\./i.test(avatarSrc);
-      return { displayName, bio, avatarSrc, isDefaultAvatar };
+      const bannerImg =
+        col.querySelector('a[href$="/header_photo"] img') ||
+        col.querySelector('[data-testid="UserProfileHeader_Items"]')?.previousElementSibling?.querySelector?.('img') ||
+        col.querySelector('div[style*="background-image"]');
+      let bannerSrc = '';
+      if (bannerImg && bannerImg.getAttribute) {
+        bannerSrc = bannerImg.getAttribute('src') || '';
+      }
+      if (!bannerSrc) {
+        const bg = Array.from(col.querySelectorAll('div')).find((d) => {
+          const s = (d.getAttribute('style') || '');
+          return /background-image/i.test(s) && /pbs\.twimg\.com\/profile_banners/i.test(s);
+        });
+        if (bg) {
+          const m = (bg.getAttribute('style') || '').match(/url\(["']?([^"')]+)/);
+          bannerSrc = m ? m[1] : '';
+        }
+      }
+      const hasCustomBanner =
+        !!bannerSrc && /profile_banners/i.test(bannerSrc) && !/default_profile_banners|600x200/i.test(bannerSrc);
+      return { displayName, bio, avatarSrc, isDefaultAvatar, bannerSrc, hasCustomBanner };
     });
 
     // Proof artifact: primary-column header BEFORE opening edit modal
     await page.screenshot({ path: `/tmp/x-persona-verify-header-${accountId || 'x'}.png` }).catch(() => {});
 
     // Authoritative: open Edit profile and read Name / Bio INPUT values
+    await page
+      .waitForSelector(
+        '[data-testid="editProfileButton"], [aria-label="Edit profile"], [aria-label="Set up profile"]',
+        { timeout: 30000 }
+      )
+      .catch(() => null);
     const editBtn =
-      (await page.$('[data-testid="editProfileButton"], [aria-label="Edit profile"]')) ||
+      (await page.$('[data-testid="editProfileButton"], [aria-label="Edit profile"], [aria-label="Set up profile"]')) ||
       (await page
-        .locator('button:has-text("Edit profile")')
+        .locator('button:has-text("Edit profile"), button:has-text("Set up profile")')
         .first()
         .elementHandle()
         .catch(() => null));
+    if (!editBtn) {
+      // Last recovery: 404 / blank column after stale URL — sidebar once more
+      if (await pageSaysMissingAccount()) {
+        console.warn(`X persona ${tag}: no Edit on 404 page — sidebar recovery before fail`);
+        await openOwnProfileViaSidebar();
+        await page
+          .waitForSelector(
+            '[data-testid="editProfileButton"], [aria-label="Edit profile"], [aria-label="Set up profile"]',
+            { timeout: 30000 }
+          )
+          .catch(() => null);
+        editBtn =
+          (await page.$('[data-testid="editProfileButton"], [aria-label="Edit profile"], [aria-label="Set up profile"]')) ||
+          (await page
+            .locator('button:has-text("Edit profile"), button:has-text("Set up profile")')
+            .first()
+            .elementHandle()
+            .catch(() => null));
+      }
+    }
     if (!editBtn) {
       await page.screenshot({ path: `/tmp/x-persona-verify-noedit-${accountId || 'x'}.png` }).catch(() => {});
       throw new Error('x_persona_verify_failed: Edit profile button not found for read-back');
@@ -3300,17 +3447,21 @@ class PlaywrightService {
         modal.avatarSrc != null && modal.avatarSrc !== ''
           ? modal.isDefaultAvatar
           : visible.isDefaultAvatar,
+      bannerSrc: visible.bannerSrc || '',
+      hasCustomBanner: !!visible.hasCustomBanner,
       source: 'edit_modal',
       visibleDisplayName: visible.displayName,
       visibleBio: visible.bio,
       nameInputFound: !!modal.nameInputFound,
       bioInputFound: !!modal.bioInputFound,
+      liveHandle: liveHandle || null,
     };
 
     console.log(
       `X persona ${tag}: live read (edit_modal) name="${live.displayName}" ` +
-        `visible="${live.visibleDisplayName}" bioLen=${(live.bio || '').length} ` +
-        `visibleBioLen=${(live.visibleBio || '').length} defaultAvatar=${!!live.isDefaultAvatar}`
+        `handle=@${live.liveHandle || '?'} visible="${live.visibleDisplayName}" ` +
+        `bioLen=${(live.bio || '').length} visibleBioLen=${(live.visibleBio || '').length} ` +
+        `defaultAvatar=${!!live.isDefaultAvatar} banner=${!!live.hasCustomBanner}`
     );
     return live;
   }
@@ -3322,7 +3473,7 @@ class PlaywrightService {
   async verifyXPersonaLive(page, persona, attempts = {}, { accountId, username } = {}) {
     const tag = accountId ? `#${accountId}` : '';
     const live = await this.readXLiveProfile(page, { accountId, username });
-    const verified = { display_name: false, bio: false, photo: false };
+    const verified = { display_name: false, bio: false, photo: false, username: false, banner: false };
     const skipped = [];
     const failed = [];
 
@@ -3372,6 +3523,22 @@ class PlaywrightService {
       verified.bio = true;
     }
 
+    // Handle rename — independent of applied_live (name+bio still gate)
+    const wantHandle = String(persona.username || persona.handle || '').replace(/^@/, '').trim();
+    const handleFailed = [];
+    if (!attempts.usernameAttempted) skipped.push('username');
+    else if (!wantHandle) skipped.push('username');
+    else if (
+      live.liveHandle &&
+      live.liveHandle.toLowerCase() === wantHandle.toLowerCase()
+    ) {
+      verified.username = true;
+    } else {
+      handleFailed.push(
+        `username expected=@${wantHandle} live=@${live.liveHandle || '?'}`
+      );
+    }
+
     // Photo is independent — never drives applied_live
     const photoFailed = [];
     if (!attempts.photoAttempted) skipped.push('photo');
@@ -3381,16 +3548,30 @@ class PlaywrightService {
       photoFailed.push(`photo still default_profile (src=${(live.avatarSrc || '').slice(0, 80)})`);
     }
 
+    const bannerFailed = [];
+    if (!attempts.bannerAttempted) skipped.push('banner');
+    else if (live.hasCustomBanner) {
+      verified.banner = true;
+    } else {
+      bannerFailed.push(`banner not custom (src=${(live.bannerSrc || '').slice(0, 80)})`);
+    }
+
     console.log(
       `X persona ${tag}: verify verified=${JSON.stringify(verified)} ` +
-        `skipped=[${skipped.join(',')}] failed=[${failed.concat(photoFailed).join(' | ')}]`
+        `skipped=[${skipped.join(',')}] failed=[${failed.concat(handleFailed, photoFailed, bannerFailed).join(' | ')}]`
     );
 
-    if (failed.length || photoFailed.length) {
+    if (failed.length || photoFailed.length || handleFailed.length || bannerFailed.length) {
       await page.screenshot({ path: `/tmp/x-persona-verify-fail-${accountId || 'x'}.png` }).catch(() => {});
     }
     if (photoFailed.length) {
       console.warn(`X persona ${tag}: photo not verified — ${photoFailed.join('; ')}`);
+    }
+    if (handleFailed.length) {
+      console.warn(`X persona ${tag}: username not verified — ${handleFailed.join('; ')}`);
+    }
+    if (bannerFailed.length) {
+      console.warn(`X persona ${tag}: banner not verified — ${bannerFailed.join('; ')}`);
     }
 
     // applied_live ONLY when name AND bio both verified — never photo-only / bio-only
@@ -3402,8 +3583,12 @@ class PlaywrightService {
       skipped,
       failed,
       photoFailed,
+      handleFailed,
+      bannerFailed,
       appliedLive,
       photoApplied: !!verified.photo,
+      usernameApplied: !!verified.username,
+      bannerApplied: !!verified.banner,
     };
   }
 
@@ -3422,7 +3607,7 @@ class PlaywrightService {
    * @param {{ display_name: string, bio: string, location?: string|null, website?: string|null }} persona
    * @param {{ accountId?: number }} [options]
    */
-  async updateXPersona(page, persona, { accountId, username, photoPath = null } = {}) {
+  async updateXPersona(page, persona, { accountId, username, photoPath = null, bannerPath = null } = {}) {
     if (process.env.X_PERSONA_LIVE !== '1') {
       throw new Error(
         'X profile live edits disabled. Set X_PERSONA_LIVE=1 only after cookie-verify ' +
@@ -3488,6 +3673,7 @@ class PlaywrightService {
     let nameAttempted = false;
     let bioAttempted = false;
     let photoAttempted = false;
+    let bannerAttempted = false;
 
     // Prefer sidebar navigation from an already-warmed feed session (no URL teleport).
     console.log(`X persona ${tag}: opening own profile via sidebar (human path)`);
@@ -3511,15 +3697,58 @@ class PlaywrightService {
     await this.simulateHumanBehavior(page);
     await this.assertXProfileActionAllowed(page, { accountId });
     await this.humanLikeDelay(1200, 2400);
-    await page.waitForSelector(editBtnSel, { timeout: 45000 }).catch(() => null);
 
-    let editBtn =
-      (await page.$(editBtnSel)) ||
-      (await page
-        .locator('button:has-text("Set up profile"), button:has-text("Edit profile")')
-        .first()
-        .elementHandle()
-        .catch(() => null));
+    // Profile column often spins for 10–30s on residential proxies — wait before giving up
+    let editBtn = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await page
+        .waitForSelector(editBtnSel, { timeout: attempt === 1 ? 45000 : 25000 })
+        .catch(() => null);
+      editBtn =
+        (await page.$(editBtnSel)) ||
+        (await page
+          .locator(
+            'button:has-text("Set up profile"), button:has-text("Edit profile"), [role="button"]:has-text("Set up profile"), [role="button"]:has-text("Edit profile")'
+          )
+          .first()
+          .elementHandle()
+          .catch(() => null)) ||
+        (await page
+          .locator(
+            'button:has-text("Complete your profile"), a:has-text("Complete your profile"), [role="button"]:has-text("Complete your profile")'
+          )
+          .first()
+          .elementHandle()
+          .catch(() => null));
+      if (editBtn) break;
+
+      const stillLoading = await page
+        .evaluate(() => {
+          const col =
+            document.querySelector('[data-testid="primaryColumn"]') ||
+            document.querySelector('main');
+          if (!col) return true;
+          const text = (col.innerText || '').trim();
+          const hasName = !!col.querySelector('[data-testid="UserName"]');
+          return !hasName && text.length < 40;
+        })
+        .catch(() => false);
+
+      if (!stillLoading && attempt >= 2) break;
+
+      console.warn(`X persona ${tag}: Edit/Set up not ready (attempt ${attempt}/3) — retry via sidebar`);
+      await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+      await this.humanLikeDelay(2000, 3500);
+      const again =
+        (await page.$('[data-testid="AppTabBar_Profile_Link"]')) ||
+        (await page.locator('a[aria-label="Profile"]').first().elementHandle().catch(() => null));
+      if (again) {
+        await again.click().catch(() => {});
+        await this.humanLikeDelay(4000, 7000);
+      }
+      await this.assertXProfileActionAllowed(page, { accountId });
+    }
+
     if (!editBtn) {
       await page.screenshot({ path: `/tmp/x-persona-noform-${accountId || 'x'}.png` }).catch(() => {});
       throw new Error('X Set up / Edit profile button not found');
@@ -3559,10 +3788,27 @@ class PlaywrightService {
         }
       }
 
-      // Header
+      // Header / banner
       text = await dialogText();
       if (/Pick a header|header/i.test(text)) {
-        await clickTextButton('Skip for now');
+        const fileInputs = await page.$$('input[data-testid="fileInput"], input[type="file"]');
+        const bannerInput = fileInputs[fileInputs.length - 1] || fileInputs[0] || null;
+        if (bannerPath && fs.existsSync(bannerPath) && bannerInput) {
+          await bannerInput.setInputFiles(bannerPath);
+          await this.humanLikeDelay(2500, 4000);
+          const apply =
+            (await page.$('[data-testid="applyButton"]')) ||
+            (await page.locator('button:has-text("Apply")').first().elementHandle().catch(() => null));
+          if (apply) {
+            await apply.click().catch(() => {});
+            await this.humanLikeDelay(1500, 2500);
+          }
+          await advanceSetupStep();
+          bannerAttempted = true;
+          console.log(`X persona ${tag}: banner upload attempted in setup (unverified)`);
+        } else {
+          await clickTextButton('Skip for now');
+        }
       }
 
       // Bio
@@ -3601,11 +3847,16 @@ class PlaywrightService {
 
       // Second pass: classic Edit profile modal for Name + Bio (authoritative path)
       await this.humanLikeDelay(2000, 3000);
-      const editProfileUrl = username
-        ? `https://x.com/${username}`
-        : 'https://x.com/home';
-      await page.goto(editProfileUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
-      if (!username) {
+      // Sidebar Profile — never teleport via DB username (handles get renamed)
+      const profileLinkAgain =
+        (await page.$('[data-testid="AppTabBar_Profile_Link"]')) ||
+        (await page.locator('a[aria-label="Profile"]').first().elementHandle().catch(() => null));
+      if (profileLinkAgain) {
+        await profileLinkAgain.click().catch(() => {});
+      } else if (username) {
+        await page.goto(`https://x.com/${username}`, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+      } else {
+        await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
         await page.waitForSelector('[data-testid="AppTabBar_Profile_Link"]', { timeout: 20000 }).catch(() => null);
         await page.click('[data-testid="AppTabBar_Profile_Link"]').catch(() => {});
       }
@@ -3617,9 +3868,9 @@ class PlaywrightService {
       if (!editAgain) {
         console.warn(`X persona ${tag}: Edit profile not available after setup — name/bio unverified`);
         console.log(
-          `X persona ${tag}: attempts name=${nameAttempted} bio=${bioAttempted} photo=${photoAttempted}`
+          `X persona ${tag}: attempts name=${nameAttempted} bio=${bioAttempted} photo=${photoAttempted} banner=${bannerAttempted}`
         );
-        return { nameAttempted, bioAttempted, photoAttempted };
+        return { nameAttempted, bioAttempted, photoAttempted, bannerAttempted };
       }
       await editAgain.click();
       await this.humanLikeDelay(2000, 3500);
@@ -3690,9 +3941,9 @@ class PlaywrightService {
       console.log(`X persona ${tag}: Edit profile name+bio submitted (unverified)`);
 
       console.log(
-        `X persona ${tag}: attempts name=${nameAttempted} bio=${bioAttempted} photo=${photoAttempted}`
+        `X persona ${tag}: attempts name=${nameAttempted} bio=${bioAttempted} photo=${photoAttempted} banner=${bannerAttempted}`
       );
-      return { nameAttempted, bioAttempted, photoAttempted };
+      return { nameAttempted, bioAttempted, photoAttempted, bannerAttempted };
     }
 
     // --- Classic Edit profile modal ---
@@ -3777,6 +4028,31 @@ class PlaywrightService {
       }
     }
 
+    // Banner / header — prefer explicit Add banner control, else second file input
+    if (bannerPath && fs.existsSync(bannerPath)) {
+      const bannerBtn = await page.$(
+        '[aria-label*="Add banner" i], [aria-label*="Edit banner" i], [aria-label*="header" i], [data-testid="banner"]'
+      );
+      if (bannerBtn) {
+        await bannerBtn.click().catch(() => {});
+        await this.humanLikeDelay(1000, 2000);
+      }
+      const fileInputs = await page.$$('input[data-testid="fileInput"], input[type="file"]');
+      const bannerInput = fileInputs.length > 1 ? fileInputs[1] : fileInputs[0] || null;
+      if (bannerInput) {
+        await bannerInput.setInputFiles(bannerPath);
+        await this.humanLikeDelay(2500, 4000);
+        const apply =
+          (await page.$('[data-testid="applyButton"]')) ||
+          (await page.locator('button:has-text("Apply")').first().elementHandle().catch(() => null));
+        if (apply) {
+          await apply.click().catch(() => {});
+          await this.humanLikeDelay(1500, 2500);
+        }
+        bannerAttempted = true;
+      }
+    }
+
     await page.screenshot({ path: `/tmp/x-persona-presave-${accountId || 'x'}.png` }).catch(() => {});
     await this.humanLikeDelay(1200, 2500);
     await this.randomMouseMove(page);
@@ -3795,9 +4071,9 @@ class PlaywrightService {
     await page.screenshot({ path: `/tmp/x-persona-saved-${accountId || 'x'}.png` }).catch(() => {});
     console.log(
       `X persona ${tag}: edit submitted name="${persona.display_name}" ` +
-        `(attempts name=${nameAttempted} bio=${bioAttempted} photo=${photoAttempted}; unverified)`
+        `(attempts name=${nameAttempted} bio=${bioAttempted} photo=${photoAttempted} banner=${bannerAttempted}; unverified)`
     );
-    return { nameAttempted, bioAttempted, photoAttempted };
+    return { nameAttempted, bioAttempted, photoAttempted, bannerAttempted };
   }
 
   /**
@@ -3875,11 +4151,157 @@ class PlaywrightService {
   }
 
   /**
-   * End-to-end: restore cookie session → apply x_persona fields (+ optional photo).
+   * Upload X profile banner/header image (cookie session only).
+   */
+  async updateXProfileBanner(page, bannerPath, { accountId, username } = {}) {
+    const fs = require('fs');
+    if (!bannerPath || !fs.existsSync(bannerPath)) {
+      throw new Error(`Banner not found: ${bannerPath}`);
+    }
+    const tag = accountId ? `#${accountId}` : '';
+
+    const openEdit = async (url) => {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+      await this.humanLikeDelay(2000, 3500);
+      await this.assertXProfileActionAllowed(page, { accountId });
+      const editBtn =
+        (await page.$('[data-testid="editProfileButton"]')) ||
+        (await page.$('[aria-label="Edit profile"]'));
+      if (editBtn) {
+        await editBtn.click().catch(() => {});
+        await this.humanLikeDelay(1500, 2500);
+      }
+      await this.assertXProfileActionAllowed(page, { accountId });
+    };
+
+    if (username) await openEdit(`https://x.com/${username}`);
+    else await openEdit('https://x.com/settings/profile');
+
+    const bannerBtn = await page.$(
+      '[aria-label*="Add banner" i], [aria-label*="Edit banner" i], [aria-label*="header photo" i], [aria-label*="Add a header" i]'
+    );
+    if (bannerBtn) {
+      await bannerBtn.click().catch(() => {});
+      await this.humanLikeDelay(1000, 2000);
+    }
+
+    const fileInputs = await page.$$('input[type="file"][accept*="image"], input[type="file"], input[data-testid="fileInput"]');
+    const fileInput = fileInputs.length > 1 ? fileInputs[fileInputs.length - 1] : fileInputs[0] || null;
+    if (!fileInput) {
+      await page.screenshot({ path: `/tmp/x-banner-nofile-${accountId || 'x'}.png` }).catch(() => {});
+      throw new Error('X banner file input not found');
+    }
+
+    await fileInput.setInputFiles(bannerPath);
+    await this.humanLikeDelay(2500, 4000);
+    const apply =
+      (await page.$('[data-testid="applyButton"]')) ||
+      (await page.locator('button:has-text("Apply")').first().elementHandle().catch(() => null));
+    if (apply) {
+      await apply.click().catch(() => {});
+      await this.humanLikeDelay(1500, 2500);
+    }
+    const save =
+      (await page.$('[data-testid="settingsDetailSave"]')) ||
+      (await page.$('[data-testid="Profile_Save_Button"]')) ||
+      (await page.locator('button:has-text("Save")').first().elementHandle().catch(() => null));
+    if (save) {
+      await save.click().catch(() => {});
+      await this.humanLikeDelay(2500, 4000);
+    }
+    await this.assertXProfileActionAllowed(page, { accountId });
+    await page.screenshot({ path: `/tmp/x-banner-done-${accountId || 'x'}.png` }).catch(() => {});
+    console.log(`X persona ${tag}: banner upload attempted from ${bannerPath} (unverified)`);
+    return { bannerAttempted: true };
+  }
+
+  /**
+   * Rename X @handle via settings/screen_name (cookie session only, no password).
+   * Soft-fails (returns attempted:false) if UI unavailable — never hangs.
+   */
+  async updateXUsername(page, newUsername, { accountId, currentUsername } = {}) {
+    const want = String(newUsername || '').replace(/^@/, '').trim();
+    if (!want || want.length < 4 || want.length > 15) {
+      throw new Error(`Invalid X username: ${newUsername}`);
+    }
+    if (!/^[A-Za-z0-9_]+$/.test(want)) {
+      throw new Error(`Invalid X username chars: ${want}`);
+    }
+    const tag = accountId ? `#${accountId}` : '';
+    const cur = String(currentUsername || '').replace(/^@/, '');
+    if (cur && cur.toLowerCase() === want.toLowerCase()) {
+      console.log(`X persona ${tag}: username already @${want}`);
+      return { usernameAttempted: true, alreadySet: true };
+    }
+
+    console.log(`X persona ${tag}: renaming handle → @${want} via settings`);
+    await page.goto('https://x.com/settings/screen_name', {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000,
+    });
+    await this.humanLikeDelay(2500, 4000);
+    await this.assertXProfileActionAllowed(page, { accountId });
+
+    // Fallback: Your account → Username
+    let input =
+      (await page.$('input[name="username"], input[name="screen_name"], input[autocomplete="username"]')) ||
+      (await page.locator('input[type="text"]').first().elementHandle().catch(() => null));
+
+    if (!input) {
+      await page.goto('https://x.com/settings/account', {
+        waitUntil: 'domcontentloaded',
+        timeout: 60000,
+      }).catch(() => {});
+      await this.humanLikeDelay(2000, 3500);
+      const link =
+        (await page.$('a[href*="screen_name"]')) ||
+        (await page.locator('a:has-text("Username"), span:has-text("Username")').first().elementHandle().catch(() => null));
+      if (link) {
+        await link.click().catch(() => {});
+        await this.humanLikeDelay(2000, 3500);
+      }
+      input =
+        (await page.$('input[name="username"], input[name="screen_name"], input[autocomplete="username"]')) ||
+        (await page.locator('input[type="text"]').first().elementHandle().catch(() => null));
+    }
+
+    if (!input) {
+      await page.screenshot({ path: `/tmp/x-username-noinput-${accountId || 'x'}.png` }).catch(() => {});
+      console.warn(`X persona ${tag}: username input not found — skipping rename`);
+      return { usernameAttempted: false };
+    }
+
+    await this.humanTypeInto(input, want, { clear: true, confirm: true });
+    await this.humanLikeDelay(1500, 2500);
+
+    const body = await page.evaluate(() => (document.body && document.body.innerText) || '').catch(() => '');
+    if (/taken|already exists|not available|unavailable/i.test(body)) {
+      // Append digit and retry once
+      const alt = `${want.slice(0, 13)}${Math.floor(Math.random() * 90 + 10)}`.slice(0, 15);
+      console.warn(`X persona ${tag}: @${want} taken — trying @${alt}`);
+      await this.humanTypeInto(input, alt, { clear: true, confirm: true });
+      await this.humanLikeDelay(1500, 2500);
+    }
+
+    const save =
+      (await page.$('[data-testid="settingsDetailSave"]')) ||
+      (await page.locator('button:has-text("Save"), button:has-text("Next"), button:has-text("Done")').first().elementHandle().catch(() => null));
+    if (save) {
+      await save.click().catch(() => {});
+      await this.humanLikeDelay(3000, 5000);
+    }
+    await this.assertXProfileActionAllowed(page, { accountId });
+    await page.screenshot({ path: `/tmp/x-username-done-${accountId || 'x'}.png` }).catch(() => {});
+    console.log(`X persona ${tag}: username rename attempted → @${want} (unverified)`);
+    return { usernameAttempted: true, requestedUsername: want };
+  }
+
+  /**
+   * End-to-end: restore cookie session → apply x_persona fields (+ optional photo/banner/rename).
    * Never password-logs in.
    * Never sets applied_live / photo_applied without live profile read-back verification.
    */
-  async applyXPersonaLive(accountId, { photoPath = null, requireProxy = true } = {}) {
+  async applyXPersonaLive(accountId, { photoPath = null, bannerPath = null, requireProxy = true } = {}) {
     if (process.env.X_PERSONA_LIVE !== '1') {
       throw new Error('Set X_PERSONA_LIVE=1 to run live X persona edits');
     }
@@ -3893,9 +4315,23 @@ class PlaywrightService {
         typeof account.credentials === 'string'
           ? JSON.parse(account.credentials)
           : account.credentials || {};
-      const persona = creds.x_persona;
+      let persona = creds.x_persona;
       if (!persona?.display_name || !persona?.bio) {
         throw new Error(`Account ${accountId} missing credentials.x_persona — run update-x-personas.js first`);
+      }
+
+      // Ensure a target username exists for rename
+      if (!persona.username && persona.rename_handle !== false) {
+        const { generateXPersona } = require('./xPersonas');
+        const generated = generateXPersona(accountId);
+        persona = { ...persona, username: generated.username, rename_handle: true };
+        await pool.query(
+          `UPDATE social_accounts
+           SET credentials = jsonb_set(COALESCE(credentials, '{}'::jsonb), '{x_persona}', $2::jsonb),
+               updated_at = NOW()
+           WHERE id = $1`,
+          [accountId, JSON.stringify(persona)]
+        );
       }
 
       await this.requireProxyForLive(accountId);
@@ -3921,11 +4357,14 @@ class PlaywrightService {
         accountId,
         username: account.username,
         photoPath,
+        bannerPath,
       });
       const attempts = {
         nameAttempted: !!(personaResult && personaResult.nameAttempted),
         bioAttempted: !!(personaResult && personaResult.bioAttempted),
         photoAttempted: !!(personaResult && personaResult.photoAttempted),
+        bannerAttempted: !!(personaResult && personaResult.bannerAttempted),
+        usernameAttempted: false,
       };
       // Fallback photo upload if setup flow skipped photo or classic modal had no file input
       if (photoPath && !attempts.photoAttempted) {
@@ -3939,6 +4378,33 @@ class PlaywrightService {
           console.warn(`X #${accountId} photo upload attempt failed: ${photoErr.message}`);
         }
       }
+      if (bannerPath && !attempts.bannerAttempted) {
+        try {
+          const bannerResult = await this.updateXProfileBanner(page, bannerPath, {
+            accountId,
+            username: account.username,
+          });
+          attempts.bannerAttempted = !!(bannerResult && bannerResult.bannerAttempted);
+        } catch (bannerErr) {
+          console.warn(`X #${accountId} banner upload attempt failed: ${bannerErr.message}`);
+        }
+      }
+
+      // Rename handle after profile fields (settings path)
+      if (persona.username && persona.rename_handle !== false) {
+        try {
+          const renameResult = await this.updateXUsername(page, persona.username, {
+            accountId,
+            currentUsername: account.username,
+          });
+          attempts.usernameAttempted = !!(renameResult && renameResult.usernameAttempted);
+          if (renameResult?.requestedUsername) {
+            persona = { ...persona, username: renameResult.requestedUsername };
+          }
+        } catch (renameErr) {
+          console.warn(`X #${accountId} username rename failed: ${renameErr.message}`);
+        }
+      }
 
       const verification = await this.verifyXPersonaLive(page, persona, attempts, {
         accountId,
@@ -3947,11 +4413,28 @@ class PlaywrightService {
 
       await this.persistSession(page, 'x', accountId);
 
+      // Sync renamed handles so future URL teleports don't 404
+      const liveHandle = verification.live?.liveHandle;
+      if (
+        liveHandle &&
+        typeof liveHandle === 'string' &&
+        liveHandle.toLowerCase() !== String(account.username || '').toLowerCase()
+      ) {
+        await pool.query(
+          `UPDATE social_accounts SET username = $2, updated_at = NOW() WHERE id = $1 AND platform = 'x'`,
+          [accountId, liveHandle]
+        );
+        console.log(`X #${accountId}: synced username ${account.username} → ${liveHandle}`);
+        account.username = liveHandle;
+      }
+
       const nextPersona = {
         ...persona,
         applied_live: !!verification.appliedLive,
         applied_live_at: verification.appliedLive ? new Date().toISOString() : null,
         photo_applied: !!verification.photoApplied,
+        banner_applied: !!verification.bannerApplied,
+        username_applied: !!verification.usernameApplied,
         last_verify: {
           at: new Date().toISOString(),
           verified: verification.verified,
@@ -3959,6 +4442,7 @@ class PlaywrightService {
           failed: verification.failed || [],
           live_name: verification.live?.displayName || null,
           visible_name: verification.live?.visibleDisplayName || null,
+          live_handle: verification.live?.liveHandle || null,
           live_bio_len: (verification.live?.bio || '').length,
         },
       };
@@ -3979,6 +4463,7 @@ class PlaywrightService {
           headline: !!verification.verified.display_name,
           about: !!verification.verified.bio,
           photo: !!verification.photoApplied,
+          banner: !!verification.bannerApplied,
           category: 'general',
         },
         { source: verification.appliedLive ? 'x_persona_live' : 'x_persona_offline' }
@@ -3999,6 +4484,8 @@ class PlaywrightService {
         username: account.username,
         display_name: persona.display_name,
         photo: !!verification.photoApplied,
+        banner: !!verification.bannerApplied,
+        username_renamed: !!verification.usernameApplied,
         verified: verification.verified,
         skipped: verification.skipped,
       };

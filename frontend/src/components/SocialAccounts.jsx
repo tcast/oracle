@@ -97,10 +97,17 @@ const SocialAccounts = () => {
   const [showImportForm, setShowImportForm] = useState(false);
   const [auditSettings, setAuditSettings] = useState(null);
   const [auditing, setAuditing] = useState(false);
+  /** Default OFF = hide banned / inactive / session_dead rows */
+  const [showBanned, setShowBanned] = useState(false);
 
   const showLinkedInFilters = platformTab === 'linkedin';
   const showRedditAudit = platformTab === 'reddit';
   const columns = COLUMNS_BY_PLATFORM[platformTab] || COLUMNS_BY_PLATFORM.all;
+
+  const HIDDEN_STATUSES = new Set(['banned', 'inactive', 'session_dead']);
+  const visibleAccounts = showBanned
+    ? accounts
+    : accounts.filter((a) => !HIDDEN_STATUSES.has(String(a.status || '').toLowerCase()));
 
   const knownPlatforms = PLATFORM_ORDER.filter((p) => filterOptions.platforms.includes(p));
   const extraPlatforms = filterOptions.platforms.filter((p) => !PLATFORM_ORDER.includes(p));
@@ -604,12 +611,25 @@ const SocialAccounts = () => {
           )}
 
           <div className="card overflow-hidden">
-            <div className="px-6 py-4 border-b border-gray-100">
+            <div className="px-6 py-4 border-b border-gray-100 flex flex-wrap items-center justify-between gap-3">
               <h2 className="text-sm font-semibold text-gray-900">
                 {loading
                   ? 'Loading…'
-                  : `${accounts.length} ${platformTab === 'all' ? 'account' : platformLabel(platformTab)} account${accounts.length !== 1 ? 's' : ''}`}
+                  : `${visibleAccounts.length} ${platformTab === 'all' ? 'account' : platformLabel(platformTab)} account${visibleAccounts.length !== 1 ? 's' : ''}${
+                      !showBanned && accounts.length !== visibleAccounts.length
+                        ? ` (${accounts.length - visibleAccounts.length} banned hidden)`
+                        : ''
+                    }`}
               </h2>
+              <label className="inline-flex items-center gap-2 text-sm text-gray-600 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  className="rounded border-gray-300 text-whisper-700 focus:ring-whisper-500"
+                  checked={showBanned}
+                  onChange={(e) => setShowBanned(e.target.checked)}
+                />
+                Show banned
+              </label>
             </div>
             <div className="overflow-x-auto">
               <table className="min-w-full divide-y divide-gray-100">
@@ -631,14 +651,14 @@ const SocialAccounts = () => {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-50">
-                  {!loading && accounts.length === 0 && (
+                  {!loading && visibleAccounts.length === 0 && (
                     <tr>
                       <td colSpan={columns.length} className="px-4 py-10 text-center text-sm text-gray-500">
                         No accounts found
                       </td>
                     </tr>
                   )}
-                  {accounts.map((account) => (
+                  {visibleAccounts.map((account) => (
                     <tr key={account.id} className="hover:bg-gray-50/50 transition-colors">
                       {columns.map((col) => renderCell(col, account))}
                     </tr>

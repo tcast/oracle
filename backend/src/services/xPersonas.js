@@ -1,9 +1,7 @@
 /**
  * X (Twitter) persona generation — offline pipeline.
  *
- * Safe profile fields (v1): display_name, bio, location, website, avatar.
- * Handle rename is opt-in/risky — NOT generated or applied in v1.
- *
+ * Profile fields: display_name, bio, location, website, username (handle), avatar, banner.
  * Stored as credentials.x_persona (+ persona_traits / profile_enrichment flags).
  * Live Playwright edits are separate and gated by X_PERSONA_LIVE=1.
  */
@@ -110,19 +108,39 @@ function pick(rng, arr) {
 }
 
 /**
+ * Human-like X handle: first+last + light digits, max 15 chars, [A-Za-z0-9_].
+ */
+function generateUsername(first, last, rng, seed) {
+  const f = String(first || 'user').replace(/[^A-Za-z]/g, '');
+  const l = String(last || 'person').replace(/[^A-Za-z]/g, '');
+  const fl = f.toLowerCase();
+  const ll = l.toLowerCase();
+  const dig2 = String(10 + Math.floor(rng() * 90));
+  const dig1 = String(Math.floor(rng() * 9) + 1);
+  const dig3 = String(100 + Math.floor(rng() * 900));
+  const year = String(1985 + Math.floor(rng() * 25));
+  const candidates = [
+    `${fl}${ll}${dig2}`,
+    `${fl}_${ll.slice(0, 4)}${dig1}`,
+    `${fl}${ll.slice(0, 3)}${dig3}`,
+    `${fl[0] || 'x'}${ll}${dig2}`,
+    `${fl}${ll.slice(0, 5)}${dig1}`,
+    `${fl}${ll}${year.slice(2)}`,
+    `${fl}_${ll}${dig2}`,
+    `${fl}${ll.slice(0, 6)}`,
+  ];
+  // Prefer first that fits; fall back to truncated + seed digits
+  for (const c of candidates) {
+    const cleaned = c.replace(/[^A-Za-z0-9_]/g, '').slice(0, 15);
+    if (cleaned.length >= 4) return cleaned;
+  }
+  const fallback = `${fl.slice(0, 6)}${(seed % 10000).toString().padStart(4, '0')}`.slice(0, 15);
+  return fallback || `user${(seed % 100000).toString()}`;
+}
+
+/**
  * Generate a realistic X persona from an account id or arbitrary seed string.
  * Same seed ⇒ same persona (stable re-runs).
- *
- * @param {number|string} accountIdOrSeed
- * @param {object} [overrides]
- * @returns {{
- *   display_name: string,
- *   bio: string,
- *   location: string|null,
- *   website: string|null,
- *   rename_handle: false,
- *   seed: number,
- * }}
  */
 function generateXPersona(accountIdOrSeed, overrides = {}) {
   const seed =
@@ -134,13 +152,16 @@ function generateXPersona(accountIdOrSeed, overrides = {}) {
   const first = pick(rng, FIRST_NAMES);
   const last = pick(rng, LAST_NAMES);
   const display_name = overrides.display_name || `${first} ${last}`;
+  const username =
+    overrides.username ||
+    overrides.handle ||
+    generateUsername(first, last, rng, seed);
 
   const role = pick(rng, ROLES);
   const interest = pick(rng, INTERESTS);
   const bioTpl = pick(rng, BIO_TEMPLATES);
   const bio = overrides.bio || bioTpl({ role, interest });
 
-  // Optional fields — not every profile fills them
   const includeLocation =
     overrides.location !== undefined ? !!overrides.location : rng() < 0.72;
   const location =
@@ -161,11 +182,11 @@ function generateXPersona(accountIdOrSeed, overrides = {}) {
 
   return {
     display_name,
+    username,
     bio,
     location,
     website,
-    // Explicitly never set in v1 — handle rename is risky / opt-in later
-    rename_handle: false,
+    rename_handle: true,
     seed,
   };
 }
@@ -176,10 +197,11 @@ function generateXPersona(accountIdOrSeed, overrides = {}) {
 function toCredentialsXPersona(persona, { applied_live = false } = {}) {
   return {
     display_name: persona.display_name,
+    username: persona.username || null,
     bio: persona.bio,
     location: persona.location || null,
     website: persona.website || null,
-    rename_handle: false,
+    rename_handle: persona.rename_handle !== false,
     applied_live: !!applied_live,
     updated_at: new Date().toISOString(),
   };
@@ -196,8 +218,8 @@ function mergePersonaTraits(existing, persona) {
   return {
     ...base,
     display_name: persona.display_name,
+    username: persona.username || base.username || null,
     bio: persona.bio,
-    // Keep existing expertise/tone if present; otherwise light defaults
     tone: base.tone || 'engaging',
     writingStyle: base.writingStyle || 'casual',
     expertise: Array.isArray(base.expertise) && base.expertise.length
@@ -222,9 +244,8 @@ function enrichmentPatchFromPersona(persona, { source = 'x_persona_offline' } = 
 
 module.exports = {
   generateXPersona,
+  generateUsername,
   toCredentialsXPersona,
   mergePersonaTraits,
   enrichmentPatchFromPersona,
-  FIRST_NAMES,
-  LAST_NAMES,
 };
