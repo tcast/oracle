@@ -591,8 +591,8 @@ async function main() {
   // Media restore / banner-only should fail fast: hard timeout default 3m
   const timeoutMs = Math.max(
     60000,
-    Number(arg('--timeout-ms', restoreMedia || bannerOnly ? '180000' : '480000')) ||
-      (restoreMedia || bannerOnly ? 180000 : 480000)
+    Number(arg('--timeout-ms', restoreMedia ? '420000' : bannerOnly ? '240000' : '480000')) ||
+      (restoreMedia ? 420000 : bannerOnly ? 240000 : 480000)
   );
 
   if ((withBanner || bannerOnly || restoreMedia) && !BANNER_POOL.length) {
