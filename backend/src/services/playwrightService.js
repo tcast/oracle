@@ -4152,11 +4152,22 @@ class PlaywrightService {
 
   /**
    * Upload X profile banner/header image (cookie session only).
+   * bannerPath MUST be a landscape header from private/x-banners — never a face/portrait.
    */
   async updateXProfileBanner(page, bannerPath, { accountId, username } = {}) {
     const fs = require('fs');
+    const path = require('path');
     if (!bannerPath || !fs.existsSync(bannerPath)) {
       throw new Error(`Banner not found: ${bannerPath}`);
+    }
+    const resolved = path.resolve(bannerPath);
+    if (
+      /linkedin-photos|[/\\]x-photos[/\\]|pilot-|portrait/i.test(resolved) ||
+      !/x-banners/i.test(resolved)
+    ) {
+      throw new Error(
+        `Refusing face/portrait as X banner (path must be under x-banners/): ${bannerPath}`
+      );
     }
     const tag = accountId ? `#${accountId}` : '';
 
@@ -4386,6 +4397,117 @@ class PlaywrightService {
       passwordConfirmed: !!pwResult.confirmed,
       inputVerified: !!verifiedLocal,
     };
+  }
+
+  /**
+   * Banner-only live fix: cookie session → upload scenic x-banners header → verify custom banner.
+   * Does not rewrite name/bio/avatar. Soft-fail tunnels via caller timeout/classify.
+   */
+  async applyXBannerLive(accountId, { bannerPath, requireProxy = true } = {}) {
+    if (process.env.X_PERSONA_LIVE !== '1') {
+      throw new Error('Set X_PERSONA_LIVE=1 to run live X banner edits');
+    }
+    if (!bannerPath) throw new Error('bannerPath required for applyXBannerLive');
+    let browser;
+    try {
+      const account = await this.getAccount(accountId);
+      if (account.platform !== 'x') {
+        throw new Error(`Account ${accountId} is ${account.platform}, expected x`);
+      }
+      const creds =
+        typeof account.credentials === 'string'
+          ? JSON.parse(account.credentials)
+          : account.credentials || {};
+      const persona = creds.x_persona || {};
+      const accountPassword =
+        (creds.password && String(creds.password).trim()) ||
+        (creds.pass && String(creds.pass).trim()) ||
+        null;
+
+      await this.requireProxyForLive(accountId);
+      const result = await this.createBrowserForAccount(accountId, 2, { requireProxy });
+      browser = result.browser;
+      const page = result.page;
+
+      const loggedIn = await this.ensureLoggedIn(
+        page,
+        'x',
+        accountId,
+        account.username,
+        accountPassword,
+        { allowLogin: false, totpSecret: creds.totp_secret }
+      );
+      if (!loggedIn) throw new Error(`no_live_session for x/${account.username}`);
+
+      await this.humanBrowseXSession(page, { accountId });
+      await this.assertXProfileActionAllowed(page, { accountId });
+
+      const bannerResult = await this.updateXProfileBanner(page, bannerPath, {
+        accountId,
+        username: account.username,
+      });
+      const attempts = {
+        nameAttempted: false,
+        bioAttempted: false,
+        photoAttempted: false,
+        bannerAttempted: !!(bannerResult && bannerResult.bannerAttempted),
+        usernameAttempted: false,
+      };
+
+      const live = await this.readXLiveProfile(page, {
+        accountId,
+        username: account.username,
+      });
+      const bannerOk = !!live.hasCustomBanner;
+      if (!bannerOk) {
+        throw new Error(
+          `x_banner_verify_failed: not custom (src=${(live.bannerSrc || '').slice(0, 80)})`
+        );
+      }
+
+      await this.persistSession(page, 'x', accountId);
+
+      const nextPersona = {
+        ...persona,
+        banner_applied: true,
+        banner_applied_at: new Date().toISOString(),
+        last_banner_path: require('path').basename(bannerPath),
+        last_verify: {
+          ...(persona.last_verify || {}),
+          at: new Date().toISOString(),
+          banner: true,
+          banner_src: (live.bannerSrc || '').slice(0, 120),
+        },
+      };
+      await pool.query(
+        `UPDATE social_accounts
+         SET credentials = jsonb_set(COALESCE(credentials, '{}'::jsonb), '{x_persona}', $2::jsonb),
+             updated_at = NOW()
+         WHERE id = $1`,
+        [accountId, JSON.stringify(nextPersona)]
+      );
+      const { updateEnrichment } = require('./profileEnrichment');
+      await updateEnrichment(accountId, { banner: true }, { source: 'x_banner_live' });
+
+      console.log(
+        `X #${accountId}: banner-only OK from ${require('path').basename(bannerPath)}`
+      );
+      return {
+        success: true,
+        accountId,
+        username: account.username,
+        display_name: persona.display_name || null,
+        photo: false,
+        banner: true,
+        username_renamed: false,
+        verified: { banner: true },
+        skipped: ['display_name', 'bio', 'photo', 'username'],
+        attempts,
+      };
+    } finally {
+      if (browser) await browser.close().catch(() => {});
+      this._untrackBrowser(accountId);
+    }
   }
 
   /**
