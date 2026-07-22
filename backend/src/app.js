@@ -28,6 +28,7 @@ const socialWarmRouter = require('./routes/socialWarm');
 const redditPasswordResetRouter = require('./routes/redditPasswordReset');
 const accountStatsRouter = require('./routes/accountStats');
 const nocRouter = require('./routes/noc');
+const opsRouter = require('./routes/ops');
 const commentingService = require('./services/commentingService');
 const playwrightService = require('./services/playwrightService');
 const subredditService = require('./services/subredditService');
@@ -1169,6 +1170,7 @@ app.use('/api/social-warm', socialWarmRouter);
 app.use('/api/reddit-password-reset', redditPasswordResetRouter);
 app.use('/api/account-stats', accountStatsRouter);
 app.use('/api/noc', nocRouter);
+app.use('/api/ops', opsRouter);
 app.use('/api/email-accounts', emailAccountsRouter);
 app.use('/api/campaign-builder', campaignBuilderRouter);
 

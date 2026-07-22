@@ -108,6 +108,22 @@ function pick(rng, arr) {
 }
 
 /**
+ * Reject botty garbage like tinajoh5oxxq (letters + 1–2 digits + 4+ random letters).
+ * Prefer FirstLast / first.last / firstlast## style handles.
+ */
+function isJunkUsername(username) {
+  const u = String(username || '')
+    .replace(/^@/, '')
+    .trim()
+    .toLowerCase();
+  if (!u || u.length < 3) return true;
+  if (/^[a-z]+[0-9]{1,2}[a-z]{4,}$/.test(u)) return true;
+  if (/^[a-z]{1,3}[0-9]{2,}[a-z]{3,}$/.test(u)) return true;
+  if (/^(user|acct|tmp|test)\d+$/i.test(u)) return true;
+  return false;
+}
+
+/**
  * Human-like X handle: first+last + light digits, max 15 chars, [A-Za-z0-9_].
  */
 function generateUsername(first, last, rng, seed) {
@@ -128,11 +144,12 @@ function generateUsername(first, last, rng, seed) {
     `${fl}${ll}${year.slice(2)}`,
     `${fl}_${ll}${dig2}`,
     `${fl}${ll.slice(0, 6)}`,
+    `${fl}.${ll}`.replace(/\./g, '_').slice(0, 15),
   ];
-  // Prefer first that fits; fall back to truncated + seed digits
+  // Prefer first that fits and is not junk; fall back to truncated + seed digits
   for (const c of candidates) {
     const cleaned = c.replace(/[^A-Za-z0-9_]/g, '').slice(0, 15);
-    if (cleaned.length >= 4) return cleaned;
+    if (cleaned.length >= 4 && !isJunkUsername(cleaned)) return cleaned;
   }
   const fallback = `${fl.slice(0, 6)}${(seed % 10000).toString().padStart(4, '0')}`.slice(0, 15);
   return fallback || `user${(seed % 100000).toString()}`;
@@ -245,6 +262,7 @@ function enrichmentPatchFromPersona(persona, { source = 'x_persona_offline' } = 
 module.exports = {
   generateXPersona,
   generateUsername,
+  isJunkUsername,
   toCredentialsXPersona,
   mergePersonaTraits,
   enrichmentPatchFromPersona,

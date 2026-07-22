@@ -5,6 +5,7 @@ const AUDIT_QUEUE = 'account-stats-audit';
 const X_FOLLOW_QUEUE = 'x-follows';
 const SOCIAL_WARM_QUEUE = 'social-warm';
 const REDDIT_PW_RESET_QUEUE = 'reddit-password-reset';
+const ACCOUNT_OPS_BRAIN_QUEUE = 'account-ops-brain';
 
 function redisConnection() {
   return {
@@ -33,12 +34,16 @@ class DurableQueue {
     this.queues[REDDIT_PW_RESET_QUEUE] = new Queue(REDDIT_PW_RESET_QUEUE, {
       connection: this.connection,
     });
+    this.queues[ACCOUNT_OPS_BRAIN_QUEUE] = new Queue(ACCOUNT_OPS_BRAIN_QUEUE, {
+      connection: this.connection,
+    });
 
     const organicCommentScheduler = require('./organicCommentScheduler');
     const accountStatsScheduler = require('./accountStatsScheduler');
     const xFollowScheduler = require('./xFollowScheduler');
     const socialWarmScheduler = require('./socialWarmScheduler');
     const redditPasswordResetScheduler = require('./redditPasswordResetScheduler');
+    const accountOpsBrainScheduler = require('./accountOpsBrainScheduler');
 
     this.workers[ORGANIC_QUEUE] = new Worker(
       ORGANIC_QUEUE,
@@ -102,6 +107,19 @@ class DurableQueue {
         connection: this.connection,
         concurrency: 1,
         lockDuration: 45 * 60 * 1000,
+      }
+    );
+
+    this.workers[ACCOUNT_OPS_BRAIN_QUEUE] = new Worker(
+      ACCOUNT_OPS_BRAIN_QUEUE,
+      async (job) => {
+        if (job.name !== 'tick') return { skipped: true, reason: 'unknown_job' };
+        return accountOpsBrainScheduler.tick();
+      },
+      {
+        connection: this.connection,
+        concurrency: 1,
+        lockDuration: 25 * 60 * 1000,
       }
     );
 
@@ -210,11 +228,33 @@ class DurableQueue {
       }
     });
 
+    this.workers[ACCOUNT_OPS_BRAIN_QUEUE].on('completed', async () => {
+      try {
+        if ((await this.pendingCount(ACCOUNT_OPS_BRAIN_QUEUE)) === 0) {
+          await this.scheduleAccountOpsBrainTick();
+        }
+      } catch (err) {
+        console.error('Failed to schedule next account-ops-brain tick:', err.message);
+      }
+    });
+
+    this.workers[ACCOUNT_OPS_BRAIN_QUEUE].on('failed', async (_job, err) => {
+      console.error('Account ops brain tick failed:', err?.message || err);
+      try {
+        if ((await this.pendingCount(ACCOUNT_OPS_BRAIN_QUEUE)) === 0) {
+          await this.scheduleAccountOpsBrainTick(60 * 1000);
+        }
+      } catch (e) {
+        console.error('Failed to reschedule account-ops-brain after failure:', e.message);
+      }
+    });
+
     await this.ensureOrganicLoop();
     await this.ensureAuditLoop();
     await this.ensureXFollowLoop();
     await this.ensureSocialWarmLoop();
     await this.ensureRedditPasswordResetLoop();
+    await this.ensureAccountOpsBrainLoop();
 
     this.started = true;
     console.log(
@@ -473,6 +513,43 @@ class DurableQueue {
     await this.scheduleRedditPasswordResetTick(30000);
   }
 
+  accountOpsBrainDelayMs(overrideMs = null) {
+    if (overrideMs != null) return overrideMs;
+    // ~2–4 min — faster than organic so enrollment/profile gaps close quickly
+    const base = 2 * 60 * 1000;
+    const jitter = Math.random() * 2 * 60 * 1000;
+    return base + jitter;
+  }
+
+  async scheduleAccountOpsBrainTick(overrideMs = null) {
+    const q = this.queues[ACCOUNT_OPS_BRAIN_QUEUE];
+    if (!q) throw new Error('Account ops brain queue not initialized');
+    const delay = this.accountOpsBrainDelayMs(overrideMs);
+    await q.add(
+      'tick',
+      { scheduledAt: new Date().toISOString() },
+      { delay, removeOnComplete: 50, removeOnFail: 25, attempts: 1 }
+    );
+    console.log(`Account ops brain tick scheduled in ${Math.round(delay / 1000)}s`);
+  }
+
+  async ensureAccountOpsBrainLoop() {
+    const enabled =
+      ['1', 'true', 'yes', 'on'].includes(
+        String(process.env.ACCOUNT_OPS_BRAIN || '').trim().toLowerCase()
+      );
+    if (!enabled) {
+      console.log('Account ops brain disabled (set ACCOUNT_OPS_BRAIN=1 to enable)');
+      return;
+    }
+    const pending = await this.pendingCount(ACCOUNT_OPS_BRAIN_QUEUE);
+    if (pending > 0) {
+      console.log(`Account ops brain queue already has ${pending} pending job(s) — skipping seed`);
+      return;
+    }
+    await this.scheduleAccountOpsBrainTick(8000);
+  }
+
   async getStatus() {
     if (!this.started) {
       return { started: false, redis: null, queues: {} };
@@ -512,6 +589,15 @@ class DurableQueue {
       'completed',
       'failed'
     );
+    const accountOpsBrain = this.queues[ACCOUNT_OPS_BRAIN_QUEUE]
+      ? await this.queues[ACCOUNT_OPS_BRAIN_QUEUE].getJobCounts(
+          'delayed',
+          'waiting',
+          'active',
+          'completed',
+          'failed'
+        )
+      : {};
     return {
       started: true,
       redis: `${this.connection.host}:${this.connection.port}`,
@@ -521,6 +607,7 @@ class DurableQueue {
         [X_FOLLOW_QUEUE]: xFollow,
         [SOCIAL_WARM_QUEUE]: socialWarm,
         [REDDIT_PW_RESET_QUEUE]: redditPwReset,
+        [ACCOUNT_OPS_BRAIN_QUEUE]: accountOpsBrain,
       },
     };
   }

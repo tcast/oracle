@@ -11,6 +11,12 @@ const ACCOUNTS_WITHOUT_PROXY_WARN = 3;
 const isOxylabs = (p) => /oxylabs/i.test(String(p || ''));
 const isProxyBase = (p) => /proxybase/i.test(String(p || ''));
 
+const HREF_BY_KIND = {
+  proxies: { href: '/proxy-management', hrefLabel: 'Proxy management' },
+  accounts: { href: '/social-accounts?tab=users', hrefLabel: 'Social accounts' },
+  enrollment: { href: '/social-accounts?tab=schedule', hrefLabel: 'Organic schedule' },
+};
+
 /**
  * Build human-facing capacity warnings from a /api/noc/dashboard payload.
  */
@@ -111,7 +117,6 @@ export function buildCapacityAlerts(data) {
     });
   }
 
-  // Per-platform: zero active on a known platform with history
   for (const row of byPlatform) {
     const plat = String(row.platform || '').toLowerCase();
     if (!plat || plat === 'twitter') continue;
@@ -138,44 +143,103 @@ export function buildCapacityAlerts(data) {
     }
   }
 
-  // Dedupe by id
   const seen = new Set();
   return alerts.filter((a) => (seen.has(a.id) ? false : (seen.add(a.id), true)));
 }
 
+/** Map AccountOpsBrain /api/ops/capacity alerts into banner shape. */
+export function mapOpsCapacityAlerts(ops) {
+  const list = Array.isArray(ops?.alerts) ? ops.alerts : [];
+  return list.map((a) => {
+    const link = HREF_BY_KIND[a.kind] || HREF_BY_KIND.proxies;
+    const platformHref =
+      a.platform === 'x'
+        ? { href: '/social-accounts?tab=users&platform=x', hrefLabel: 'View X' }
+        : a.platform === 'reddit'
+          ? { href: '/social-accounts?tab=users&platform=reddit', hrefLabel: 'View Reddit' }
+          : link;
+    return {
+      id: `ops-${a.id}`,
+      level: a.severity === 'critical' ? 'critical' : a.severity === 'info' ? 'info' : 'warn',
+      title: a.message,
+      body: a.action || '',
+      href: a.kind === 'accounts' ? platformHref.href : link.href,
+      hrefLabel: a.kind === 'accounts' ? platformHref.hrefLabel : link.hrefLabel,
+      source: 'ops',
+    };
+  });
+}
+
+function mergeAlerts(opsAlerts, dashAlerts) {
+  const out = [...opsAlerts];
+  const seen = new Set(out.map((a) => a.id));
+  // Drop generic oxylabs/proxybase/accounts-low when ops already covers them
+  const opsCoversOx = opsAlerts.some((a) => /oxylabs|x_oxylabs/i.test(a.id));
+  const opsCoversPb = opsAlerts.some((a) => /proxybase|reddit_proxybase/i.test(a.id));
+  const opsCoversAcct = opsAlerts.some((a) => /accounts_low|x_accounts|reddit_accounts/i.test(a.id));
+
+  for (const a of dashAlerts) {
+    if (seen.has(a.id)) continue;
+    if (opsCoversOx && /oxylabs/i.test(a.id)) continue;
+    if (opsCoversPb && /proxybase/i.test(a.id)) continue;
+    if (opsCoversAcct && /^accounts-low/.test(a.id)) continue;
+    seen.add(a.id);
+    out.push(a);
+  }
+  return out;
+}
+
 /**
  * Visible capacity banners for Social Accounts (light) and NOC (dark).
- * Pass `data` from an existing NOC fetch to avoid a second round-trip.
+ * Prefers /api/ops/capacity (brain) and merges NOC dashboard heuristics.
  */
 const CapacityAlerts = ({ data: externalData = null, variant = 'light', pollMs = 60000 }) => {
   const [data, setData] = useState(externalData);
+  const [ops, setOps] = useState(null);
   const [dismissed, setDismissed] = useState(() => new Set());
 
-  const load = useCallback(async () => {
+  const loadOps = useCallback(async () => {
+    try {
+      const res = await api.get('/api/ops/capacity?fresh=1');
+      setOps(res.data);
+    } catch {
+      /* best-effort */
+    }
+  }, []);
+
+  const loadDash = useCallback(async () => {
     if (externalData) return;
     try {
       const res = await api.get('/api/noc/dashboard');
       setData(res.data);
     } catch {
-      /* silent — don't spam UI if NOC endpoint fails */
+      /* silent */
     }
   }, [externalData]);
 
   useEffect(() => {
-    if (externalData) {
-      setData(externalData);
-      return undefined;
-    }
-    load();
-    if (!pollMs) return undefined;
-    const t = setInterval(load, pollMs);
-    return () => clearInterval(t);
-  }, [externalData, load, pollMs]);
+    if (externalData) setData(externalData);
+  }, [externalData]);
 
-  const alerts = useMemo(
-    () => buildCapacityAlerts(data).filter((a) => !dismissed.has(a.id)),
-    [data, dismissed]
-  );
+  useEffect(() => {
+    loadOps();
+    if (!externalData) loadDash();
+    if (!pollMs) {
+      // Still refresh ops on a modest cadence when parent owns dashboard polling
+      const t = setInterval(loadOps, 30000);
+      return () => clearInterval(t);
+    }
+    const t = setInterval(() => {
+      loadOps();
+      loadDash();
+    }, pollMs);
+    return () => clearInterval(t);
+  }, [externalData, loadDash, loadOps, pollMs]);
+
+  const alerts = useMemo(() => {
+    const merged = mergeAlerts(mapOpsCapacityAlerts(ops), buildCapacityAlerts(data));
+    return merged.filter((a) => !dismissed.has(a.id));
+  }, [ops, data, dismissed]);
 
   if (!alerts.length) return null;
 
@@ -203,9 +267,11 @@ const CapacityAlerts = ({ data: externalData = null, variant = 'light', pollMs =
                 {critical ? '⚠ ' : ''}
                 {a.title}
               </div>
-              <p className={`text-sm mt-0.5 ${dark ? 'text-slate-300 font-mono text-xs' : 'text-amber-900/80'}`}>
-                {a.body}
-              </p>
+              {a.body ? (
+                <p className={`text-sm mt-0.5 ${dark ? 'text-slate-300 font-mono text-xs' : 'text-amber-900/80'}`}>
+                  {a.body}
+                </p>
+              ) : null}
             </div>
             <div className="flex items-center gap-2 shrink-0">
               {a.href && (
