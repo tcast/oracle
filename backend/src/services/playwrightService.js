@@ -2725,6 +2725,653 @@ class PlaywrightService {
   }
 
   /**
+   * Upload LinkedIn profile background/banner (NOT avatar).
+   * bannerPath MUST be a landscape scenic under x-banners or linkedin-banners — never portraits.
+   */
+  async updateLinkedInProfileBanner(accountId, bannerPath, { requireProxy = false } = {}) {
+    const fs = require('fs');
+    const path = require('path');
+    if (!bannerPath || !fs.existsSync(bannerPath)) {
+      throw new Error(`Banner not found: ${bannerPath}`);
+    }
+    const resolved = path.resolve(bannerPath);
+    if (
+      /linkedin-photos|[/\\]x-photos[/\\]|pilot-|portrait/i.test(resolved) ||
+      (!/x-banners|linkedin-banners/i.test(resolved) &&
+        /face|headshot|avatar|photo-/i.test(path.basename(resolved)))
+    ) {
+      throw new Error(
+        `Refusing face/portrait as LinkedIn banner (path must be under x-banners/ or linkedin-banners/): ${bannerPath}`
+      );
+    }
+    if (!/x-banners|linkedin-banners/i.test(resolved)) {
+      throw new Error(
+        `Refusing non-banner asset as LinkedIn header (must live under x-banners/ or linkedin-banners/): ${bannerPath}`
+      );
+    }
+
+    let browser;
+    let proxyId = null;
+    try {
+      const account = await this.getAccount(accountId);
+      if (account.platform !== 'linkedin') {
+        throw new Error(`Account ${accountId} is ${account.platform}, expected linkedin`);
+      }
+      const creds =
+        typeof account.credentials === 'string'
+          ? JSON.parse(account.credentials)
+          : account.credentials || {};
+      const password = creds.password;
+      const loginEmail = account.email || account.username;
+      const profileUrl = (creds.profile_url || `https://www.linkedin.com/in/${account.username}`).replace(
+        /\/?$/,
+        '/'
+      );
+      const extras = {
+        totpSecret: creds.totp_secret || creds.totp || creds.twofa,
+        emailPassword: creds.email_password,
+        profileUrl,
+      };
+
+      const openBrowser = async (withProxy) => {
+        if (browser) {
+          await browser.close().catch(() => {});
+          this._untrackBrowser(accountId);
+          browser = null;
+        }
+        if (withProxy) {
+          const result = await this.createBrowserForAccount(accountId, 2, { requireProxy });
+          browser = result.browser;
+          proxyId = result.proxyConfig?._proxyId || null;
+          return result.page;
+        }
+        const result = await this.createBrowser(
+          null,
+          false,
+          await this.getOrCreateDeviceProfile(accountId, { forceDesktop: true })
+        );
+        browser = result.browser;
+        proxyId = null;
+        result.accountId = accountId;
+        this._trackBrowser(accountId, result.browser);
+        return result.page;
+      };
+
+      let page = await openBrowser(false);
+      let loggedIn = false;
+      const restored = await this.restoreSession(page, 'linkedin', accountId);
+      if (restored) {
+        await page.goto('https://www.linkedin.com/in/me/', {
+          waitUntil: 'domcontentloaded',
+          timeout: 60000,
+        });
+        await this.humanLikeDelay(2000, 3500);
+        if (!/authwall|\/login|\/signup|\/uas\//i.test(page.url())) {
+          loggedIn = true;
+          console.log(`LinkedIn #${accountId}: banner — reused session on ${page.url()}`);
+        }
+      }
+
+      if (!loggedIn) {
+        await page.goto('https://www.linkedin.com/login', {
+          waitUntil: 'domcontentloaded',
+          timeout: 60000,
+        });
+        await this.humanLikeDelay(1500, 2500);
+        loggedIn = await this.performLogin(page, 'linkedin', loginEmail, password, extras);
+        if (!loggedIn && !requireProxy) {
+          page = await openBrowser(true);
+          await page.goto('https://www.linkedin.com/login', {
+            waitUntil: 'domcontentloaded',
+            timeout: 60000,
+          });
+          loggedIn = await this.performLogin(page, 'linkedin', loginEmail, password, extras);
+        }
+        if (!loggedIn) throw new Error('LinkedIn login failed');
+        await this.persistSession(page, 'linkedin', accountId);
+        await page.goto('https://www.linkedin.com/in/me/', {
+          waitUntil: 'domcontentloaded',
+          timeout: 60000,
+        });
+        await this.humanLikeDelay(2500, 4000);
+      }
+
+      if (/authwall|\/login|\/signup|\/uas\//i.test(page.url())) {
+        await page.screenshot({ path: `/tmp/linkedin-banner-authwall-${accountId}.png` }).catch(() => {});
+        throw new Error(`Still on authwall after login: ${page.url()}`);
+      }
+
+      await this.dismissLinkedInModals(page).catch(() => {});
+      await this.randomScroll(page).catch(() => {});
+
+      // Open Edit/Add background — NEVER profile photo controls
+      let opened = false;
+      const bgCandidates = await page.$$(
+        'button[aria-label*="Edit background" i], button[aria-label*="Add background" i], a[aria-label*="Edit background" i], a[aria-label*="Add background" i], button[aria-label*="background photo" i], a[aria-label*="background photo" i], button[aria-label*="cover photo" i]'
+      );
+      for (const el of bgCandidates) {
+        const label = ((await el.getAttribute('aria-label').catch(() => '')) || '').toLowerCase();
+        if (/profile photo|edit photo|add photo|change photo/i.test(label) && !/background|cover|banner/i.test(label)) {
+          continue;
+        }
+        if (await el.isVisible().catch(() => false)) {
+          await el.click({ force: true });
+          opened = true;
+          break;
+        }
+      }
+      if (!opened) {
+        opened = await page.evaluate(() => {
+          const els = [...document.querySelectorAll('a, button, [role="button"]')];
+          const el = els.find((e) => {
+            const label = `${e.getAttribute('aria-label') || ''} ${e.innerText || ''}`;
+            if (!/background|cover (photo|image)|banner/i.test(label)) return false;
+            if (/profile photo|add photo|edit photo/i.test(label) && !/background|cover|banner/i.test(label)) {
+              return false;
+            }
+            const r = e.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+          });
+          if (el) {
+            el.scrollIntoView({ block: 'center' });
+            el.click();
+            return true;
+          }
+          return false;
+        });
+      }
+      if (!opened) {
+        await page.screenshot({ path: `/tmp/linkedin-banner-no-edit-${accountId}.png` }).catch(() => {});
+        throw new Error('Edit background control not found');
+      }
+      await this.humanLikeDelay(1500, 2500);
+
+      try {
+        const [chooser] = await Promise.all([
+          page.waitForEvent('filechooser', { timeout: 12000 }),
+          page.evaluate(() => {
+            const buttons = [...document.querySelectorAll('button, [role="button"], label')];
+            const b =
+              buttons.find((x) =>
+                /upload (photo|image|background|cover)|change (photo|image|background)|select (image|photo)/i.test(
+                  (x.innerText || x.getAttribute('aria-label') || '').trim()
+                )
+              ) ||
+              buttons.find((x) => /^Upload photo$/i.test((x.innerText || '').trim()));
+            if (b) b.click();
+          }),
+        ]);
+        await chooser.setFiles(bannerPath);
+        console.log(`LinkedIn #${accountId}: banner file set via chooser`);
+      } catch (e) {
+        console.warn(`LinkedIn #${accountId}: banner filechooser failed (${e.message}), trying input`);
+        const inputs = await page.$$('input[type="file"]');
+        let set = false;
+        for (const input of inputs) {
+          const lab = (
+            (await input.getAttribute('aria-label').catch(() => '')) ||
+            (await input.getAttribute('name').catch(() => '')) ||
+            ''
+          ).toLowerCase();
+          if (/avatar|profile.?photo|profile.?picture/i.test(lab) && !/background|cover|banner/i.test(lab)) {
+            continue;
+          }
+          await input.setInputFiles(bannerPath);
+          set = true;
+          break;
+        }
+        if (!set) {
+          await page.screenshot({ path: `/tmp/linkedin-banner-no-input-${accountId}.png` }).catch(() => {});
+          throw new Error('LinkedIn banner file input not found');
+        }
+      }
+
+      await this.humanLikeDelay(3000, 5000);
+      for (let i = 0; i < 2; i++) {
+        await page
+          .evaluate(() => {
+            const b = [...document.querySelectorAll('button')].find((x) =>
+              /^Got it$/i.test((x.innerText || '').trim())
+            );
+            if (b) b.click();
+          })
+          .catch(() => {});
+        await this.humanLikeDelay(400, 800);
+      }
+
+      await page.screenshot({ path: `/tmp/linkedin-banner-before-save-${accountId}.png` }).catch(() => {});
+
+      for (let i = 0; i < 6; i++) {
+        const clicked = await page.evaluate(() => {
+          const buttons = [...document.querySelectorAll('button, [role="button"]')];
+          const order = [
+            /^Apply$/i,
+            /^Save changes$/i,
+            /^Save photo$/i,
+            /^Save to profile$/i,
+            /^Done$/i,
+            /^Save$/i,
+            /^Skip$/i,
+            /^Not now$/i,
+          ];
+          for (const re of order) {
+            const b = buttons.find((x) => {
+              if (!re.test((x.innerText || '').trim()) || x.disabled) return false;
+              const r = x.getBoundingClientRect();
+              return r.width > 0 && r.height > 0;
+            });
+            if (b) {
+              b.click();
+              return (b.innerText || '').trim();
+            }
+          }
+          return null;
+        });
+        if (!clicked) break;
+        console.log(`LinkedIn #${accountId}: banner clicked "${clicked}"`);
+        await this.humanLikeDelay(2500, 4000);
+      }
+
+      await this.humanLikeDelay(3000, 5000);
+      await page.goto('https://www.linkedin.com/in/me/', {
+        waitUntil: 'domcontentloaded',
+        timeout: 60000,
+      });
+      await this.humanLikeDelay(2500, 4000);
+      await page.screenshot({ path: `/tmp/linkedin-banner-done-${accountId}.png` }).catch(() => {});
+
+      const bannerInfo = await page.evaluate(() => {
+        const imgs = [...document.querySelectorAll('img')];
+        const avatar =
+          imgs.find((i) =>
+            /profile-displayphoto|EntityPhoto|presencephoto|eprofile/i.test(
+              `${i.className} ${i.alt} ${i.src}`
+            )
+          ) || null;
+        const bannerImg =
+          imgs.find((i) =>
+            /profile-displaybackground|background|cover|banner/i.test(
+              `${i.className} ${i.alt} ${i.src}`
+            )
+          ) ||
+          imgs.find((i) => /media\.licdn\.com.*(?:bg|background|cover)/i.test(i.src));
+        let bannerBg = null;
+        const bgEl = [...document.querySelectorAll('div, section, figure')].find((el) => {
+          const s = getComputedStyle(el).backgroundImage || '';
+          return /media\.licdn\.com/i.test(s) && /background|cover|banner|profile-displaybackground/i.test(s + el.className);
+        });
+        if (bgEl) {
+          const m = (getComputedStyle(bgEl).backgroundImage || '').match(/url\(["']?([^"')]+)/);
+          bannerBg = m ? m[1] : null;
+        }
+        const bannerSrc = bannerImg?.src || bannerBg || null;
+        return {
+          url: location.href,
+          avatarSrc: avatar?.src || null,
+          bannerSrc,
+          hasBanner: !!(bannerSrc && /media\.licdn\.com/i.test(bannerSrc)),
+          avatarIsBanner: !!(avatar?.src && bannerSrc && avatar.src === bannerSrc),
+        };
+      }).catch(() => ({}));
+
+      await this.persistSession(page, 'linkedin', accountId);
+
+      const success =
+        !/authwall|\/login/i.test(bannerInfo.url || '') &&
+        !!bannerInfo.hasBanner &&
+        !bannerInfo.avatarIsBanner;
+
+      if (success) {
+        try {
+          const { updateEnrichment } = require('./profileEnrichment');
+          await updateEnrichment(accountId, { banner: true }, { source: 'linkedin_banner' });
+        } catch (enrichErr) {
+          console.warn(`LinkedIn #${accountId}: banner enrichment failed:`, enrichErr.message);
+        }
+      }
+
+      return {
+        success,
+        accountId,
+        email: loginEmail,
+        profileUrl,
+        finalUrl: bannerInfo.url || null,
+        bannerSrc: bannerInfo.bannerSrc || null,
+        avatarSrc: bannerInfo.avatarSrc || null,
+        usedProxy: !!proxyId,
+        proofScreenshot: `/tmp/linkedin-banner-done-${accountId}.png`,
+      };
+    } catch (error) {
+      console.error(`LinkedIn banner update failed for ${accountId}:`, error.message);
+      return { success: false, accountId, error: error.message, usedProxy: !!proxyId };
+    } finally {
+      if (browser) await browser.close();
+      this._untrackBrowser(accountId);
+    }
+  }
+
+  /**
+   * Connect (person) or Follow (company/person-with-follow) on LinkedIn.
+   */
+  async followLinkedInTarget(accountId, handle, {
+    targetType = 'person',
+    requireProxy = false,
+    allowLogin = false,
+  } = {}) {
+    const slug = String(handle || '')
+      .replace(/^@/, '')
+      .replace(/\/$/, '')
+      .trim();
+    if (!slug) throw new Error('LinkedIn follow handle required');
+    const profileUrl =
+      targetType === 'company'
+        ? `https://www.linkedin.com/company/${slug}/`
+        : `https://www.linkedin.com/in/${slug}/`;
+
+    let browser;
+    try {
+      const account = await this.getAccount(accountId);
+      if (account.platform !== 'linkedin') {
+        throw new Error(`Account ${accountId} is ${account.platform}, expected linkedin`);
+      }
+      const creds =
+        typeof account.credentials === 'string'
+          ? JSON.parse(account.credentials)
+          : account.credentials || {};
+      const loginId = account.email || account.username;
+      const extras = {
+        allowLogin,
+        totpSecret: creds.totp_secret || creds.totp || creds.twofa,
+        emailPassword: creds.email_password,
+        profileUrl: creds.profile_url,
+      };
+
+      const opened = requireProxy
+        ? await this.createBrowserForAccount(accountId, 2, { requireProxy: true })
+        : await this.createBrowser(
+            null,
+            false,
+            await this.getOrCreateDeviceProfile(accountId, { forceDesktop: true })
+          );
+      browser = opened.browser;
+      if (!requireProxy) {
+        opened.accountId = accountId;
+        this._trackBrowser(accountId, opened.browser);
+      }
+      const page = opened.page;
+
+      const loggedIn = await this.ensureLoggedIn(
+        page,
+        'linkedin',
+        accountId,
+        loginId,
+        creds.password,
+        extras
+      );
+      if (!loggedIn) throw new Error('no_live_session for linkedin follow');
+
+      await this.humanBrowseLinkedInSession(page, { accountId }).catch(() => {});
+      await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await this.humanLikeDelay(2000, 3500);
+      await this.dismissLinkedInModals(page).catch(() => {});
+
+      if (/authwall|\/login|\/uas\//i.test(page.url())) {
+        throw new Error(`LinkedIn profile authwalled: ${page.url()}`);
+      }
+
+      const state = await page.evaluate(() => {
+        const text = (document.body?.innerText || '').slice(0, 4000);
+        const already =
+          /Pending|Invitation sent|Connected|Following\b/i.test(text) &&
+          [...document.querySelectorAll('button, [role="button"]')].some((b) =>
+            /^(Pending|Connected|Following|Message)$/i.test((b.innerText || '').trim())
+          );
+        return { already, url: location.href };
+      });
+
+      if (state.already) {
+        await this.persistSession(page, 'linkedin', accountId).catch(() => {});
+        return {
+          followed: false,
+          alreadyFollowing: true,
+          pending: /Pending|Invitation sent/i.test(
+            await page.evaluate(() => document.body?.innerText || '').catch(() => '')
+          ),
+          profileUrl,
+        };
+      }
+
+      const clicked = await page.evaluate((preferFollow) => {
+        const buttons = [...document.querySelectorAll('button, [role="button"]')];
+        const visible = (b) => {
+          const r = b.getBoundingClientRect();
+          return r.width > 0 && r.height > 0 && !b.disabled;
+        };
+        const labelOf = (b) => `${b.getAttribute('aria-label') || ''} ${(b.innerText || '').trim()}`;
+        const order = preferFollow
+          ? [/^Follow$/i, /^Connect$/i, /Follow/i, /Connect/i]
+          : [/^Connect$/i, /^Follow$/i, /Connect/i, /Follow/i];
+        for (const re of order) {
+          const b = buttons.find((x) => re.test(labelOf(x).trim()) && visible(x));
+          if (b) {
+            b.click();
+            return labelOf(b).trim().slice(0, 40);
+          }
+        }
+        return null;
+      }, targetType === 'company');
+
+      if (!clicked) {
+        await page.screenshot({ path: `/tmp/linkedin-follow-nobtn-${accountId}.png` }).catch(() => {});
+        throw new Error(`Connect/Follow button not found on ${profileUrl}`);
+      }
+      console.log(`LinkedIn #${accountId}: clicked "${clicked}" on ${slug}`);
+      await this.humanLikeDelay(1200, 2200);
+
+      // Send without note if modal appears
+      await page
+        .evaluate(() => {
+          const buttons = [...document.querySelectorAll('button, [role="button"]')];
+          const send = buttons.find((b) =>
+            /send without a note|^Send$|Send now|Send invitation/i.test((b.innerText || '').trim())
+          );
+          if (send && !send.disabled) send.click();
+        })
+        .catch(() => {});
+      await this.humanLikeDelay(1500, 2500);
+
+      const after = await page.evaluate(() => {
+        const text = (document.body?.innerText || '').slice(0, 3000);
+        return {
+          pending: /Pending|Invitation sent/i.test(text),
+          following: /\bFollowing\b|\bConnected\b/i.test(text),
+        };
+      });
+
+      await this.persistSession(page, 'linkedin', accountId).catch(() => {});
+      await page.screenshot({ path: `/tmp/linkedin-follow-done-${accountId}.png` }).catch(() => {});
+
+      return {
+        followed: !!(after.following || after.pending || clicked),
+        alreadyFollowing: false,
+        pending: !!after.pending,
+        profileUrl,
+        action: clicked,
+      };
+    } finally {
+      if (browser) await browser.close().catch(() => {});
+      this._untrackBrowser(accountId);
+    }
+  }
+
+  /**
+   * Accept pending LinkedIn connection invitations (My Network).
+   */
+  async acceptLinkedInInvitations(accountId, { maxAccept = 5 } = {}) {
+    let browser;
+    const screenshots = [];
+    try {
+      const account = await this.getAccount(accountId);
+      const creds =
+        typeof account.credentials === 'string'
+          ? JSON.parse(account.credentials)
+          : account.credentials || {};
+      const loginId = account.email || account.username;
+      const opened = await this.createBrowser(
+        null,
+        false,
+        await this.getOrCreateDeviceProfile(accountId, { forceDesktop: true })
+      );
+      browser = opened.browser;
+      opened.accountId = accountId;
+      this._trackBrowser(accountId, opened.browser);
+      const page = opened.page;
+
+      const loggedIn = await this.ensureLoggedIn(page, 'linkedin', accountId, loginId, creds.password, {
+        allowLogin: false,
+        totpSecret: creds.totp_secret || creds.totp || creds.twofa,
+      });
+      if (!loggedIn) throw new Error('no_live_session for linkedin accept');
+
+      await page.goto('https://www.linkedin.com/mynetwork/invitation-manager/', {
+        waitUntil: 'domcontentloaded',
+        timeout: 60000,
+      });
+      await this.humanLikeDelay(2000, 3500);
+      await this.dismissLinkedInModals(page).catch(() => {});
+
+      let accepted = 0;
+      for (let i = 0; i < maxAccept; i++) {
+        const clicked = await page.evaluate(() => {
+          const buttons = [...document.querySelectorAll('button, [role="button"]')];
+          const accept = buttons.find((b) => {
+            const t = (b.innerText || b.getAttribute('aria-label') || '').trim();
+            if (!/^Accept$/i.test(t) && !/Accept /i.test(t)) return false;
+            const r = b.getBoundingClientRect();
+            return r.width > 0 && r.height > 0 && !b.disabled;
+          });
+          if (!accept) return null;
+          accept.click();
+          return (accept.innerText || accept.getAttribute('aria-label') || '').trim();
+        });
+        if (!clicked) break;
+        accepted += 1;
+        await this.humanLikeDelay(1200, 2200);
+      }
+
+      const shot = `/tmp/linkedin-accept-${accountId}.png`;
+      await page.screenshot({ path: shot }).catch(() => {});
+      screenshots.push(shot);
+      await this.persistSession(page, 'linkedin', accountId).catch(() => {});
+
+      return { accepted, empty: accepted === 0, screenshots };
+    } finally {
+      if (browser) await browser.close().catch(() => {});
+      this._untrackBrowser(accountId);
+    }
+  }
+
+  /**
+   * Discover people/companies from LinkedIn search + People You May Know.
+   */
+  async discoverLinkedInFollowTargets(accountId, { keywords = [], limit = 12 } = {}) {
+    let browser;
+    try {
+      const account = await this.getAccount(accountId);
+      const creds =
+        typeof account.credentials === 'string'
+          ? JSON.parse(account.credentials)
+          : account.credentials || {};
+      const loginId = account.email || account.username;
+      const opened = await this.createBrowser(
+        null,
+        false,
+        await this.getOrCreateDeviceProfile(accountId, { forceDesktop: true })
+      );
+      browser = opened.browser;
+      opened.accountId = accountId;
+      this._trackBrowser(accountId, opened.browser);
+      const page = opened.page;
+
+      const loggedIn = await this.ensureLoggedIn(page, 'linkedin', accountId, loginId, creds.password, {
+        allowLogin: false,
+        totpSecret: creds.totp_secret || creds.totp || creds.twofa,
+      });
+      if (!loggedIn) throw new Error('no_live_session for linkedin discover');
+
+      const targets = [];
+      const seen = new Set();
+      const addFromPage = async (targetType) => {
+        const found = await page.evaluate((max) => {
+          const out = [];
+          for (const a of document.querySelectorAll('a[href*="/in/"], a[href*="/company/"]')) {
+            const href = (a.href || '').split('?')[0];
+            const person = href.match(/linkedin\.com\/in\/([^/?#]+)/i);
+            const company = href.match(/linkedin\.com\/company\/([^/?#]+)/i);
+            if (person) out.push({ handle: decodeURIComponent(person[1]), target_type: 'person' });
+            else if (company) out.push({ handle: decodeURIComponent(company[1]), target_type: 'company' });
+            if (out.length >= max) break;
+          }
+          return out;
+        }, limit);
+        for (const t of found) {
+          const key = `${t.target_type}:${t.handle}`.toLowerCase();
+          if (seen.has(key)) continue;
+          if (/^(feed|mynetwork|messaging|jobs|login|signup)$/i.test(t.handle)) continue;
+          seen.add(key);
+          targets.push({ ...t, notes: 'discovered' });
+          if (targets.length >= limit) return;
+        }
+      };
+
+      // People you may know
+      await page.goto('https://www.linkedin.com/mynetwork/', {
+        waitUntil: 'domcontentloaded',
+        timeout: 60000,
+      });
+      await this.humanLikeDelay(2000, 3500);
+      await this.dismissLinkedInModals(page).catch(() => {});
+      await this.randomScroll(page).catch(() => {});
+      await addFromPage('person');
+
+      const kw = (keywords && keywords[0]) || 'talent acquisition';
+      if (targets.length < limit) {
+        const url = `https://www.linkedin.com/search/results/people/?keywords=${encodeURIComponent(kw)}`;
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+        await this.humanLikeDelay(2000, 3500);
+        await this.randomScroll(page).catch(() => {});
+        await addFromPage('person');
+      }
+
+      await this.persistSession(page, 'linkedin', accountId).catch(() => {});
+      return { targets: targets.slice(0, limit), keywords };
+    } finally {
+      if (browser) await browser.close().catch(() => {});
+      this._untrackBrowser(accountId);
+    }
+  }
+
+  async humanBrowseLinkedInSession(page, { accountId } = {}) {
+    try {
+      if (!/linkedin\.com\/feed/i.test(page.url())) {
+        await page.goto('https://www.linkedin.com/feed/', {
+          waitUntil: 'domcontentloaded',
+          timeout: 45000,
+        }).catch(() => {});
+      }
+      await this.humanLikeDelay(1200, 2200);
+      await this.dismissLinkedInModals(page).catch(() => {});
+      await this.randomScroll(page).catch(() => {});
+      await this.humanLikeDelay(800, 1600);
+      if (Math.random() < 0.4) {
+        await this.randomScroll(page).catch(() => {});
+      }
+    } catch (err) {
+      console.warn(`LinkedIn browse #${accountId || '?'}:`, err.message);
+    }
+  }
+
+  /**
    * Update LinkedIn intro (headline/industry), About, and current experience
    * for an HR/Talent persona (InsightHire advocacy).
    */
@@ -4595,25 +5242,34 @@ class PlaywrightService {
       if (!loggedIn) throw new Error(`no_live_session for x/${account.username}`);
 
       await this.humanBrowseXSession(page, { accountId });
+      // Tunnel/browse can leave about:blank — recover before media edits.
+      if (!/x\.com|twitter\.com/i.test(page.url() || '')) {
+        await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await this.humanLikeDelay(2000, 3500);
+      }
       await this.assertXProfileActionAllowed(page, { accountId });
-
-      // Open own profile via sidebar (never teleport to DB username — rename may lag).
       console.log(`X #${accountId}: opening own profile via sidebar for media restore`);
       if (!/x\.com|twitter\.com/i.test(page.url() || '')) {
         await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 60000 });
         await this.humanLikeDelay(2000, 3500);
       }
-      const profileLink =
-        (await page.$('[data-testid="AppTabBar_Profile_Link"]')) ||
-        (await page.locator('a[aria-label="Profile"]').first().elementHandle().catch(() => null));
-      if (!profileLink) {
-        await page.waitForSelector('[data-testid="AppTabBar_Profile_Link"]', { timeout: 30000 });
+      let opened = false;
+      try {
+        const profileLink =
+          (await page.$('[data-testid="AppTabBar_Profile_Link"]')) ||
+          (await page.locator('a[aria-label="Profile"]').first().elementHandle().catch(() => null));
+        if (!profileLink) {
+          await page.waitForSelector('[data-testid="AppTabBar_Profile_Link"]', { timeout: 15000 });
+        }
+        const profileEl = profileLink || (await page.$('[data-testid="AppTabBar_Profile_Link"]'));
+        if (profileEl) {
+          await profileEl.click().catch(() => {});
+          await this.humanLikeDelay(2500, 4000);
+          opened = /x\.com|twitter\.com/i.test(page.url() || '');
+        }
+      } catch (sidebarErr) {
+        console.warn(`X #${accountId}: sidebar profile failed — ${sidebarErr.message}`);
       }
-      const profileEl = profileLink || (await page.$('[data-testid="AppTabBar_Profile_Link"]'));
-      if (!profileEl) throw new Error('X Profile sidebar link not found');
-      await profileEl.click().catch(() => {});
-      await this.humanLikeDelay(2500, 4000);
-      await this.assertXProfileActionAllowed(page, { accountId });
 
       const editBtnSel =
         '[data-testid="editProfileButton"], [aria-label="Edit profile"], [aria-label="Set up profile"]';
@@ -4624,11 +5280,23 @@ class PlaywrightService {
           .first()
           .elementHandle()
           .catch(() => null));
+      if (!editBtn && opened) {
+        await page.waitForSelector(editBtnSel, { timeout: 12000 }).catch(() => null);
+        editBtn =
+          (await page.$(editBtnSel)) ||
+          (await page
+            .locator('button:has-text("Edit profile"), button:has-text("Set up profile")')
+            .first()
+            .elementHandle()
+            .catch(() => null));
+      }
+
       if (!editBtn) {
+        // Do NOT swallow tunnel failures — let classifyApplyError soft-skip.
         await page.goto('https://x.com/settings/profile', {
           waitUntil: 'domcontentloaded',
           timeout: 60000,
-        }).catch(() => {});
+        });
         await this.humanLikeDelay(2000, 3500);
         editBtn =
           (await page.$(editBtnSel)) ||
@@ -4638,12 +5306,21 @@ class PlaywrightService {
             .elementHandle()
             .catch(() => null));
       }
-      if (!editBtn) {
+
+      const alreadyEditing =
+        /settings\/profile/i.test(page.url() || '') ||
+        !!(await page.$(
+          '[aria-label*="Add avatar" i], [aria-label*="Edit avatar" i], [aria-label*="Add banner" i], [aria-label*="Edit banner" i], input[data-testid="fileInput"]'
+        ));
+
+      if (editBtn) {
+        await editBtn.click().catch(() => {});
+        await this.humanLikeDelay(1500, 2500);
+      } else if (!alreadyEditing) {
         await page.screenshot({ path: `/tmp/x-media-noedit-${accountId}.png` }).catch(() => {});
-        throw new Error('Edit profile button not found');
+        await page.screenshot({ path: `/app/uploads/x-media-noedit-${accountId}.png` }).catch(() => {});
+        throw new Error(`Edit profile button not found (url=${page.url()})`);
       }
-      await editBtn.click().catch(() => {});
-      await this.humanLikeDelay(1500, 2500);
       await this.assertXProfileActionAllowed(page, { accountId });
 
       console.log(`X #${accountId}: restoring avatar from ${require('path').basename(photoPath)}`);
@@ -4688,6 +5365,9 @@ class PlaywrightService {
         );
       }
 
+      await page
+        .screenshot({ path: `/app/uploads/x-media-proof-${accountId}.png`, fullPage: false })
+        .catch(() => {});
       await page
         .screenshot({ path: `/tmp/x-media-proof-${accountId}.png`, fullPage: false })
         .catch(() => {});
@@ -6528,6 +7208,283 @@ class PlaywrightService {
         try { await proxyService.updateProxyStats(proxyId, true); }
         catch { /* ignore */ }
       }
+    }
+  }
+
+  /**
+   * Visit a Reddit user profile and click Follow if not already following.
+   * Returns { followed, alreadyFollowing, profileUrl }
+   */
+  async redditFollowUser(page, targetUsername) {
+    const handle = String(targetUsername || '').replace(/^u\//i, '').trim();
+    const profileUrl = `https://www.reddit.com/user/${encodeURIComponent(handle)}/`;
+    await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
+    await this.humanLikeDelay(2500, 4500);
+    await this.simulateHumanBehavior(page).catch(() => {});
+    await this.randomScroll(page).catch(() => {});
+
+    const bodyText = await page.evaluate(() => (document.body?.innerText || '').slice(0, 2500));
+    if (/this account has been banned|suspended|deleted|doesn.?t exist|nobody on reddit goes by that name/i.test(bodyText)) {
+      throw new Error(`Reddit target unavailable: ${handle}`);
+    }
+    if (/your account has been banned|account is suspended|you.?ve been permanently banned from reddit/i.test(bodyText)) {
+      throw new Error(`Reddit account banned while viewing u/${handle}`);
+    }
+
+    const state = await page.evaluate(() => {
+      const labels = [];
+      for (const el of document.querySelectorAll('button, a, [role="button"]')) {
+        const t = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim();
+        if (/follow/i.test(t)) labels.push(t.split('\n')[0].slice(0, 40));
+      }
+      const following = labels.some((t) => /^(Following|Unfollow)$/i.test(t) || /Unfollow|Following/i.test(t));
+      return {
+        following,
+        labels: labels.filter((t) => /follow/i.test(t)).slice(0, 10),
+      };
+    });
+
+    if (state.following) {
+      return { followed: false, alreadyFollowing: true, profileUrl, button: state.labels[0] || 'Following' };
+    }
+
+    const clicked = await page.evaluate(() => {
+      const isFollow = (t) => /^(Follow|Follow back)$/i.test(String(t || '').trim());
+      const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+      for (const el of candidates) {
+        const label = (el.innerText || el.textContent || el.getAttribute('aria-label') || '')
+          .trim()
+          .split('\n')[0]
+          .trim();
+        if (isFollow(label)) {
+          el.click();
+          return label;
+        }
+      }
+      // New Reddit sometimes nests Follow in a shadow host — try faceplate buttons
+      for (const host of document.querySelectorAll('faceplate-tracker, shreddit-async-loader, *')) {
+        try {
+          const root = host.shadowRoot;
+          if (!root) continue;
+          for (const el of root.querySelectorAll('button, a, [role="button"]')) {
+            const label = (el.innerText || el.textContent || el.getAttribute('aria-label') || '')
+              .trim()
+              .split('\n')[0]
+              .trim();
+            if (isFollow(label)) {
+              el.click();
+              return label;
+            }
+          }
+        } catch { /* ignore */ }
+      }
+      return null;
+    });
+
+    if (!clicked) {
+      await page.screenshot({ path: `/tmp/reddit-follow-miss-${handle}.png`, fullPage: true }).catch(() => {});
+      throw new Error(
+        `Reddit Follow button not found on u/${handle} (saw: ${(state.labels || []).join(', ') || 'none'})`
+      );
+    }
+
+    await this.humanLikeDelay(1500, 3000);
+    return { followed: true, alreadyFollowing: false, profileUrl, button: clicked };
+  }
+
+  /**
+   * Login (or reuse session) and follow a single Reddit user.
+   */
+  async followRedditUser(accountId, targetUsername, { requireProxy = true, allowLogin = true } = {}) {
+    const account = await this.getAccount(accountId);
+    if (String(account.platform || '').toLowerCase() !== 'reddit') {
+      throw new Error(`Account ${accountId} is ${account.platform}, expected reddit`);
+    }
+    const creds =
+      typeof account.credentials === 'string'
+        ? JSON.parse(account.credentials)
+        : account.credentials || {};
+    const password = creds.password || account.credentials?.password;
+    if (allowLogin && (!password || password === 'default_password')) {
+      throw new Error('Account has no real password');
+    }
+
+    const modes = requireProxy
+      ? [{ requireProxy: true, skipProxy: false }, { requireProxy: false, skipProxy: true }]
+      : [{ requireProxy: false, skipProxy: true }];
+
+    let lastError;
+    for (const mode of modes) {
+      let browser;
+      try {
+        if (mode.requireProxy) await this.requireProxyForLive(accountId);
+        const result = await this.createBrowserForAccount(accountId, 2, mode);
+        browser = result.browser;
+        const page = result.page;
+
+        const loggedIn = await this.ensureLoggedIn(
+          page,
+          'reddit',
+          accountId,
+          account.username,
+          password,
+          { allowLogin }
+        );
+        if (!loggedIn) {
+          await page.screenshot({ path: `/tmp/reddit-follow-login-${account.username}.png`, fullPage: true }).catch(() => {});
+          throw new Error(allowLogin ? 'Reddit login failed' : 'Reddit session not alive (cookie-only)');
+        }
+
+        // Human-like browse before follow
+        try {
+          await this.browseWarmFeed(page, 'reddit');
+        } catch { /* continue */ }
+
+        const follow = await this.redditFollowUser(page, targetUsername);
+        await this.persistSession(page, 'reddit', accountId);
+        await pool.query(
+          `UPDATE social_accounts
+           SET last_used_at = NOW(), updated_at = NOW(),
+               warmup_status = 'warmed', warmed_up_at = COALESCE(warmed_up_at, NOW())
+           WHERE id = $1`,
+          [accountId]
+        ).catch(() => {});
+
+        return {
+          success: true,
+          accountId,
+          username: account.username,
+          usedProxy: !mode.skipProxy,
+          ...follow,
+        };
+      } catch (err) {
+        lastError = err;
+        const msg = String(err.message || err);
+        const canRetryDirect =
+          !mode.skipProxy &&
+          /proxy|err_tunnel|err_timed_out|err_proxy|tunnel_connection|net::err_/i.test(msg);
+        console.warn(
+          `Reddit follow via ${mode.skipProxy ? 'direct' : 'proxy'} failed for #${accountId}: ${msg}` +
+            (canRetryDirect ? ' — retrying direct' : '')
+        );
+        if (!canRetryDirect) break;
+      } finally {
+        if (browser) {
+          try { await browser.close(); } catch { /* ignore */ }
+        }
+        this._untrackBrowser(accountId);
+      }
+    }
+    throw lastError || new Error('Reddit follow failed');
+  }
+
+  /**
+   * Discover follow targets from hot subreddit threads (post authors + commenters).
+   */
+  async discoverRedditFollowTargets(accountId, {
+    subreddits = [],
+    limit = 12,
+    requireProxy = true,
+  } = {}) {
+    const account = await this.getAccount(accountId);
+    if (String(account.platform || '').toLowerCase() !== 'reddit') {
+      throw new Error(`Account ${accountId} is ${account.platform}, expected reddit`);
+    }
+    const creds =
+      typeof account.credentials === 'string'
+        ? JSON.parse(account.credentials)
+        : account.credentials || {};
+    const password = creds.password || account.credentials?.password;
+    const subs = (subreddits || []).map((s) => String(s).replace(/^r\//i, '').trim()).filter(Boolean);
+    if (!subs.length) {
+      return { targets: [], subreddits: [] };
+    }
+
+    let browser;
+    try {
+      if (requireProxy) await this.requireProxyForLive(accountId);
+      const result = await this.createBrowserForAccount(accountId, 2, { requireProxy });
+      browser = result.browser;
+      const page = result.page;
+
+      await this.ensureLoggedIn(page, 'reddit', accountId, account.username, password, {
+        allowLogin: true,
+      }).catch(() => false);
+
+      const seen = new Set();
+      const targets = [];
+      const self = String(account.username || '').toLowerCase();
+
+      for (const sub of subs.slice(0, 3)) {
+        if (targets.length >= limit) break;
+        await page.goto(`https://www.reddit.com/r/${encodeURIComponent(sub)}/hot/`, {
+          waitUntil: 'domcontentloaded',
+          timeout: 90000,
+        });
+        await this.humanLikeDelay(2000, 4000);
+        await this.randomScroll(page).catch(() => {});
+
+        const fromListing = await page.evaluate((max) => {
+          const out = [];
+          const junk = /^(home|popular|all|login|register|submit|settings|message|chat|premium|coins)$/i;
+          for (const a of document.querySelectorAll('a[href*="/user/"]')) {
+            const m = (a.getAttribute('href') || '').match(/\/user\/([^/?#]+)/i);
+            if (!m) continue;
+            const handle = decodeURIComponent(m[1]);
+            if (junk.test(handle) || handle.length < 2) continue;
+            out.push({ handle, source: 'listing_author' });
+            if (out.length >= max) break;
+          }
+          return out;
+        }, 8);
+
+        for (const t of fromListing) {
+          const h = String(t.handle || '').toLowerCase();
+          if (!h || h === self || seen.has(h)) continue;
+          seen.add(h);
+          targets.push({ handle: t.handle, category: 'discovered', source: `r/${sub}:${t.source}` });
+          if (targets.length >= limit) break;
+        }
+
+        // Open one hot thread and skim commenters
+        if (targets.length < limit) {
+          const postHref = await page.evaluate(() => {
+            const a = document.querySelector('a[href*="/comments/"]');
+            return a ? a.href : null;
+          });
+          if (postHref) {
+            await page.goto(postHref, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
+            await this.humanLikeDelay(2000, 3500);
+            await this.randomScroll(page).catch(() => {});
+            const commenters = await page.evaluate((max) => {
+              const out = [];
+              const junk = /^(home|popular|all|AutoModerator)$/i;
+              for (const a of document.querySelectorAll('a[href*="/user/"]')) {
+                const m = (a.getAttribute('href') || '').match(/\/user\/([^/?#]+)/i);
+                if (!m) continue;
+                const handle = decodeURIComponent(m[1]);
+                if (junk.test(handle)) continue;
+                out.push({ handle, source: 'commenter' });
+                if (out.length >= max) break;
+              }
+              return out;
+            }, 10);
+            for (const t of commenters) {
+              const h = String(t.handle || '').toLowerCase();
+              if (!h || h === self || seen.has(h)) continue;
+              seen.add(h);
+              targets.push({ handle: t.handle, category: 'discovered', source: `r/${sub}:${t.source}` });
+              if (targets.length >= limit) break;
+            }
+          }
+        }
+      }
+
+      await this.persistSession(page, 'reddit', accountId).catch(() => {});
+      return { targets: targets.slice(0, limit), subreddits: subs };
+    } finally {
+      if (browser) await browser.close().catch(() => {});
+      this._untrackBrowser(accountId);
     }
   }
 

@@ -3,6 +3,8 @@ const { Queue, Worker } = require('bullmq');
 const ORGANIC_QUEUE = 'organic-comments';
 const AUDIT_QUEUE = 'account-stats-audit';
 const X_FOLLOW_QUEUE = 'x-follows';
+const LINKEDIN_FOLLOW_QUEUE = 'linkedin-follows';
+const REDDIT_FOLLOW_QUEUE = 'reddit-follows';
 const SOCIAL_WARM_QUEUE = 'social-warm';
 const REDDIT_PW_RESET_QUEUE = 'reddit-password-reset';
 const ACCOUNT_OPS_BRAIN_QUEUE = 'account-ops-brain';
@@ -30,6 +32,12 @@ class DurableQueue {
     this.queues[ORGANIC_QUEUE] = new Queue(ORGANIC_QUEUE, { connection: this.connection });
     this.queues[AUDIT_QUEUE] = new Queue(AUDIT_QUEUE, { connection: this.connection });
     this.queues[X_FOLLOW_QUEUE] = new Queue(X_FOLLOW_QUEUE, { connection: this.connection });
+    this.queues[LINKEDIN_FOLLOW_QUEUE] = new Queue(LINKEDIN_FOLLOW_QUEUE, {
+      connection: this.connection,
+    });
+    this.queues[REDDIT_FOLLOW_QUEUE] = new Queue(REDDIT_FOLLOW_QUEUE, {
+      connection: this.connection,
+    });
     this.queues[SOCIAL_WARM_QUEUE] = new Queue(SOCIAL_WARM_QUEUE, { connection: this.connection });
     this.queues[REDDIT_PW_RESET_QUEUE] = new Queue(REDDIT_PW_RESET_QUEUE, {
       connection: this.connection,
@@ -52,6 +60,8 @@ class DurableQueue {
     const organicCommentScheduler = require('./organicCommentScheduler');
     const accountStatsScheduler = require('./accountStatsScheduler');
     const xFollowScheduler = require('./xFollowScheduler');
+    const linkedinFollowScheduler = require('./linkedinFollowScheduler');
+    const redditFollowScheduler = require('./redditFollowScheduler');
     const socialWarmScheduler = require('./socialWarmScheduler');
     const redditPasswordResetScheduler = require('./redditPasswordResetScheduler');
     const accountOpsBrainScheduler = require('./accountOpsBrainScheduler');
@@ -87,6 +97,32 @@ class DurableQueue {
       async (job) => {
         if (job.name !== 'tick') return { skipped: true, reason: 'unknown_job' };
         return xFollowScheduler.tick();
+      },
+      {
+        connection: this.connection,
+        concurrency: 1,
+        lockDuration: 30 * 60 * 1000,
+      }
+    );
+
+    this.workers[LINKEDIN_FOLLOW_QUEUE] = new Worker(
+      LINKEDIN_FOLLOW_QUEUE,
+      async (job) => {
+        if (job.name !== 'tick') return { skipped: true, reason: 'unknown_job' };
+        return linkedinFollowScheduler.tick();
+      },
+      {
+        connection: this.connection,
+        concurrency: 1,
+        lockDuration: 30 * 60 * 1000,
+      }
+    );
+
+    this.workers[REDDIT_FOLLOW_QUEUE] = new Worker(
+      REDDIT_FOLLOW_QUEUE,
+      async (job) => {
+        if (job.name !== 'tick') return { skipped: true, reason: 'unknown_job' };
+        return redditFollowScheduler.tick();
       },
       {
         connection: this.connection,
@@ -201,6 +237,48 @@ class DurableQueue {
       }
     });
 
+    this.workers[LINKEDIN_FOLLOW_QUEUE].on('completed', async () => {
+      try {
+        if ((await this.pendingCount(LINKEDIN_FOLLOW_QUEUE)) === 0) {
+          await this.scheduleLinkedInFollowTick();
+        }
+      } catch (err) {
+        console.error('Failed to schedule next LinkedIn follow tick:', err.message);
+      }
+    });
+
+    this.workers[LINKEDIN_FOLLOW_QUEUE].on('failed', async (_job, err) => {
+      console.error('LinkedIn follow tick job failed:', err?.message || err);
+      try {
+        if ((await this.pendingCount(LINKEDIN_FOLLOW_QUEUE)) === 0) {
+          await this.scheduleLinkedInFollowTick(60 * 1000);
+        }
+      } catch (e) {
+        console.error('Failed to reschedule LinkedIn follow after failure:', e.message);
+      }
+    });
+
+    this.workers[REDDIT_FOLLOW_QUEUE].on('completed', async () => {
+      try {
+        if ((await this.pendingCount(REDDIT_FOLLOW_QUEUE)) === 0) {
+          await this.scheduleRedditFollowTick();
+        }
+      } catch (err) {
+        console.error('Failed to schedule next Reddit follow tick:', err.message);
+      }
+    });
+
+    this.workers[REDDIT_FOLLOW_QUEUE].on('failed', async (_job, err) => {
+      console.error('Reddit follow tick job failed:', err?.message || err);
+      try {
+        if ((await this.pendingCount(REDDIT_FOLLOW_QUEUE)) === 0) {
+          await this.scheduleRedditFollowTick(60 * 1000);
+        }
+      } catch (e) {
+        console.error('Failed to reschedule Reddit follow after failure:', e.message);
+      }
+    });
+
     this.workers[SOCIAL_WARM_QUEUE].on('completed', async () => {
       try {
         if ((await this.pendingCount(SOCIAL_WARM_QUEUE)) === 0) {
@@ -267,6 +345,8 @@ class DurableQueue {
     await this.ensureOrganicLoop();
     await this.ensureAuditLoop();
     await this.ensureXFollowLoop();
+    await this.ensureLinkedInFollowLoop();
+    await this.ensureRedditFollowLoop();
     await this.ensureSocialWarmLoop();
     await this.ensureRedditPasswordResetLoop();
     await this.ensureAccountOpsBrainLoop();
@@ -472,6 +552,102 @@ class DurableQueue {
     await this.scheduleXFollowTick(8000);
   }
 
+  linkedInFollowDelayMs(overrideMs = null) {
+    if (overrideMs != null) return overrideMs;
+    const base = 12 * 60 * 1000;
+    const jitter = Math.random() * 10 * 60 * 1000;
+    return base + jitter;
+  }
+
+  async kickLinkedInFollowSoon(delayMs = 5000) {
+    const q = this.queues[LINKEDIN_FOLLOW_QUEUE];
+    if (!q) throw new Error('LinkedIn follow queue not initialized');
+    const delayed = await q.getDelayed();
+    const waiting = await q.getWaiting();
+    for (const job of [...delayed, ...waiting]) {
+      if (job.name === 'tick') {
+        try {
+          await job.remove();
+        } catch { /* ignore */ }
+      }
+    }
+    await this.scheduleLinkedInFollowTick(delayMs);
+  }
+
+  async scheduleLinkedInFollowTick(overrideMs = null) {
+    const q = this.queues[LINKEDIN_FOLLOW_QUEUE];
+    if (!q) throw new Error('LinkedIn follow queue not initialized');
+    const delay = this.linkedInFollowDelayMs(overrideMs);
+    await q.add(
+      'tick',
+      { scheduledAt: new Date().toISOString() },
+      {
+        delay,
+        removeOnComplete: 100,
+        removeOnFail: 50,
+        attempts: 1,
+      }
+    );
+    console.log(`LinkedIn follow tick scheduled in ${Math.round(delay / 1000)}s`);
+  }
+
+  async ensureLinkedInFollowLoop() {
+    const pending = await this.pendingCount(LINKEDIN_FOLLOW_QUEUE);
+    if (pending > 0) {
+      console.log(`LinkedIn follow queue already has ${pending} pending job(s) — skipping seed`);
+      return;
+    }
+    await this.scheduleLinkedInFollowTick(10000);
+  }
+
+  redditFollowDelayMs(overrideMs = null) {
+    if (overrideMs != null) return overrideMs;
+    const base = 10 * 60 * 1000;
+    const jitter = Math.random() * 10 * 60 * 1000;
+    return base + jitter;
+  }
+
+  async kickRedditFollowSoon(delayMs = 5000) {
+    const q = this.queues[REDDIT_FOLLOW_QUEUE];
+    if (!q) throw new Error('Reddit follow queue not initialized');
+    const delayed = await q.getDelayed();
+    const waiting = await q.getWaiting();
+    for (const job of [...delayed, ...waiting]) {
+      if (job.name === 'tick') {
+        try {
+          await job.remove();
+        } catch { /* ignore */ }
+      }
+    }
+    await this.scheduleRedditFollowTick(delayMs);
+  }
+
+  async scheduleRedditFollowTick(overrideMs = null) {
+    const q = this.queues[REDDIT_FOLLOW_QUEUE];
+    if (!q) throw new Error('Reddit follow queue not initialized');
+    const delay = this.redditFollowDelayMs(overrideMs);
+    await q.add(
+      'tick',
+      { scheduledAt: new Date().toISOString() },
+      {
+        delay,
+        removeOnComplete: 100,
+        removeOnFail: 50,
+        attempts: 1,
+      }
+    );
+    console.log(`Reddit follow tick scheduled in ${Math.round(delay / 1000)}s`);
+  }
+
+  async ensureRedditFollowLoop() {
+    const pending = await this.pendingCount(REDDIT_FOLLOW_QUEUE);
+    if (pending > 0) {
+      console.log(`Reddit follow queue already has ${pending} pending job(s) — skipping seed`);
+      return;
+    }
+    await this.scheduleRedditFollowTick(9000);
+  }
+
   socialWarmDelayMs(overrideMs = null) {
     if (overrideMs != null) return overrideMs;
     const base = 12 * 60 * 1000;
@@ -641,6 +817,20 @@ class DurableQueue {
       'completed',
       'failed'
     );
+    const linkedInFollow = await this.queues[LINKEDIN_FOLLOW_QUEUE].getJobCounts(
+      'delayed',
+      'waiting',
+      'active',
+      'completed',
+      'failed'
+    );
+    const redditFollow = await this.queues[REDDIT_FOLLOW_QUEUE].getJobCounts(
+      'delayed',
+      'waiting',
+      'active',
+      'completed',
+      'failed'
+    );
     const socialWarm = await this.queues[SOCIAL_WARM_QUEUE].getJobCounts(
       'delayed',
       'waiting',
@@ -671,6 +861,8 @@ class DurableQueue {
         [ORGANIC_QUEUE]: organic,
         [AUDIT_QUEUE]: audit,
         [X_FOLLOW_QUEUE]: xFollow,
+        [LINKEDIN_FOLLOW_QUEUE]: linkedInFollow,
+        [REDDIT_FOLLOW_QUEUE]: redditFollow,
         [SOCIAL_WARM_QUEUE]: socialWarm,
         [REDDIT_PW_RESET_QUEUE]: redditPwReset,
         [ACCOUNT_OPS_BRAIN_QUEUE]: accountOpsBrain,

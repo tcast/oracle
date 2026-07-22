@@ -5,12 +5,13 @@
 const pool = require('./db');
 const organicCommentService = require('./organicCommentService');
 const xFollowService = require('./xFollowService');
+const linkedinFollowService = require('./linkedinFollowService');
 const proxyService = require('./proxyService');
 const oxylabsStickyService = require('./oxylabsStickyService');
 const brainLiveState = require('./brainLiveState');
 const { isJunkUsername, looksFakeUsername, needsHumanHandle } = require('./xPersonas');
 
-const PLATFORMS = ['x', 'reddit'];
+const PLATFORMS = ['x', 'reddit', 'linkedin'];
 const WORKER_HARD_MS = Number(process.env.ACCOUNT_OPS_WORKER_TIMEOUT_MS || 10 * 60 * 1000);
 const MAX_PARALLEL = Math.min(10, Math.max(1, Number(process.env.ACCOUNT_OPS_PARALLEL || 10)));
 const FREE_PROXY_FLOOR = Math.max(1, Number(process.env.ACCOUNT_OPS_FREE_PROXY_FLOOR || 5));
@@ -78,7 +79,7 @@ class AccountOpsBrainService {
    */
   async refreshLivePools() {
     brainLiveState.setMeta({ enabled: this.isEnabled(), parallel: MAX_PARALLEL });
-    const [xCookies, redditDue, organicEn, followEn, comments15, follows15, byPlat15] =
+    const [xCookies, redditDue, organicEn, followEn, liFollowEn, comments15, follows15, liFollows15, byPlat15] =
       await Promise.all([
         pool.query(`
           SELECT COUNT(DISTINCT sa.id)::int AS n
@@ -108,7 +109,7 @@ class AccountOpsBrainService {
           JOIN social_accounts sa ON sa.id = j.social_account_id
           WHERE j.enabled = true AND sa.status = 'active'
             AND COALESCE(sa.is_simulated, false) = false
-            AND lower(sa.platform) IN ('x', 'twitter', 'reddit')
+            AND lower(sa.platform) IN ('x', 'twitter', 'reddit', 'linkedin')
         `),
         pool.query(`
           SELECT COUNT(*)::int AS n
@@ -119,6 +120,13 @@ class AccountOpsBrainService {
         `),
         pool.query(`
           SELECT COUNT(*)::int AS n
+          FROM linkedin_follow_jobs j
+          JOIN social_accounts sa ON sa.id = j.social_account_id
+          WHERE j.enabled = true AND sa.status = 'active'
+            AND COALESCE(sa.is_simulated, false) = false
+        `).catch(() => ({ rows: [{ n: 0 }] })),
+        pool.query(`
+          SELECT COUNT(*)::int AS n
           FROM organic_comments
           WHERE status = 'posted'
             AND created_at >= NOW() - INTERVAL '15 minutes'
@@ -126,6 +134,11 @@ class AccountOpsBrainService {
         pool.query(`
           SELECT COUNT(*)::int AS n
           FROM x_follows
+          WHERE created_at >= NOW() - INTERVAL '15 minutes'
+        `).catch(() => ({ rows: [{ n: 0 }] })),
+        pool.query(`
+          SELECT COUNT(*)::int AS n
+          FROM linkedin_follows
           WHERE created_at >= NOW() - INTERVAL '15 minutes'
         `).catch(() => ({ rows: [{ n: 0 }] })),
         pool.query(`
@@ -144,16 +157,19 @@ class AccountOpsBrainService {
       live_x_cookies: xCookies.rows[0]?.n || 0,
       reddit_due: redditDue.rows[0]?.n || 0,
       organic_enabled: organicEn.rows[0]?.n || 0,
-      follows_enabled: followEn.rows[0]?.n || 0,
+      follows_enabled: (followEn.rows[0]?.n || 0) + (liFollowEn.rows[0]?.n || 0),
+      linkedin_follows_enabled: liFollowEn.rows[0]?.n || 0,
     });
 
-    const byPlat = { x: 0, reddit: 0 };
+    const byPlat = { x: 0, reddit: 0, linkedin: 0 };
     for (const row of byPlat15.rows || []) {
-      if (row.platform === 'x' || row.platform === 'reddit') byPlat[row.platform] = row.n;
+      if (row.platform === 'x' || row.platform === 'reddit' || row.platform === 'linkedin') {
+        byPlat[row.platform] = row.n;
+      }
     }
     brainLiveState.setStats15m({
       comments: comments15.rows[0]?.n || 0,
-      follows: follows15.rows[0]?.n || 0,
+      follows: (follows15.rows[0]?.n || 0) + (liFollows15.rows[0]?.n || 0),
       by_platform: byPlat,
     });
 
@@ -204,7 +220,7 @@ class AccountOpsBrainService {
           COUNT(*) FILTER (WHERE lower(status) = 'banned')::int AS banned
         FROM social_accounts
         WHERE COALESCE(is_simulated, false) = false
-          AND lower(platform) IN ('x','twitter','reddit')
+          AND lower(platform) IN ('x','twitter','reddit','linkedin')
         GROUP BY 1
       `),
       pool.query(`
@@ -219,7 +235,7 @@ class AccountOpsBrainService {
         FROM social_accounts sa
         LEFT JOIN organic_comment_jobs j ON j.social_account_id = sa.id
         WHERE COALESCE(sa.is_simulated, false) = false
-          AND lower(sa.platform) IN ('x','twitter','reddit')
+          AND lower(sa.platform) IN ('x','twitter','reddit','linkedin')
           AND sa.status = 'active'
         GROUP BY 1
       `),
@@ -235,12 +251,16 @@ class AccountOpsBrainService {
     const proxybaseFree = proxies.ProxyBase?.free_healthy || 0;
     const xUnbound = accounts.x?.unbound || 0;
     const redditUnbound = accounts.reddit?.unbound || 0;
+    const linkedinUnbound = accounts.linkedin?.unbound || 0;
     const xActive = accounts.x?.active || 0;
     const redditActive = accounts.reddit?.active || 0;
+    const linkedinActive = accounts.linkedin?.active || 0;
     const xOrganic = organic.x?.organic_enabled || 0;
     const redditOrganic = organic.reddit?.organic_enabled || 0;
+    const linkedinOrganic = organic.linkedin?.organic_enabled || 0;
     const xStarved = organic.x?.organic_starved || 0;
     const redditStarved = organic.reddit?.organic_starved || 0;
+    const linkedinStarved = organic.linkedin?.organic_starved || 0;
 
     const alerts = [];
 
@@ -318,6 +338,37 @@ class AccountOpsBrainService {
       });
     }
 
+    // LinkedIn: all accounts already ProxyBase-bound — never false-alert empty free pool.
+    // Surface only when we need more LinkedIn accounts (or rare unbound).
+    if (linkedinActive < MIN_ACTIVE_ACCOUNTS) {
+      alerts.push({
+        id: 'linkedin_accounts_low',
+        severity: linkedinActive < 5 ? 'critical' : 'warn',
+        kind: 'accounts',
+        platform: 'linkedin',
+        message: `Need more LinkedIn accounts (active=${linkedinActive}, organic_enabled=${linkedinOrganic})`,
+        action: 'Import more LinkedIn accounts with proxies.',
+        metrics: {
+          active: linkedinActive,
+          organic_enabled: linkedinOrganic,
+          starved: linkedinStarved,
+          unbound: linkedinUnbound,
+          min: MIN_ACTIVE_ACCOUNTS,
+        },
+      });
+    } else if (linkedinUnbound > 0) {
+      alerts.push({
+        id: 'linkedin_unbound',
+        severity: 'warn',
+        kind: 'proxies',
+        platform: 'linkedin',
+        provider: 'ProxyBase',
+        message: `${linkedinUnbound} LinkedIn account(s) missing proxy binding`,
+        action: 'Assign ProxyBase proxies to unbound LinkedIn accounts.',
+        metrics: { unbound: linkedinUnbound, free: proxybaseFree },
+      });
+    }
+
     if (xStarved > 0 && oxylabsFree >= FREE_PROXY_FLOOR && xUnbound === 0) {
       // organic not enrolled — brain will fix; soft info only if large
       if (xStarved >= 10) {
@@ -391,6 +442,11 @@ class AccountOpsBrainService {
           organic_enabled: redditOrganic,
           organic_starved: redditStarved,
         },
+        linkedin: {
+          ...(accounts.linkedin || {}),
+          organic_enabled: linkedinOrganic,
+          organic_starved: linkedinStarved,
+        },
       },
       parallel: MAX_PARALLEL,
       brain_enabled: this.isEnabled(),
@@ -423,7 +479,7 @@ class AccountOpsBrainService {
          )
        ORDER BY sa.id
        LIMIT $2`,
-      [['x', 'twitter', 'reddit'], limit]
+      [['x', 'twitter', 'reddit', 'linkedin'], limit]
     );
 
     let enrolled = 0;
@@ -449,18 +505,41 @@ class AccountOpsBrainService {
     return { enrolled, sample: rows.slice(0, 5).map((r) => r.id) };
   }
 
-  /** Enable X follow jobs for active proxied X accounts with fresh cookies. */
+  /** Enable X + LinkedIn follow jobs for active proxied accounts with live sessions. */
   async enrollFollowGap(limit = ENROLL_BATCH) {
-    const accounts = await xFollowService.listEligibleAccounts();
+    const half = Math.max(1, Math.floor(limit / 2));
+    const xAccounts = await xFollowService.listEligibleAccounts();
     let enrolled = 0;
-    for (const account of accounts.slice(0, limit)) {
+    for (const account of xAccounts.slice(0, half)) {
       const job = await xFollowService.ensureJob(account.id);
       if (!job.enabled) {
         await xFollowService.setAccountEnabled(account.id, true);
         enrolled += 1;
       }
     }
-    return { enrolled, eligible: accounts.length };
+
+    let liEnrolled = 0;
+    let liEligible = 0;
+    try {
+      const liAccounts = await linkedinFollowService.listEligibleAccounts();
+      liEligible = liAccounts.length;
+      for (const account of liAccounts.slice(0, half)) {
+        const job = await linkedinFollowService.ensureJob(account.id);
+        if (!job.enabled) {
+          await linkedinFollowService.setAccountEnabled(account.id, true);
+          liEnrolled += 1;
+        }
+      }
+    } catch (err) {
+      console.warn('Brain LinkedIn follow enroll skipped:', err.message);
+    }
+
+    return {
+      enrolled: enrolled + liEnrolled,
+      eligible: xAccounts.length + liEligible,
+      x: enrolled,
+      linkedin: liEnrolled,
+    };
   }
 
   /**
@@ -576,7 +655,7 @@ class AccountOpsBrainService {
   async listActionCandidates(limit = MAX_PARALLEL * 3, { platforms = null } = {}) {
     const plats = platforms && platforms.length
       ? platforms
-      : ['x', 'twitter', 'reddit'];
+      : ['x', 'twitter', 'reddit', 'linkedin'];
     const { rows } = await pool.query(
       `SELECT sa.id, sa.platform, sa.username, sa.status, sa.warmup_status,
               sa.credentials,
@@ -587,18 +666,21 @@ class AccountOpsBrainService {
               j.daily_target,
               j.cooldown_until AS organic_cooldown,
               j.failure_class AS organic_failure,
-              fj.enabled AS follow_enabled,
-              fj.next_due_at AS follow_due,
-              fj.follows_today,
-              fj.daily_target AS follow_target,
-              fj.cooldown_until AS follow_cooldown,
-              fj.status AS follow_status,
-              fj.accepts_today,
-              fj.last_accept_at,
-              fj.last_discover_at
+              COALESCE(xfj.enabled, lfj.enabled) AS follow_enabled,
+              COALESCE(xfj.next_due_at, lfj.next_due_at) AS follow_due,
+              COALESCE(xfj.follows_today, lfj.follows_today) AS follows_today,
+              COALESCE(xfj.daily_target, lfj.daily_target) AS follow_target,
+              COALESCE(xfj.cooldown_until, lfj.cooldown_until) AS follow_cooldown,
+              COALESCE(xfj.status, lfj.status) AS follow_status,
+              COALESCE(xfj.accepts_today, lfj.accepts_today) AS accepts_today,
+              COALESCE(xfj.last_accept_at, lfj.last_accept_at) AS last_accept_at,
+              COALESCE(xfj.last_discover_at, lfj.last_discover_at) AS last_discover_at
        FROM social_accounts sa
        LEFT JOIN organic_comment_jobs j ON j.social_account_id = sa.id
-       LEFT JOIN x_follow_jobs fj ON fj.social_account_id = sa.id
+       LEFT JOIN x_follow_jobs xfj ON xfj.social_account_id = sa.id
+         AND lower(sa.platform) IN ('x', 'twitter')
+       LEFT JOIN linkedin_follow_jobs lfj ON lfj.social_account_id = sa.id
+         AND lower(sa.platform) = 'linkedin'
        WHERE sa.status = 'active'
          AND COALESCE(sa.is_simulated, false) = false
          AND lower(sa.platform) = ANY($1::text[])
@@ -631,8 +713,7 @@ class AccountOpsBrainService {
 
   /**
    * Plan up to `limit` workers with platform fair-share.
-   * When X has due work, reserve min(floor(limit/2), xDue) slots for X so a
-   * large Reddit pool cannot starve search_comment / follow.
+   * Reserve slots for X and LinkedIn so a large Reddit pool cannot starve them.
    */
   _selectPlannedFairShare(candidates, ctx, limit) {
     const byPlatform = new Map();
@@ -657,10 +738,11 @@ class AccountOpsBrainService {
     }
 
     const planned = [];
-    const xList = actionable.get('x') || [];
-    const xReserve = Math.min(Math.floor(limit / 2), xList.length);
-    for (let i = 0; i < xReserve; i++) {
-      planned.push(xList.shift());
+    const reserveShare = Math.max(1, Math.floor(limit / 3));
+    for (const key of ['x', 'linkedin']) {
+      const list = actionable.get(key) || [];
+      const n = Math.min(reserveShare, list.length);
+      for (let i = 0; i < n; i++) planned.push(list.shift());
     }
 
     const platforms = this._shuffleInPlace([...actionable.keys()]);
@@ -702,9 +784,10 @@ class AccountOpsBrainService {
     const lastAccept = account.last_accept_at ? new Date(account.last_accept_at).getTime() : 0;
     const lastDiscover = account.last_discover_at ? new Date(account.last_discover_at).getTime() : 0;
     const acceptsToday = account.accepts_today || 0;
+    const networkPlatform = platform === 'x' || platform === 'linkedin';
 
     if (
-      platform === 'x' &&
+      networkPlatform &&
       !quietFollow &&
       acceptsToday < 10 &&
       (!lastAccept || now - lastAccept > sixHours) &&
@@ -714,7 +797,7 @@ class AccountOpsBrainService {
     }
 
     if (
-      platform === 'x' &&
+      networkPlatform &&
       !quietFollow &&
       (!lastDiscover || now - lastDiscover > 12 * 60 * 60 * 1000) &&
       Math.random() < 0.3
@@ -723,7 +806,7 @@ class AccountOpsBrainService {
     }
 
     const followDue =
-      platform === 'x' &&
+      networkPlatform &&
       !quietFollow &&
       account.follow_enabled !== false &&
       (!account.follow_cooldown || new Date(account.follow_cooldown).getTime() <= now) &&
@@ -860,21 +943,29 @@ class AccountOpsBrainService {
       let result;
       if (action.type === 'accept_follows') {
         const full = await pool.query('SELECT * FROM social_accounts WHERE id = $1', [account.id]);
+        const acc = full.rows[0] || account;
+        const svc =
+          this._platformKey(acc) === 'linkedin' ? linkedinFollowService : xFollowService;
         result = await withTimeout(
-          xFollowService.acceptFollowsForAccount(full.rows[0] || account, { maxAccept: 5, dailyCap: 10 }),
+          svc.acceptFollowsForAccount(acc, { maxAccept: 5, dailyCap: 10 }),
           WORKER_HARD_MS,
           'accept_follows'
         );
       } else if (action.type === 'discover_targets') {
         const full = await pool.query('SELECT * FROM social_accounts WHERE id = $1', [account.id]);
+        const acc = full.rows[0] || account;
+        const svc =
+          this._platformKey(acc) === 'linkedin' ? linkedinFollowService : xFollowService;
         result = await withTimeout(
-          xFollowService.discoverTargetsForAccount(full.rows[0] || account, { limit: 12 }),
+          svc.discoverTargetsForAccount(acc, { limit: 12 }),
           WORKER_HARD_MS,
           'discover_targets'
         );
       } else if (action.type === 'network') {
+        const svc =
+          this._platformKey(account) === 'linkedin' ? linkedinFollowService : xFollowService;
         result = await withTimeout(
-          xFollowService.runOneForAccount(account, { dryRun: false }),
+          svc.runOneForAccount(account, { dryRun: false }),
           WORKER_HARD_MS,
           'follow'
         );
@@ -967,16 +1058,25 @@ class AccountOpsBrainService {
 
     const organicSettings = await organicCommentService.getSettings();
     const followSettings = await xFollowService.getSettings();
+    let liFollowSettings = { quiet_hours_start: 1, quiet_hours_end: 8 };
+    try {
+      liFollowSettings = await linkedinFollowService.getSettings();
+    } catch {
+      /* migration may not be applied yet */
+    }
     const quietOrganic = organicCommentService.inQuietHours(organicSettings);
-    const quietFollow = xFollowService.inQuietHours(followSettings);
+    const quietFollow =
+      xFollowService.inQuietHours(followSettings) &&
+      linkedinFollowService.inQuietHours(liFollowSettings);
 
-    // Per-platform fetch so ~200 Reddit cannot drown ~20 live X in one random LIMIT.
+    // Per-platform fetch so Reddit cannot drown X / LinkedIn in one random LIMIT.
     const perPlat = Math.max(MAX_PARALLEL, Math.ceil(MAX_PARALLEL / 2) * 3);
-    const [xCands, redditCands] = await Promise.all([
+    const [xCands, redditCands, liCands] = await Promise.all([
       this.listActionCandidates(perPlat, { platforms: ['x', 'twitter'] }),
       this.listActionCandidates(perPlat, { platforms: ['reddit'] }),
+      this.listActionCandidates(perPlat, { platforms: ['linkedin'] }),
     ]);
-    const candidates = [...xCands, ...redditCands];
+    const candidates = [...xCands, ...redditCands, ...liCands];
     const planned = this._selectPlannedFairShare(
       candidates,
       { quietOrganic, quietFollow, profileBudget: PROFILE_PER_TICK },
