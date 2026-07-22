@@ -335,7 +335,16 @@ class LinkedInFollowService {
   }
 
   async applyFailureQuarantine(job, errorMessage) {
-    const failureClass = classifyFailure(errorMessage);
+    const organicCommentService = require('./organicCommentService');
+    let failureClass = classifyFailure(errorMessage);
+    // Owned LinkedIn accounts have passwords — a lost/expired cookie is recoverable
+    // via re-login, not a dead account. Downgrade so we retry instead of killing.
+    if (
+      failureClass === 'session_dead' &&
+      (await organicCommentService.isRevivableLinkedInSessionLoss(job.social_account_id, errorMessage))
+    ) {
+      failureClass = 'login_failed';
+    }
     const consecutive = (job.consecutive_failures || 0) + 1;
     const until = cooldownUntil(failureClass, consecutive);
     const disable =
@@ -345,7 +354,6 @@ class LinkedInFollowService {
 
     if (failureClass === 'session_dead') {
       try {
-        const organicCommentService = require('./organicCommentService');
         await organicCommentService.markDeadSessionAccount(job.social_account_id, errorMessage);
       } catch (e) {
         console.warn('LI follow markDeadSession failed:', e.message);
@@ -490,9 +498,10 @@ class LinkedInFollowService {
       const age = session?.updated_at
         ? `${Math.round((Date.now() - new Date(session.updated_at).getTime()) / 3600000)}h old`
         : 'missing';
-      const msg = `no_live_session (${age}) — refusing password login for LinkedIn follow`;
-      await this.applyFailureQuarantine(job, msg);
-      return { skipped: true, reason: 'no_live_session', error: msg };
+      // Owned LinkedIn accounts carry real passwords/TOTP — a stale/missing cookie
+      // is recoverable. Attempt re-login (cookie-first, password fallback) below
+      // instead of quarantining. Only a real login failure marks the account.
+      console.log(`LI follow #${account.id}: session ${age}, attempting cookie-first re-login`);
     }
 
     const profileUrl = this.profileUrlForTarget(target);
@@ -503,7 +512,7 @@ class LinkedInFollowService {
         followResult = await playwrightService.followLinkedInTarget(account.id, target.handle, {
           targetType: target.target_type || 'person',
           requireProxy: false,
-          allowLogin: false,
+          allowLogin: true,
         });
       } else {
         followResult = {

@@ -455,8 +455,49 @@ Write only the comment text.`;
     return { accountId, status: 'banned', failureClass: 'banned' };
   }
 
+  /**
+   * LinkedIn accounts are owned and carry real passwords — an expired/missing
+   * cookie session is recoverable via password re-login, NOT a dead account.
+   * Only genuine bad_credentials / ban (classified before session_dead) should
+   * terminally kill them. Returns true when a session_dead classification is
+   * really just a recoverable cookie loss for a LinkedIn account with a password.
+   */
+  async isRevivableLinkedInSessionLoss(accountId, message) {
+    if (
+      !/no_live_session|session_not_logged_in|cookie_session_dead|refusing password login/i.test(
+        String(message || '')
+      )
+    ) {
+      return false;
+    }
+    try {
+      const { rows } = await pool.query(
+        `SELECT platform, COALESCE(credentials->>'password', '') AS password
+         FROM social_accounts WHERE id = $1`,
+        [accountId]
+      );
+      const row = rows[0];
+      if (!row) return false;
+      return (
+        row.platform === 'linkedin' &&
+        row.password &&
+        row.password !== 'default_password'
+      );
+    } catch (_) {
+      return false;
+    }
+  }
+
   async applyFailureQuarantine(job, errorMessage) {
-    const failureClass = classifyFailure(errorMessage);
+    let failureClass = classifyFailure(errorMessage);
+    // Never terminally kill an owned LinkedIn account on a flaky/expired cookie —
+    // downgrade to a transient login failure so it re-logins on the next tick.
+    if (
+      failureClass === 'session_dead' &&
+      (await this.isRevivableLinkedInSessionLoss(job.social_account_id, errorMessage))
+    ) {
+      failureClass = 'login_failed';
+    }
     const consecutive = (job.consecutive_failures || 0) + 1;
     const until = cooldownUntil(failureClass, consecutive);
     // Terminal: bad password, dead cookies, or platform ban — disable until replaced
@@ -671,7 +712,9 @@ Write only the comment text.`;
           null,
           {
             requireProxy: platform !== 'linkedin',
-            allowLogin: platform === 'reddit',
+            // LinkedIn accounts are owned and carry real passwords/TOTP — allow
+            // cookie-first with password fallback (X stays cookie-only).
+            allowLogin: platform === 'reddit' || platform === 'linkedin',
           }
         );
         status = 'posted';
