@@ -3788,24 +3788,48 @@ class PlaywrightService {
         }
       }
 
-      // Header / banner
+      // Header / banner — setup step should only show header picker; still refuse avatar-labeled inputs
       text = await dialogText();
       if (/Pick a header|header/i.test(text)) {
-        const fileInputs = await page.$$('input[data-testid="fileInput"], input[type="file"]');
-        const bannerInput = fileInputs[fileInputs.length - 1] || fileInputs[0] || null;
-        if (bannerPath && fs.existsSync(bannerPath) && bannerInput) {
-          await bannerInput.setInputFiles(bannerPath);
-          await this.humanLikeDelay(2500, 4000);
-          const apply =
-            (await page.$('[data-testid="applyButton"]')) ||
-            (await page.locator('button:has-text("Apply")').first().elementHandle().catch(() => null));
-          if (apply) {
-            await apply.click().catch(() => {});
-            await this.humanLikeDelay(1500, 2500);
+        if (bannerPath && fs.existsSync(bannerPath)) {
+          try {
+            const fileInputs = await page.$$('input[data-testid="fileInput"], input[type="file"]');
+            let bannerInput = null;
+            for (const input of fileInputs) {
+              const lab = await input
+                .evaluate((el) => {
+                  let n = el;
+                  for (let i = 0; i < 8 && n; i++) {
+                    const a = n.getAttribute && n.getAttribute('aria-label');
+                    if (a) return a;
+                    n = n.parentElement;
+                  }
+                  return '';
+                })
+                .catch(() => '');
+              if (/avatar|profile photo/i.test(lab) && !/banner|header/i.test(lab)) continue;
+              if (/banner|header/i.test(lab) || !lab) {
+                bannerInput = input;
+                if (/banner|header/i.test(lab)) break;
+              }
+            }
+            if (!bannerInput) throw new Error('setup header file input not found');
+            await bannerInput.setInputFiles(bannerPath);
+            await this.humanLikeDelay(2500, 4000);
+            const apply =
+              (await page.$('[data-testid="applyButton"]')) ||
+              (await page.locator('button:has-text("Apply")').first().elementHandle().catch(() => null));
+            if (apply) {
+              await apply.click().catch(() => {});
+              await this.humanLikeDelay(1500, 2500);
+            }
+            await advanceSetupStep();
+            bannerAttempted = true;
+            console.log(`X persona ${tag}: banner upload attempted in setup (unverified)`);
+          } catch (e) {
+            console.warn(`X persona ${tag}: setup banner skipped — ${e.message}`);
+            await clickTextButton('Skip for now');
           }
-          await advanceSetupStep();
-          bannerAttempted = true;
-          console.log(`X persona ${tag}: banner upload attempted in setup (unverified)`);
         } else {
           await clickTextButton('Skip for now');
         }
@@ -4013,43 +4037,21 @@ class PlaywrightService {
     );
 
     if (photoPath && fs.existsSync(photoPath)) {
-      const fileInput = await page.$('input[data-testid="fileInput"], input[type="file"]');
-      if (fileInput) {
-        await fileInput.setInputFiles(photoPath);
-        await this.humanLikeDelay(2500, 4000);
-        const apply =
-          (await page.$('[data-testid="applyButton"]')) ||
-          (await page.locator('button:has-text("Apply")').first().elementHandle().catch(() => null));
-        if (apply) {
-          await apply.click().catch(() => {});
-          await this.humanLikeDelay(1500, 2500);
-        }
+      try {
+        await this._setXAvatarInputFiles(page, photoPath, { accountId });
         photoAttempted = true;
+      } catch (photoErr) {
+        console.warn(`X persona ${tag}: avatar upload skipped — ${photoErr.message}`);
       }
     }
 
-    // Banner / header — prefer explicit Add banner control, else second file input
+    // Banner / header — MUST use banner/header control only (never avatar file input)
     if (bannerPath && fs.existsSync(bannerPath)) {
-      const bannerBtn = await page.$(
-        '[aria-label*="Add banner" i], [aria-label*="Edit banner" i], [aria-label*="header" i], [data-testid="banner"]'
-      );
-      if (bannerBtn) {
-        await bannerBtn.click().catch(() => {});
-        await this.humanLikeDelay(1000, 2000);
-      }
-      const fileInputs = await page.$$('input[data-testid="fileInput"], input[type="file"]');
-      const bannerInput = fileInputs.length > 1 ? fileInputs[1] : fileInputs[0] || null;
-      if (bannerInput) {
-        await bannerInput.setInputFiles(bannerPath);
-        await this.humanLikeDelay(2500, 4000);
-        const apply =
-          (await page.$('[data-testid="applyButton"]')) ||
-          (await page.locator('button:has-text("Apply")').first().elementHandle().catch(() => null));
-        if (apply) {
-          await apply.click().catch(() => {});
-          await this.humanLikeDelay(1500, 2500);
-        }
+      try {
+        await this._setXBannerInputFiles(page, bannerPath, { accountId });
         bannerAttempted = true;
+      } catch (bannerErr) {
+        console.warn(`X persona ${tag}: banner upload skipped — ${bannerErr.message}`);
       }
     }
 
@@ -4077,58 +4079,138 @@ class PlaywrightService {
   }
 
   /**
-   * Upload X avatar from a local image (cookie session, allowLogin=false).
-   * Returns { photoAttempted } only — caller must verify live avatar.
+   * Click banner OR avatar media control and set files via filechooser (preferred)
+   * or a label-classified file input. Never cross-wires avatar ↔ banner.
    */
-  async updateXProfilePhoto(page, photoPath, { accountId, username } = {}) {
-    const fs = require('fs');
-    if (!photoPath || !fs.existsSync(photoPath)) {
-      throw new Error(`Photo not found: ${photoPath}`);
-    }
-    const tag = accountId ? `#${accountId}` : '';
+  async _setXProfileMediaFiles(page, kind, filePath, { accountId } = {}) {
+    const wantBanner = kind === 'banner';
+    const btnSelectors = wantBanner
+      ? [
+          '[aria-label*="Add banner" i]',
+          '[aria-label*="Edit banner" i]',
+          '[aria-label*="banner photo" i]',
+          '[aria-label*="Add a header" i]',
+          '[aria-label*="Edit header" i]',
+          '[aria-label*="header photo" i]',
+          '[aria-label*="Add header" i]',
+        ]
+      : [
+          '[aria-label*="Add avatar" i]',
+          '[aria-label*="Edit avatar" i]',
+          '[aria-label*="profile photo" i]',
+          '[aria-label*="Add a profile photo" i]',
+          '[aria-label*="Edit profile photo" i]',
+        ];
 
-    const openEditForPhoto = async (url) => {
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
-      await this.humanLikeDelay(2000, 3500);
-      await this.assertXProfileActionAllowed(page, { accountId });
-      const editBtn =
-        (await page.$('[data-testid="editProfileButton"]')) ||
-        (await page.$('[aria-label="Edit profile"]'));
-      if (editBtn) {
-        await editBtn.click().catch(() => {});
-        await this.humanLikeDelay(1500, 2500);
+    let btn = null;
+    for (const sel of btnSelectors) {
+      const el = await page.$(sel);
+      if (!el) continue;
+      const label = ((await el.getAttribute('aria-label').catch(() => '')) || '').toLowerCase();
+      if (wantBanner && /avatar|profile photo|profile picture/.test(label) && !/banner|header/.test(label)) {
+        continue;
       }
-      await this.assertXProfileActionAllowed(page, { accountId });
-      return page.$('input[type="file"][accept*="image"], input[type="file"], input[data-testid="fileInput"]');
-    };
-
-    // Prefer own profile Edit modal (avatar control lives there)
-    let fileInput = null;
-    if (username) {
-      fileInput = await openEditForPhoto(`https://x.com/${username}`);
+      if (!wantBanner && /banner|header/.test(label)) continue;
+      btn = el;
+      break;
     }
-    if (!fileInput) {
-      fileInput = await openEditForPhoto('https://x.com/settings/profile');
-    }
-    if (!fileInput) {
-      const avatarBtn = await page.$(
-        '[aria-label*="Add avatar" i], [aria-label*="Edit avatar" i], [aria-label*="profile photo" i], [data-testid="UserAvatar-Container-unknown"]'
+    if (!btn) {
+      throw new Error(
+        wantBanner
+          ? 'X banner/header control not found (refusing avatar file input)'
+          : 'X avatar control not found'
       );
-      if (avatarBtn) {
-        await avatarBtn.click().catch(() => {});
-        await this.humanLikeDelay(1000, 2000);
-      }
-      fileInput = await page.$('input[type="file"]');
-    }
-    if (!fileInput) {
-      await page.screenshot({ path: `/tmp/x-avatar-nofile-${accountId || 'x'}.png` }).catch(() => {});
-      throw new Error('X avatar file input not found');
     }
 
-    await fileInput.setInputFiles(photoPath);
+    const btnLabel = ((await btn.getAttribute('aria-label').catch(() => '')) || '').toLowerCase();
+    if (wantBanner && !/banner|header/.test(btnLabel)) {
+      throw new Error(`Refusing non-banner control for header upload: "${btnLabel}"`);
+    }
+    if (!wantBanner && /banner|header/.test(btnLabel) && !/avatar|profile photo/.test(btnLabel)) {
+      throw new Error(`Refusing banner control for avatar upload: "${btnLabel}"`);
+    }
+
+    // Prefer native filechooser from the clicked control — no ambiguous input[0] fallback.
+    let usedChooser = false;
+    try {
+      const chooserPromise = page.waitForEvent('filechooser', { timeout: 8000 });
+      await btn.click();
+      const chooser = await chooserPromise;
+      await chooser.setFiles(filePath);
+      usedChooser = true;
+    } catch {
+      // Fall through to classified input resolution
+    }
+
+    if (!usedChooser) {
+      const fileInput = await this._resolveXProfileMediaInput(page, kind, btn);
+      await fileInput.setInputFiles(filePath);
+    }
+
     await this.humanLikeDelay(2500, 4000);
+    await this._applyXMediaCropAndSave(page);
+    await this.assertXProfileActionAllowed(page, { accountId });
+  }
 
-    // Apply / Save in crop modal if present
+  /**
+   * Resolve the Edit-profile file input for banner OR avatar — never confuse the two.
+   * kind: 'banner' | 'avatar'
+   */
+  async _resolveXProfileMediaInput(page, kind, preferredBtn = null) {
+    const wantBanner = kind === 'banner';
+
+    const handle = await page.evaluateHandle(
+      ({ wantBannerInner }) => {
+        const isBannerLabel = (s) => /banner|header/.test(String(s || '').toLowerCase());
+        const isAvatarLabel = (s) =>
+          /avatar|profile photo|profile picture/.test(String(s || '').toLowerCase()) &&
+          !isBannerLabel(s);
+
+        const labelNear = (el) => {
+          let n = el;
+          for (let i = 0; i < 10 && n; i++) {
+            const a = n.getAttribute && n.getAttribute('aria-label');
+            if (a) return a;
+            n = n.parentElement;
+          }
+          return '';
+        };
+
+        const inputs = [...document.querySelectorAll('input[type="file"]')];
+        const scored = inputs.map((input, idx) => {
+          const label = labelNear(input);
+          let score = 0;
+          if (wantBannerInner) {
+            if (isBannerLabel(label)) score += 100;
+            if (isAvatarLabel(label)) score -= 200;
+          } else {
+            if (isAvatarLabel(label)) score += 100;
+            if (isBannerLabel(label)) score -= 200;
+          }
+          return { input, score, label, idx };
+        });
+        scored.sort((a, b) => b.score - a.score);
+        const best = scored[0];
+        if (!best || best.score < 50) return null;
+        if (wantBannerInner && isAvatarLabel(best.label)) return null;
+        if (!wantBannerInner && isBannerLabel(best.label)) return null;
+        return best.input;
+      },
+      { wantBannerInner: wantBanner }
+    );
+
+    const fileInput = handle && handle.asElement ? handle.asElement() : null;
+    if (!fileInput) {
+      throw new Error(
+        wantBanner
+          ? 'X banner file input not found (refusing to use avatar input)'
+          : 'X avatar file input not found'
+      );
+    }
+    return fileInput;
+  }
+
+  async _applyXMediaCropAndSave(page) {
     const apply =
       (await page.$('[data-testid="applyButton"]')) ||
       (await page.locator('button:has-text("Apply")').first().elementHandle().catch(() => null));
@@ -4144,7 +4226,45 @@ class PlaywrightService {
       await save.click().catch(() => {});
       await this.humanLikeDelay(2500, 4000);
     }
-    await this.assertXProfileActionAllowed(page, { accountId });
+  }
+
+  async _setXBannerInputFiles(page, bannerPath, { accountId } = {}) {
+    await this._setXProfileMediaFiles(page, 'banner', bannerPath, { accountId });
+  }
+
+  async _setXAvatarInputFiles(page, photoPath, { accountId } = {}) {
+    await this._setXProfileMediaFiles(page, 'avatar', photoPath, { accountId });
+  }
+
+  /**
+   * Upload X avatar from a local image (cookie session, allowLogin=false).
+   * Returns { photoAttempted } only — caller must verify live avatar.
+   */
+  async updateXProfilePhoto(page, photoPath, { accountId, username } = {}) {
+    const fs = require('fs');
+    if (!photoPath || !fs.existsSync(photoPath)) {
+      throw new Error(`Photo not found: ${photoPath}`);
+    }
+    const tag = accountId ? `#${accountId}` : '';
+
+    const openEdit = async (url) => {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+      await this.humanLikeDelay(2000, 3500);
+      await this.assertXProfileActionAllowed(page, { accountId });
+      const editBtn =
+        (await page.$('[data-testid="editProfileButton"]')) ||
+        (await page.$('[aria-label="Edit profile"]'));
+      if (editBtn) {
+        await editBtn.click().catch(() => {});
+        await this.humanLikeDelay(1500, 2500);
+      }
+      await this.assertXProfileActionAllowed(page, { accountId });
+    };
+
+    if (username) await openEdit(`https://x.com/${username}`);
+    else await openEdit('https://x.com/settings/profile');
+
+    await this._setXAvatarInputFiles(page, photoPath, { accountId });
     await page.screenshot({ path: `/tmp/x-avatar-done-${accountId || 'x'}.png` }).catch(() => {});
     console.log(`X persona ${tag}: avatar upload attempted from ${photoPath} (unverified)`);
     return { photoAttempted: true };
@@ -4153,6 +4273,7 @@ class PlaywrightService {
   /**
    * Upload X profile banner/header image (cookie session only).
    * bannerPath MUST be a landscape header from private/x-banners — never a face/portrait.
+   * NEVER writes to the avatar file input.
    */
   async updateXProfileBanner(page, bannerPath, { accountId, username } = {}) {
     const fs = require('fs');
@@ -4188,39 +4309,7 @@ class PlaywrightService {
     if (username) await openEdit(`https://x.com/${username}`);
     else await openEdit('https://x.com/settings/profile');
 
-    const bannerBtn = await page.$(
-      '[aria-label*="Add banner" i], [aria-label*="Edit banner" i], [aria-label*="header photo" i], [aria-label*="Add a header" i]'
-    );
-    if (bannerBtn) {
-      await bannerBtn.click().catch(() => {});
-      await this.humanLikeDelay(1000, 2000);
-    }
-
-    const fileInputs = await page.$$('input[type="file"][accept*="image"], input[type="file"], input[data-testid="fileInput"]');
-    const fileInput = fileInputs.length > 1 ? fileInputs[fileInputs.length - 1] : fileInputs[0] || null;
-    if (!fileInput) {
-      await page.screenshot({ path: `/tmp/x-banner-nofile-${accountId || 'x'}.png` }).catch(() => {});
-      throw new Error('X banner file input not found');
-    }
-
-    await fileInput.setInputFiles(bannerPath);
-    await this.humanLikeDelay(2500, 4000);
-    const apply =
-      (await page.$('[data-testid="applyButton"]')) ||
-      (await page.locator('button:has-text("Apply")').first().elementHandle().catch(() => null));
-    if (apply) {
-      await apply.click().catch(() => {});
-      await this.humanLikeDelay(1500, 2500);
-    }
-    const save =
-      (await page.$('[data-testid="settingsDetailSave"]')) ||
-      (await page.$('[data-testid="Profile_Save_Button"]')) ||
-      (await page.locator('button:has-text("Save")').first().elementHandle().catch(() => null));
-    if (save) {
-      await save.click().catch(() => {});
-      await this.humanLikeDelay(2500, 4000);
-    }
-    await this.assertXProfileActionAllowed(page, { accountId });
+    await this._setXBannerInputFiles(page, bannerPath, { accountId });
     await page.screenshot({ path: `/tmp/x-banner-done-${accountId || 'x'}.png` }).catch(() => {});
     console.log(`X persona ${tag}: banner upload attempted from ${bannerPath} (unverified)`);
     return { bannerAttempted: true };
@@ -4397,6 +4486,142 @@ class PlaywrightService {
       passwordConfirmed: !!pwResult.confirmed,
       inputVerified: !!verifiedLocal,
     };
+  }
+
+  /**
+   * Restore avatar (portrait) then set scenic banner — cookie session only.
+   * Use after a bad run that wrote banner assets onto avatars.
+   */
+  async applyXAvatarAndBannerLive(
+    accountId,
+    { photoPath, bannerPath, requireProxy = true } = {}
+  ) {
+    if (process.env.X_PERSONA_LIVE !== '1') {
+      throw new Error('Set X_PERSONA_LIVE=1 to run live X media edits');
+    }
+    if (!photoPath) throw new Error('photoPath required to restore avatar');
+    if (!bannerPath) throw new Error('bannerPath required for scenic header');
+    let browser;
+    try {
+      const account = await this.getAccount(accountId);
+      if (account.platform !== 'x') {
+        throw new Error(`Account ${accountId} is ${account.platform}, expected x`);
+      }
+      const creds =
+        typeof account.credentials === 'string'
+          ? JSON.parse(account.credentials)
+          : account.credentials || {};
+      const persona = creds.x_persona || {};
+      const accountPassword =
+        (creds.password && String(creds.password).trim()) ||
+        (creds.pass && String(creds.pass).trim()) ||
+        null;
+
+      await this.requireProxyForLive(accountId);
+      const result = await this.createBrowserForAccount(accountId, 2, { requireProxy });
+      browser = result.browser;
+      const page = result.page;
+
+      const loggedIn = await this.ensureLoggedIn(
+        page,
+        'x',
+        accountId,
+        account.username,
+        accountPassword,
+        { allowLogin: false, totpSecret: creds.totp_secret }
+      );
+      if (!loggedIn) throw new Error(`no_live_session for x/${account.username}`);
+
+      await this.humanBrowseXSession(page, { accountId });
+      await this.assertXProfileActionAllowed(page, { accountId });
+
+      // 1) Restore face avatar first
+      await this.updateXProfilePhoto(page, photoPath, {
+        accountId,
+        username: account.username,
+      });
+      // 2) Then scenic banner via banner control only
+      await this.updateXProfileBanner(page, bannerPath, {
+        accountId,
+        username: account.username,
+      });
+
+      const live = await this.readXLiveProfile(page, {
+        accountId,
+        username: account.username,
+      });
+      const photoOk = !live.isDefaultAvatar;
+      const bannerOk = !!live.hasCustomBanner;
+      if (!photoOk || !bannerOk) {
+        throw new Error(
+          `x_media_verify_failed: photoOk=${photoOk} bannerOk=${bannerOk} ` +
+            `avatar=${(live.avatarSrc || '').slice(0, 60)} banner=${(live.bannerSrc || '').slice(0, 60)}`
+        );
+      }
+
+      // Proof screenshots (profile header shows both)
+      await page.goto(`https://x.com/${account.username}`, {
+        waitUntil: 'domcontentloaded',
+        timeout: 60000,
+      }).catch(() => {});
+      await this.humanLikeDelay(2000, 3500);
+      await page
+        .screenshot({ path: `/tmp/x-media-proof-${accountId}.png`, fullPage: false })
+        .catch(() => {});
+
+      await this.persistSession(page, 'x', accountId);
+
+      const path = require('path');
+      const nextPersona = {
+        ...persona,
+        photo_applied: true,
+        banner_applied: true,
+        banner_applied_at: new Date().toISOString(),
+        last_banner_path: path.basename(bannerPath),
+        last_photo_path: path.basename(photoPath),
+        last_verify: {
+          ...(persona.last_verify || {}),
+          at: new Date().toISOString(),
+          photo: true,
+          banner: true,
+          avatar_src: (live.avatarSrc || '').slice(0, 120),
+          banner_src: (live.bannerSrc || '').slice(0, 120),
+        },
+      };
+      await pool.query(
+        `UPDATE social_accounts
+         SET credentials = jsonb_set(COALESCE(credentials, '{}'::jsonb), '{x_persona}', $2::jsonb),
+             updated_at = NOW()
+         WHERE id = $1`,
+        [accountId, JSON.stringify(nextPersona)]
+      );
+      const { updateEnrichment } = require('./profileEnrichment');
+      await updateEnrichment(
+        accountId,
+        { photo: true, banner: true },
+        { source: 'x_media_restore' }
+      );
+
+      console.log(
+        `X #${accountId}: avatar+banner OK photo=${path.basename(photoPath)} banner=${path.basename(bannerPath)}`
+      );
+      return {
+        success: true,
+        accountId,
+        username: account.username,
+        display_name: persona.display_name || null,
+        photo: true,
+        banner: true,
+        username_renamed: false,
+        verified: { photo: true, banner: true },
+        skipped: ['display_name', 'bio', 'username'],
+        photoPath,
+        bannerPath,
+      };
+    } finally {
+      if (browser) await browser.close().catch(() => {});
+      this._untrackBrowser(accountId);
+    }
   }
 
   /**

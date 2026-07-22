@@ -11,10 +11,12 @@
  *   X_PERSONA_LIVE=1 node src/scripts/apply-x-personas-live.js --accounts 618,620,600
  *   X_PERSONA_LIVE=1 node src/scripts/apply-x-personas-live.js --pending --with-photo --with-banner --concurrency 4
  *   X_PERSONA_LIVE=1 node src/scripts/apply-x-personas-live.js --banner-fix --concurrency 4
+ *   X_PERSONA_LIVE=1 node src/scripts/apply-x-personas-live.js --restore-media --accounts 630,610 --concurrency 4
  *   X_PERSONA_LIVE=1 node src/scripts/apply-x-personas-live.js --ids-file /tmp/x-ids.txt --dry-run
  *
  * Avatar photos: private/x-photos (+ linkedin-photos fallback for portraits only).
  * Banner headers: private/x-banners ONLY — never portraits / face crops.
+ * --restore-media: re-apply portrait avatar THEN scenic banner (fixes avatar/banner mixups).
  *
  * Soft-skips rate_limit / proxy_error (does not mark account dead).
  * Session dead → markDeadSessionAccount and continue.
@@ -368,7 +370,7 @@ function withTimeout(promise, ms, label) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-async function applyOne(accountId, { withPhoto, withBanner, bannerOnly, dryRun, timeoutMs }) {
+async function applyOne(accountId, { withPhoto, withBanner, bannerOnly, restoreMedia, dryRun, timeoutMs }) {
   const ensure = await ensureOfflinePersona(accountId, { dryRun });
   if (!ensure.ok) {
     return {
@@ -381,8 +383,10 @@ async function applyOne(accountId, { withPhoto, withBanner, bannerOnly, dryRun, 
   }
 
   if (dryRun) {
-    const photoPath = withPhoto && !bannerOnly ? resolvePhotoPath(accountId) : null;
-    const bannerPath = withBanner || bannerOnly ? resolveBannerPath(accountId) : null;
+    const photoPath =
+      withPhoto || restoreMedia ? resolvePhotoPath(accountId) : null;
+    const bannerPath =
+      withBanner || bannerOnly || restoreMedia ? resolveBannerPath(accountId) : null;
     return {
       accountId,
       success: true,
@@ -395,19 +399,29 @@ async function applyOne(accountId, { withPhoto, withBanner, bannerOnly, dryRun, 
       photoPath,
       bannerPath,
       bannerOnly: !!bannerOnly,
+      restoreMedia: !!restoreMedia,
       needsAssign: !!ensure.needsAssign,
     };
   }
 
   let photoPath = null;
   let bannerPath = null;
-  if (withPhoto && !bannerOnly) {
+  if (withPhoto || restoreMedia) {
     photoPath = resolvePhotoPath(accountId);
     if (!photoPath) {
+      if (restoreMedia) {
+        return {
+          accountId,
+          success: false,
+          soft: true,
+          error: 'no portrait in x-photos/linkedin-photos for avatar restore',
+          class: 'skip',
+        };
+      }
       console.warn(`#${accountId}: --with-photo but no file — continuing text-only`);
     }
   }
-  if (withBanner || bannerOnly) {
+  if (withBanner || bannerOnly || restoreMedia) {
     bannerPath = resolveBannerPath(accountId);
     if (!bannerPath) {
       return {
@@ -421,20 +435,26 @@ async function applyOne(accountId, { withPhoto, withBanner, bannerOnly, dryRun, 
   }
 
   try {
-    const result = await withTimeout(
-      bannerOnly
-        ? playwrightService.applyXBannerLive(accountId, {
-            bannerPath,
-            requireProxy: true,
-          })
-        : playwrightService.applyXPersonaLive(accountId, {
-            photoPath,
-            bannerPath,
-            requireProxy: true,
-          }),
-      timeoutMs,
-      `account #${accountId}`
-    );
+    let applyPromise;
+    if (restoreMedia) {
+      applyPromise = playwrightService.applyXAvatarAndBannerLive(accountId, {
+        photoPath,
+        bannerPath,
+        requireProxy: true,
+      });
+    } else if (bannerOnly) {
+      applyPromise = playwrightService.applyXBannerLive(accountId, {
+        bannerPath,
+        requireProxy: true,
+      });
+    } else {
+      applyPromise = playwrightService.applyXPersonaLive(accountId, {
+        photoPath,
+        bannerPath,
+        requireProxy: true,
+      });
+    }
+    const result = await withTimeout(applyPromise, timeoutMs, `account #${accountId}`);
     if (!result?.success) {
       return {
         accountId,
@@ -456,7 +476,8 @@ async function applyOne(accountId, { withPhoto, withBanner, bannerOnly, dryRun, 
       username_renamed: !!result.username_renamed,
       verified: result.verified,
       skipped: result.skipped,
-      bannerPath,
+      bannerPath: result.bannerPath || bannerPath,
+      photoPath: result.photoPath || photoPath,
     };
   } catch (err) {
     const msg = err.message || String(err);
@@ -549,19 +570,22 @@ async function main() {
   }
 
   const dryRun = process.argv.includes('--dry-run');
-  const bannerOnly = process.argv.includes('--banner-fix');
-  const withPhoto = !bannerOnly && process.argv.includes('--with-photo');
+  const restoreMedia = process.argv.includes('--restore-media');
+  const bannerOnly = !restoreMedia && process.argv.includes('--banner-fix');
+  const withPhoto =
+    restoreMedia || (!bannerOnly && process.argv.includes('--with-photo'));
   // Do NOT auto-enable banner from --with-photo (that previously uploaded face crops as headers).
   const withBanner =
-    bannerOnly || process.argv.includes('--with-banner');
+    restoreMedia || bannerOnly || process.argv.includes('--with-banner');
   const concurrency = Math.max(1, Math.min(5, Number(arg('--concurrency', '4')) || 4));
-  // Banner-only should fail fast: hard timeout default 3m
+  // Media restore / banner-only should fail fast: hard timeout default 3m
   const timeoutMs = Math.max(
     60000,
-    Number(arg('--timeout-ms', bannerOnly ? '180000' : '480000')) || (bannerOnly ? 180000 : 480000)
+    Number(arg('--timeout-ms', restoreMedia || bannerOnly ? '180000' : '480000')) ||
+      (restoreMedia || bannerOnly ? 180000 : 480000)
   );
 
-  if ((withBanner || bannerOnly) && !BANNER_POOL.length) {
+  if ((withBanner || bannerOnly || restoreMedia) && !BANNER_POOL.length) {
     console.error(
       `No scenic banners in ${BANNER_DIR} — refusing to fall back to portraits. ` +
         'Add 1500x500 landscape JPGs under private/x-banners/ first.'
@@ -576,14 +600,19 @@ async function main() {
     process.exit(0);
   }
 
+  const modeLabel = restoreMedia
+    ? 'RESTORE avatar+banner'
+    : bannerOnly
+      ? 'BANNER-ONLY'
+      : 'LIVE';
   console.log(
     dryRun
-      ? `DRY RUN — would ${bannerOnly ? 'banner-fix' : 'live-apply X personas to'} ${ids.length} account(s)`
-      : `${bannerOnly ? 'BANNER-ONLY' : 'LIVE'} apply to ${ids.length} account(s) (cookie-only, concurrency=${concurrency}, timeout=${Math.round(timeoutMs / 60000)}m)`
+      ? `DRY RUN — would ${restoreMedia ? 'restore media for' : bannerOnly ? 'banner-fix' : 'live-apply X personas to'} ${ids.length} account(s)`
+      : `${modeLabel} apply to ${ids.length} account(s) (cookie-only, concurrency=${concurrency}, timeout=${Math.round(timeoutMs / 60000)}m)`
   );
   console.log(
-    `Photos: ${withPhoto ? `yes (pool=${PHOTO_POOL.length})` : 'no'} | Banners: ${
-      withBanner || bannerOnly
+    `Photos: ${withPhoto || restoreMedia ? `yes (pool=${PHOTO_POOL.length})` : 'no'} | Banners: ${
+      withBanner || bannerOnly || restoreMedia
         ? `yes (x-banners pool=${BANNER_POOL.length}, faces forbidden)`
         : 'no'
     }\n`
@@ -591,7 +620,8 @@ async function main() {
 
   const results = await runPool(
     ids,
-    (id) => applyOne(id, { withPhoto, withBanner, bannerOnly, dryRun, timeoutMs }),
+    (id) =>
+      applyOne(id, { withPhoto, withBanner, bannerOnly, restoreMedia, dryRun, timeoutMs }),
     concurrency
   );
 
