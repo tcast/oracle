@@ -7131,28 +7131,30 @@ class PlaywrightService {
         extras
       );
 
-      // LinkedIn: sticky proxies sometimes authwall live cookies — retry direct once.
-      if (!loggedIn && platform === 'linkedin' && allowLogin === false) {
+      // LinkedIn: sticky proxies sometimes authwall cookies — prefer direct, but if
+      // the direct session is dead try the assigned proxy once before giving up.
+      if (!loggedIn && platform === 'linkedin' && preferDirect) {
         await browser.close().catch(() => {});
         this._untrackBrowser(accountId);
-        const direct = await this.createBrowser(
-          null,
-          false,
-          await this.getOrCreateDeviceProfile(accountId, { forceDesktop: true })
-        );
-        browser = direct.browser;
-        page = direct.page;
-        proxyId = null;
-        direct.accountId = accountId;
-        this._trackBrowser(accountId, browser);
-        loggedIn = await this.ensureLoggedIn(
-          page,
-          platform,
-          accountId,
-          loginId,
-          creds.password,
-          extras
-        );
+        try {
+          await this.requireProxyForLive(accountId);
+          const viaProxy = await this.createBrowserForAccount(accountId, 2, { requireProxy: true });
+          browser = viaProxy.browser;
+          page = viaProxy.page;
+          proxyId = viaProxy.proxyConfig?._proxyId;
+          viaProxy.accountId = accountId;
+          this._trackBrowser(accountId, browser);
+          loggedIn = await this.ensureLoggedIn(
+            page,
+            platform,
+            accountId,
+            loginId,
+            creds.password,
+            extras
+          );
+        } catch (proxyErr) {
+          console.warn(`LinkedIn postComment proxy fallback failed: ${proxyErr.message}`);
+        }
       }
 
       if (!loggedIn) throw new Error('Login failed');
