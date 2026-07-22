@@ -498,6 +498,16 @@ async function applyOne(accountId, { withPhoto, withBanner, bannerOnly, restoreM
     }
 
     if (cls === 'session_dead') {
+      // During media restore, tunnel flaps often look like login walls — soft-skip, do not kill account.
+      if (restoreMedia || bannerOnly) {
+        return {
+          accountId,
+          success: false,
+          error: msg,
+          class: cls,
+          soft: true,
+        };
+      }
       const organicCommentService = require('../services/organicCommentService');
       await organicCommentService
         .markDeadSessionAccount(accountId, `x_persona_live: ${msg}`)
