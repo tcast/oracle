@@ -2484,6 +2484,12 @@ class PlaywrightService {
       await page.screenshot({ path: `/tmp/linkedin-login-failed-${Date.now()}.png` }).catch(() => {});
       return false;
     } catch (error) {
+      // Terminal account states must propagate — do not collapse into a generic
+      // `false` or callers misclassify them as soft login_failed.
+      const msg = error?.message || String(error);
+      if (/linkedin_id_verification_restricted|government-ID|id_verification_restricted/i.test(msg)) {
+        throw error;
+      }
       console.error('LinkedIn login error:', error);
       await page.screenshot({ path: `/tmp/linkedin-login-error-${Date.now()}.png` }).catch(() => {});
       return false;
