@@ -430,7 +430,19 @@ class XFollowService {
     const failureClass = classifyFailure(errorMessage);
     const consecutive = (job.consecutive_failures || 0) + 1;
     const until = cooldownUntil(failureClass, consecutive);
-    const disable = failureClass === 'bad_credentials';
+    const disable =
+      failureClass === 'bad_credentials' ||
+      failureClass === 'session_dead' ||
+      failureClass === 'banned';
+
+    if (failureClass === 'session_dead') {
+      try {
+        const organicCommentService = require('./organicCommentService');
+        await organicCommentService.markDeadSessionAccount(job.social_account_id, errorMessage);
+      } catch (e) {
+        console.warn('Follow markDeadSession failed:', e.message);
+      }
+    }
 
     await pool.query(
       `UPDATE x_follow_jobs
@@ -447,7 +459,8 @@ class XFollowService {
     );
 
     console.warn(
-      `X follow job ${job.social_account_id} quarantined as ${failureClass} until ${until.toISOString()}`
+      `X follow job ${job.social_account_id} quarantined as ${failureClass} until ${until.toISOString()}` +
+        (disable ? ' — disabled' : '')
     );
     return { failureClass, consecutive, until, disable };
   }

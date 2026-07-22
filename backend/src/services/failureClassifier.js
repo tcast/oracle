@@ -33,13 +33,11 @@ function classifyFailure(message = '') {
   ) {
     return 'banned';
   }
-  // Explicit dead-cookie signals only. Plain "no_live_session" can also come from
-  // transient proxy/network flakes during verify, so keep those retryable.
-  if (/session_not_logged_in|cookie_session_dead|session_dead/i.test(msg)) {
+  // Dead cookies / missing live session — mark terminal so workers stop retrying.
+  if (
+    /session_not_logged_in|cookie_session_dead|session_dead|no_live_session/i.test(msg)
+  ) {
     return 'session_dead';
-  }
-  if (/no_live_session/i.test(msg)) {
-    return 'login_failed';
   }
   if (/login failed/i.test(msg)) {
     return 'login_failed';

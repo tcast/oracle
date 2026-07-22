@@ -11,11 +11,14 @@ const { isJunkUsername, looksFakeUsername, needsHumanHandle } = require('./xPers
 
 const PLATFORMS = ['x', 'reddit'];
 const WORKER_HARD_MS = Number(process.env.ACCOUNT_OPS_WORKER_TIMEOUT_MS || 10 * 60 * 1000);
-const MAX_PARALLEL = Math.min(8, Math.max(1, Number(process.env.ACCOUNT_OPS_PARALLEL || 5)));
+const MAX_PARALLEL = Math.min(10, Math.max(1, Number(process.env.ACCOUNT_OPS_PARALLEL || 10)));
 const FREE_PROXY_FLOOR = Math.max(1, Number(process.env.ACCOUNT_OPS_FREE_PROXY_FLOOR || 5));
 const MIN_ACTIVE_ACCOUNTS = Math.max(1, Number(process.env.ACCOUNT_OPS_MIN_ACTIVE || 10));
 const ENROLL_BATCH = Math.min(80, Math.max(5, Number(process.env.ACCOUNT_OPS_ENROLL_BATCH || 40)));
-const PROFILE_PER_TICK = Math.min(2, Math.max(0, Number(process.env.ACCOUNT_OPS_PROFILE_PER_TICK || 1)));
+// Profile edits are flaky and must never block comment/follow scale. Default off.
+const PROFILE_PER_TICK = Math.min(1, Math.max(0, Number(process.env.ACCOUNT_OPS_PROFILE_PER_TICK || 0)));
+const PROFILE_SKIP_MS = 24 * 60 * 60 * 1000;
+const profileSkipUntil = new Map(); // accountId -> epoch ms
 
 let lastCapacity = { alerts: [], computed_at: null, stats: {} };
 const lockedAccounts = new Set();
@@ -478,7 +481,8 @@ class AccountOpsBrainService {
   }
 
   decideAction(account, { quietOrganic, quietFollow, profileBudget }) {
-    // Order: profile_gap → accept_follows → discover_targets → follow → search/home comment
+    // Order: accept_follows → discover_targets → follow → search/home comment
+    // profile_gap is soft-optional only (never blocks queue; max 1 try then 24h skip).
     const platform = String(account.platform || '').toLowerCase() === 'twitter'
       ? 'x'
       : String(account.platform || '').toLowerCase();
@@ -495,29 +499,6 @@ class AccountOpsBrainService {
       return null;
     }
 
-    const junkUser =
-      looksFakeUsername(account.username) ||
-      isJunkUsername(account.username) ||
-      (xp && needsHumanHandle(account.username, xp));
-    const personaLiveOn = ['1', 'true', 'yes', 'on'].includes(
-      String(process.env.X_PERSONA_LIVE || '').trim().toLowerCase()
-    );
-    const needsPersona =
-      platform === 'x' &&
-      personaLiveOn &&
-      profileBudget > 0 &&
-      (!xp ||
-        !xp.applied_live ||
-        junkUser ||
-        !enrichment.photo ||
-        !enrichment.banner ||
-        !xp.display_name ||
-        (xp.desired_username && !xp.username_applied));
-
-    if (needsPersona) {
-      return { type: 'profile_gap', priority: 1 };
-    }
-
     const now = Date.now();
     const sixHours = 6 * 60 * 60 * 1000;
     const lastAccept = account.last_accept_at ? new Date(account.last_accept_at).getTime() : 0;
@@ -531,7 +512,7 @@ class AccountOpsBrainService {
       (!lastAccept || now - lastAccept > sixHours) &&
       Math.random() < 0.35
     ) {
-      return { type: 'accept_follows', priority: 2 };
+      return { type: 'accept_follows', priority: 1 };
     }
 
     if (
@@ -540,7 +521,7 @@ class AccountOpsBrainService {
       (!lastDiscover || now - lastDiscover > 12 * 60 * 60 * 1000) &&
       Math.random() < 0.3
     ) {
-      return { type: 'discover_targets', priority: 3 };
+      return { type: 'discover_targets', priority: 2 };
     }
 
     const followDue =
@@ -551,8 +532,8 @@ class AccountOpsBrainService {
       (!account.follow_due || new Date(account.follow_due).getTime() <= now) &&
       (account.follows_today || 0) < (account.follow_target || 5);
 
-    if (followDue && Math.random() < 0.5) {
-      return { type: 'network', priority: 4 };
+    if (followDue && Math.random() < 0.55) {
+      return { type: 'network', priority: 3 };
     }
 
     const organicDue =
@@ -564,22 +545,46 @@ class AccountOpsBrainService {
       (account.comments_today || 0) < (account.daily_target || 3);
 
     if (organicDue) {
-      // organicDiscoveryService prefers search over home for X
-      return { type: 'search_comment', priority: 5 };
+      return { type: 'search_comment', priority: 4 };
     }
 
     if (followDue) {
-      return { type: 'network', priority: 4 };
+      return { type: 'network', priority: 3 };
     }
 
-    // Light engage: browse/warm via organic path when under daily cap
     if (
       !quietOrganic &&
       account.organic_enabled &&
       (account.comments_today || 0) < (account.daily_target || 3) &&
-      Math.random() < 0.2
+      Math.random() < 0.25
     ) {
-      return { type: 'home_comment', priority: 6 };
+      return { type: 'home_comment', priority: 5 };
+    }
+
+    // Soft profile only after comment/follow paths decline — never blocks queue.
+    const junkUser =
+      looksFakeUsername(account.username) ||
+      isJunkUsername(account.username) ||
+      (xp && needsHumanHandle(account.username, xp));
+    const personaLiveOn = ['1', 'true', 'yes', 'on'].includes(
+      String(process.env.X_PERSONA_LIVE || '').trim().toLowerCase()
+    );
+    const profileSkipped = (profileSkipUntil.get(account.id) || 0) > now;
+    const needsPersona =
+      platform === 'x' &&
+      personaLiveOn &&
+      profileBudget > 0 &&
+      !profileSkipped &&
+      (!xp ||
+        !xp.applied_live ||
+        junkUser ||
+        !enrichment.photo ||
+        !enrichment.banner ||
+        !xp.display_name ||
+        (xp.desired_username && !xp.username_applied));
+
+    if (needsPersona) {
+      return { type: 'profile_gap', priority: 9 };
     }
 
     return null;
@@ -590,12 +595,26 @@ class AccountOpsBrainService {
     const started = Date.now();
     try {
       if (action.type === 'profile_gap') {
+        // One attempt then 24h skip so flaky profile never monopolizes workers.
+        profileSkipUntil.set(account.id, Date.now() + PROFILE_SKIP_MS);
         const playwrightService = require('./playwrightService');
         const result = await withTimeout(
           playwrightService.applyXPersonaLive(account.id, { requireProxy: true }),
-          WORKER_HARD_MS,
+          Math.min(WORKER_HARD_MS, 90 * 1000),
           'persona'
         );
+        const ok = result && result.success !== false && !result.error;
+        if (!ok) {
+          return {
+            type: action.type,
+            accountId: account.id,
+            platform: account.platform,
+            skipped: true,
+            reason: 'profile_soft_skip_24h',
+            error: result?.error || result?.reason,
+            ms: Date.now() - started,
+          };
+        }
         return { type: action.type, accountId: account.id, platform: account.platform, ...result, ms: Date.now() - started };
       }
       if (action.type === 'accept_follows') {
@@ -635,7 +654,13 @@ class AccountOpsBrainService {
       return { type: action.type, accountId: account.id, skipped: true, reason: 'unknown_action' };
     } catch (err) {
       const msg = err?.message || String(err);
-      if (/banned|suspended|locked|challenge/i.test(msg)) {
+      if (/no_live_session|session_not_logged_in|cookie_session_dead/i.test(msg)) {
+        try {
+          await organicCommentService.markDeadSessionAccount(account.id, `ops_brain: ${msg}`);
+        } catch (e) {
+          console.warn('Brain markDeadSession failed:', e.message);
+        }
+      } else if (/banned|suspended|locked|challenge/i.test(msg)) {
         try {
           await organicCommentService.markBannedAccount(account.id, `ops_brain: ${msg}`);
         } catch (e) {
