@@ -531,11 +531,18 @@ class RedditFollowService {
     } catch (error) {
       const msg = error.message || String(error);
       if (
-        /err_tunnel|err_timed_out|err_proxy|tunnel_connection|net::err_|proxy|has been closed|Target closed|browser.*closed/i.test(
+        /err_tunnel|err_timed_out|err_proxy|tunnel_connection|net::err_|proxy|has been closed|Target closed|browser.*closed|Follow button not found/i.test(
           msg
         ) &&
         !/banned|suspended|locked|session_dead|bad_credentials/i.test(msg)
       ) {
+        if (/Follow button not found/i.test(msg)) {
+          await pool.query(
+            `UPDATE reddit_follow_targets SET enabled = false, notes = COALESCE(notes,'') || ' | no_follow_button'
+             WHERE lower(handle) = lower($1)`,
+            [target.handle]
+          ).catch(() => {});
+        }
         const soft = await this.softSkipJob(job, msg);
         return { ...soft, accountId: account.id, handle: target.handle };
       }

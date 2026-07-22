@@ -7231,28 +7231,74 @@ class PlaywrightService {
       throw new Error(`Reddit account banned while viewing u/${handle}`);
     }
 
-    const state = await page.evaluate(() => {
-      const labels = [];
-      for (const el of document.querySelectorAll('button, a, [role="button"]')) {
-        const t = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim();
-        if (/follow/i.test(t)) labels.push(t.split('\n')[0].slice(0, 40));
-      }
-      const following = labels.some((t) => /^(Following|Unfollow)$/i.test(t) || /Unfollow|Following/i.test(t));
-      return {
-        following,
-        labels: labels.filter((t) => /follow/i.test(t)).slice(0, 10),
+    const collectFollowControls = () => page.evaluate(() => {
+      const out = [];
+      const pushEl = (el, depth = 0) => {
+        if (!el || depth > 4) return;
+        const label = (
+          el.getAttribute?.('aria-label') ||
+          el.innerText ||
+          el.textContent ||
+          ''
+        )
+          .trim()
+          .split('\n')[0]
+          .trim()
+          .slice(0, 60);
+        if (/follow/i.test(label)) {
+          out.push({
+            label,
+            tag: (el.tagName || '').toLowerCase(),
+            testid: el.getAttribute?.('data-testid') || null,
+          });
+        }
+        try {
+          if (el.shadowRoot) {
+            for (const child of el.shadowRoot.querySelectorAll('button, a, [role="button"]')) {
+              pushEl(child, depth + 1);
+            }
+          }
+        } catch { /* ignore */ }
       };
+      for (const el of document.querySelectorAll(
+        'button, a, [role="button"], faceplate-tracker, shreddit-async-loader, [data-testid*="follow" i]'
+      )) {
+        pushEl(el, 0);
+      }
+      return out.slice(0, 20);
     });
 
-    if (state.following) {
-      return { followed: false, alreadyFollowing: true, profileUrl, button: state.labels[0] || 'Following' };
+    // Profile chrome can hydrate slowly on new Reddit.
+    let labels = [];
+    for (let attempt = 0; attempt < 3; attempt++) {
+      labels = await collectFollowControls();
+      if (labels.length) break;
+      await this.humanLikeDelay(1200, 2200);
+      await this.randomScroll(page).catch(() => {});
+    }
+
+    const following = labels.some((t) =>
+      /^(Following|Unfollow)$/i.test(t.label) || /Unfollow|Following/i.test(t.label)
+    );
+    if (following) {
+      return {
+        followed: false,
+        alreadyFollowing: true,
+        profileUrl,
+        button: labels.find((t) => /follow/i.test(t.label))?.label || 'Following',
+      };
     }
 
     const clicked = await page.evaluate(() => {
       const isFollow = (t) => /^(Follow|Follow back)$/i.test(String(t || '').trim());
-      const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]'));
-      for (const el of candidates) {
-        const label = (el.innerText || el.textContent || el.getAttribute('aria-label') || '')
+      const tryClick = (el, depth = 0) => {
+        if (!el || depth > 4) return null;
+        const label = (
+          el.getAttribute?.('aria-label') ||
+          el.innerText ||
+          el.textContent ||
+          ''
+        )
           .trim()
           .split('\n')[0]
           .trim();
@@ -7260,23 +7306,21 @@ class PlaywrightService {
           el.click();
           return label;
         }
-      }
-      // New Reddit sometimes nests Follow in a shadow host — try faceplate buttons
-      for (const host of document.querySelectorAll('faceplate-tracker, shreddit-async-loader, *')) {
         try {
-          const root = host.shadowRoot;
-          if (!root) continue;
-          for (const el of root.querySelectorAll('button, a, [role="button"]')) {
-            const label = (el.innerText || el.textContent || el.getAttribute('aria-label') || '')
-              .trim()
-              .split('\n')[0]
-              .trim();
-            if (isFollow(label)) {
-              el.click();
-              return label;
+          if (el.shadowRoot) {
+            for (const child of el.shadowRoot.querySelectorAll('button, a, [role="button"]')) {
+              const hit = tryClick(child, depth + 1);
+              if (hit) return hit;
             }
           }
         } catch { /* ignore */ }
+        return null;
+      };
+      for (const el of document.querySelectorAll(
+        'button, a, [role="button"], faceplate-tracker, shreddit-async-loader, [data-testid*="follow" i]'
+      )) {
+        const hit = tryClick(el, 0);
+        if (hit) return hit;
       }
       return null;
     });
@@ -7284,7 +7328,9 @@ class PlaywrightService {
     if (!clicked) {
       await page.screenshot({ path: `/tmp/reddit-follow-miss-${handle}.png`, fullPage: true }).catch(() => {});
       throw new Error(
-        `Reddit Follow button not found on u/${handle} (saw: ${(state.labels || []).join(', ') || 'none'})`
+        `Reddit Follow button not found on u/${handle} (saw: ${
+          labels.map((t) => t.label).join(', ') || 'none'
+        })`
       );
     }
 
