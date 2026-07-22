@@ -77,8 +77,19 @@ function classifyApplyError(msg) {
   if (/rate.?limit|try again later/i.test(m)) {
     return 'rate_limit';
   }
-  if (/proxy|oxylabs|ECONNREFUSED|ETIMEDOUT|tunnel|ERR_PROXY|ERR_TUNNEL/i.test(m)) {
+  if (
+    /proxy|oxylabs|ECONNREFUSED|ETIMEDOUT|tunnel|ERR_PROXY|ERR_TUNNEL|ERR_HTTP_RESPONSE_CODE_FAILURE|ERR_CONNECTION|net::ERR_/i.test(
+      m
+    )
+  ) {
     return 'proxy_error';
+  }
+  if (
+    /edit form not found|Edit profile button not found|Set up \/ Edit profile|Execution context was destroyed|UI flake/i.test(
+      m
+    )
+  ) {
+    return 'ui_flake';
   }
   if (/challenge|unusual activity|verify you/i.test(m)) {
     return 'challenge';
@@ -531,7 +542,8 @@ async function applyOne(accountId, { withPhoto, withBanner, bannerOnly, restoreM
         cls === 'proxy_error' ||
         cls === 'challenge' ||
         cls === 'timeout' ||
-        cls === 'needs_password',
+        cls === 'needs_password' ||
+        cls === 'ui_flake',
     };
   }
 }

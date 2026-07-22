@@ -2080,6 +2080,89 @@ class PlaywrightService {
     }
   }
 
+  /**
+   * Solve LinkedIn's "quick security check" reCAPTCHA on the login checkpoint.
+   * Reuses the shared captcha pipeline (2Captcha → CapSolver, v2/enterprise) and
+   * injects the token / fires the grecaptcha callback so the challenge advances.
+   * Returns true when a token was applied (caller re-checks the resulting state).
+   */
+  async solveLinkedInCheckpoint(page, loginId, extras = {}) {
+    const captchaSolverService = require('./captchaSolverService');
+
+    // LinkedIn embeds reCAPTCHA Enterprise inside a same-origin `captchaInternal`
+    // iframe; the g-recaptcha-response + grecaptcha callback live in THAT frame.
+    // Wait for it (and the nested Google anchor) to load.
+    let captchaFrame = null;
+    let siteKey = null;
+    let enterprise = true;
+    for (let i = 0; i < 8 && !siteKey; i++) {
+      for (const f of page.frames()) {
+        const fu = f.url() || '';
+        if (/captchaInternal/i.test(fu)) captchaFrame = f;
+        const m = fu.match(/recaptcha\/(enterprise|api2)\/(?:anchor|bframe).*?[?&]k=([^&]+)/i);
+        if (m) {
+          siteKey = decodeURIComponent(m[2]);
+          enterprise = /enterprise/i.test(m[1]);
+        }
+      }
+      if (!siteKey) await this.humanLikeDelay(1200, 1800);
+    }
+    if (!captchaFrame) {
+      console.log(`LinkedIn checkpoint: captchaInternal frame not found for ${loginId}`);
+      return false;
+    }
+    if (!siteKey) {
+      // Known LinkedIn checkpoint reCAPTCHA Enterprise site key (fallback).
+      siteKey = '6Lc7CQMTAAAAAIL84V_tPRYEWZtljsJQJZ5jSijw';
+      enterprise = true;
+      console.log(`LinkedIn checkpoint: using fallback site key for ${loginId}`);
+    }
+
+    let token;
+    try {
+      // websiteURL must be the domain root (the internal iframe URL makes
+      // CapSolver fail with 1001); ProxyLess — passing the ProxyBase proxy
+      // trips CapSolver "proxy authentication failed".
+      token = await captchaSolverService.solveCaptcha(
+        siteKey,
+        'https://www.linkedin.com/',
+        'recaptcha_v2',
+        null,
+        { enterprise, invisible: false }
+      );
+    } catch (e) {
+      console.warn(`LinkedIn checkpoint solve failed for ${loginId}: ${e.message}`);
+      return false;
+    }
+    if (!token) return false;
+
+    // Inject the token + fire grecaptcha callback INSIDE the captchaInternal frame.
+    await captchaSolverService.injectCaptchaToken(captchaFrame, token).catch(() => {});
+    console.log(`LinkedIn checkpoint token injected for ${loginId} (${enterprise ? 'enterprise' : 'v2'})`);
+    await this.humanLikeDelay(1500, 2500);
+
+    // Nudge a Submit/Verify inside the frame or top doc if callback didn't submit.
+    const clickSubmit = async (ctx) => {
+      await ctx
+        .evaluate(() => {
+          const btns = [...document.querySelectorAll('button, [role="button"], input[type="submit"]')];
+          const b = btns.find(
+            (x) =>
+              /^(Submit|Verify|Continue|Next|Done)$/i.test((x.innerText || x.value || '').trim()) &&
+              x.offsetParent !== null &&
+              !x.disabled
+          );
+          if (b) b.click();
+        })
+        .catch(() => {});
+    };
+    await clickSubmit(captchaFrame);
+    await clickSubmit(page);
+    await page.waitForLoadState('domcontentloaded', { timeout: 20000 }).catch(() => {});
+    await this.humanLikeDelay(1500, 2500);
+    return true;
+  }
+
   async linkedInLogin(page, email, password, extras = {}) {
     const loginId = email || 'unknown';
     try {
@@ -2197,25 +2280,60 @@ class PlaywrightService {
       }
 
       // 2FA / PIN / authenticator challenge
-      const challenge = await page.evaluate(() => {
-        const text = (document.body?.innerText || '').slice(0, 3500);
-        return {
-          pin: !!document.querySelector(
-            'input[name="pin"], input#input__phone_verification_pin, input[id*="pin" i], input[autocomplete="one-time-code"]'
-          ),
-          totp: /authenticator|verification code|enter the code|security code|two.?step|two.?factor|6.?digit|Enter code|Enter the 6-digit/i.test(text),
-          appPush: /Check your LinkedIn app|notification to your signed-in devices/i.test(text),
-          captcha: /quick security check|verify you.?re human/i.test(text) ||
-            !!document.querySelector('#captcha-internal, .captcha, iframe[src*="captcha"], iframe[src*="arkoselabs"], iframe[src*="funcaptcha"]'),
-          challengeDialog: !!document.querySelector('.challenge-dialog'),
-          snippet: text.split('\n').map((l) => l.trim()).filter(Boolean).slice(0, 8).join(' | '),
-        };
-      }).catch(() => ({}));
+      const detectChallenge = () =>
+        page
+          .evaluate(() => {
+            const text = (document.body?.innerText || '').slice(0, 3500);
+            return {
+              pin: !!document.querySelector(
+                'input[name="pin"], input#input__phone_verification_pin, input[id*="pin" i], input[autocomplete="one-time-code"]'
+              ),
+              totp: /authenticator|verification code|enter the code|security code|two.?step|two.?factor|6.?digit|Enter code|Enter the 6-digit/i.test(text),
+              appPush: /Check your LinkedIn app|notification to your signed-in devices/i.test(text),
+              captcha:
+                /quick security check|verify you.?re human|I.?m not a robot/i.test(text) ||
+                !!document.querySelector(
+                  '#captcha-internal, .captcha, iframe[src*="captcha"], iframe[src*="recaptcha"], iframe[title*="reCAPTCHA" i], iframe[src*="arkoselabs"], iframe[src*="funcaptcha"], [data-sitekey], .g-recaptcha'
+                ),
+              challengeDialog: !!document.querySelector('.challenge-dialog'),
+              snippet: text.split('\n').map((l) => l.trim()).filter(Boolean).slice(0, 8).join(' | '),
+            };
+          })
+          .catch(() => ({}));
+      let challenge = await detectChallenge();
 
       if (challenge.captcha && !challenge.totp && !challenge.pin && !challenge.appPush) {
-        console.log(`LinkedIn captcha for ${loginId}: ${challenge.snippet}`);
-        await page.screenshot({ path: `/tmp/linkedin-captcha-${Date.now()}.png` }).catch(() => {});
-        return false;
+        console.log(`LinkedIn security check (reCAPTCHA) for ${loginId}: ${challenge.snippet}`);
+        const solved = await this.solveLinkedInCheckpoint(page, loginId, extras).catch((e) => {
+          console.warn(`LinkedIn checkpoint solve error for ${loginId}: ${e.message}`);
+          return false;
+        });
+        if (!solved) {
+          await page.screenshot({ path: `/tmp/linkedin-captcha-${Date.now()}.png` }).catch(() => {});
+          return false;
+        }
+        await this.humanLikeDelay(2500, 4500);
+        // Checkpoint clears asynchronously and usually advances to an authenticator
+        // TOTP step — poll until that (or a logged-in URL) appears before re-checking.
+        challenge = await detectChallenge();
+        for (
+          let i = 0;
+          i < 8 &&
+          !challenge.totp &&
+          !challenge.pin &&
+          !challenge.appPush &&
+          !challenge.challengeDialog;
+          i++
+        ) {
+          if (/linkedin\.com\/(feed|in\/|mynetwork|messaging)/i.test(page.url())) break;
+          await this.humanLikeDelay(1500, 2500);
+          challenge = await detectChallenge();
+        }
+        if (challenge.captcha && !challenge.totp && !challenge.pin && !challenge.appPush) {
+          console.log(`LinkedIn checkpoint still present after solve for ${loginId}`);
+          await page.screenshot({ path: `/tmp/linkedin-captcha-post-${Date.now()}.png` }).catch(() => {});
+          return false;
+        }
       }
 
       if ((challenge.pin || challenge.totp || challenge.appPush || challenge.challengeDialog) && extras.totpSecret) {
@@ -2233,25 +2351,38 @@ class PlaywrightService {
           await this.humanLikeDelay(2000, 3500);
         }
 
-        const code = generateTotp(extras.totpSecret);
-        console.log(`LinkedIn 2FA for ${loginId} — submitting TOTP`);
-        let pinInput = await page.waitForSelector(
-          'input[name="pin"], input#input__phone_verification_pin, input[id*="pin" i], input[autocomplete="one-time-code"], input[type="tel"], input[inputmode="numeric"]',
-          { timeout: 15000, state: 'visible' }
-        ).catch(() => null);
-        if (!pinInput) {
-          const handles = await page.$$('input[type="text"], input[type="tel"], input[type="number"], input[inputmode="numeric"]');
-          for (const h of handles) {
-            if (await h.isVisible().catch(() => false)) {
-              pinInput = h;
-              break;
+        const findPinInput = async () => {
+          let el = await page
+            .waitForSelector(
+              'input[name="pin"], input#input__phone_verification_pin, input[id*="pin" i], input[autocomplete="one-time-code"], input[type="tel"], input[inputmode="numeric"]',
+              { timeout: 15000, state: 'visible' }
+            )
+            .catch(() => null);
+          if (!el) {
+            const handles = await page.$$('input[type="text"], input[type="tel"], input[type="number"], input[inputmode="numeric"]');
+            for (const h of handles) {
+              if (await h.isVisible().catch(() => false)) {
+                el = h;
+                break;
+              }
             }
           }
-        }
-        if (pinInput) {
+          return el;
+        };
+
+        const submitTotpOnce = async () => {
+          const pinInput = await findPinInput();
+          if (!pinInput) return 'no_input';
+          // Submit on a fresh TOTP window so typing/latency can't expire the code.
+          if (totpSecondsRemaining() < 8) {
+            await this.humanLikeDelay((totpSecondsRemaining() + 1) * 1000, (totpSecondsRemaining() + 2) * 1000);
+          }
+          const code = generateTotp(extras.totpSecret);
+          if (!/^\d{6}$/.test(code)) return 'bad_code';
+          console.log(`LinkedIn 2FA for ${loginId} — submitting TOTP (${totpSecondsRemaining()}s left)`);
           await pinInput.click({ force: true });
           await pinInput.fill('');
-          await pinInput.type(code, { delay: 40 });
+          await pinInput.type(code, { delay: 60 });
           await this.humanLikeDelay(400, 900);
           await page.evaluate(() => {
             const buttons = [...document.querySelectorAll('button, [role="button"]')];
@@ -2264,12 +2395,48 @@ class PlaywrightService {
               if (submit) submit.click();
             }
           });
-          await this.humanLikeDelay(4000, 7000);
-        } else {
+          await this.humanLikeDelay(3000, 4500);
+          // The post-2FA redirect can take several seconds (blank/spinner while
+          // LinkedIn establishes the session). Poll until it settles into a
+          // logged-in URL, a wrong-code error, or a persistent challenge — do NOT
+          // navigate away early (that abandons an in-flight login).
+          await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+          for (let i = 0; i < 12; i++) {
+            const state = await page
+              .evaluate(() => {
+                const text = (document.body?.innerText || '').slice(0, 2000);
+                return {
+                  wrong: /that.?s not the right code|isn.?t correct|incorrect|try again|didn.?t work|wrong code|enter a valid/i.test(text),
+                  prompt: !!document.querySelector(
+                    'input[name="pin"], input[autocomplete="one-time-code"], input[id*="pin" i]'
+                  ),
+                  loggedIn: /Start a post|Messaging|My Network|Notifications/i.test(text),
+                  url: location.href,
+                };
+              })
+              .catch(() => ({}));
+            const u = state.url || page.url();
+            if (/linkedin\.com\/(feed|in\/|mynetwork|messaging)/i.test(u) || state.loggedIn) return 'ok';
+            if (state.wrong) return 'wrong';
+            if (!state.prompt && !/checkpoint|\/login/i.test(u)) return 'ok';
+            await this.humanLikeDelay(1500, 2200);
+          }
+          return 'retry';
+        };
+
+        let totpResult = await submitTotpOnce();
+        if (totpResult === 'no_input') {
           console.log(`LinkedIn 2FA input missing for ${loginId}`);
           await page.screenshot({ path: `/tmp/linkedin-2fa-missing-${Date.now()}.png` }).catch(() => {});
           return false;
         }
+        // Retry once with a fresh window if the first code was rejected / not consumed.
+        if (totpResult === 'wrong' || totpResult === 'retry') {
+          console.log(`LinkedIn 2FA retry for ${loginId} (prev=${totpResult})`);
+          await this.humanLikeDelay((totpSecondsRemaining() + 1) * 1000, (totpSecondsRemaining() + 2) * 1000);
+          totpResult = await submitTotpOnce();
+        }
+        await page.screenshot({ path: `/tmp/linkedin-post-totp-${loginId}-${Date.now()}.png` }).catch(() => {});
       } else if (challenge.pin || challenge.totp || challenge.appPush || challenge.challengeDialog) {
         console.log(`LinkedIn challenge without TOTP secret for ${loginId}: ${challenge.snippet}`);
         await page.screenshot({ path: `/tmp/linkedin-challenge-${Date.now()}.png` }).catch(() => {});
