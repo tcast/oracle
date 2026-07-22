@@ -4131,15 +4131,16 @@ class PlaywrightService {
     }
 
     // Prefer native filechooser from the clicked control — no ambiguous input[0] fallback.
+    // Attach catch on the waiter FIRST so a missed chooser never becomes an unhandled rejection.
     let usedChooser = false;
-    try {
-      const chooserPromise = page.waitForEvent('filechooser', { timeout: 8000 });
-      await btn.click();
-      const chooser = await chooserPromise;
+    const chooserPromise = page
+      .waitForEvent('filechooser', { timeout: 8000 })
+      .catch(() => null);
+    await btn.click().catch(() => {});
+    const chooser = await chooserPromise;
+    if (chooser) {
       await chooser.setFiles(filePath);
       usedChooser = true;
-    } catch {
-      // Fall through to classified input resolution
     }
 
     if (!usedChooser) {
@@ -4158,6 +4159,39 @@ class PlaywrightService {
    */
   async _resolveXProfileMediaInput(page, kind, preferredBtn = null) {
     const wantBanner = kind === 'banner';
+
+    // Best fallback: file input nested under / beside the control we already clicked.
+    if (preferredBtn) {
+      const related = await preferredBtn.evaluateHandle((btn) => {
+        let n = btn;
+        for (let i = 0; i < 8 && n; i++) {
+          const input = n.querySelector && n.querySelector('input[type="file"]');
+          if (input) return input;
+          n = n.parentElement;
+        }
+        const root = btn.closest?.('[role="dialog"]') || document;
+        // Among dialog inputs, pick the one closest to this button in DOM order near banner/avatar region
+        return null;
+      });
+      const el = related && related.asElement ? related.asElement() : null;
+      if (el) {
+        const lab = await el
+          .evaluate((input) => {
+            let n = input;
+            for (let i = 0; i < 10 && n; i++) {
+              const a = n.getAttribute && n.getAttribute('aria-label');
+              if (a) return a;
+              n = n.parentElement;
+            }
+            return '';
+          })
+          .catch(() => '');
+        const bad =
+          (wantBanner && /avatar|profile photo|profile picture/i.test(lab) && !/banner|header/i.test(lab)) ||
+          (!wantBanner && /banner|header/i.test(lab) && !/avatar|profile photo/i.test(lab));
+        if (!bad) return el;
+      }
+    }
 
     const handle = await page.evaluateHandle(
       ({ wantBannerInner }) => {
