@@ -3225,6 +3225,9 @@ class PlaywrightService {
       return { displayName, bio, avatarSrc, isDefaultAvatar };
     });
 
+    // Proof artifact: primary-column header BEFORE opening edit modal
+    await page.screenshot({ path: `/tmp/x-persona-verify-header-${accountId || 'x'}.png` }).catch(() => {});
+
     // Authoritative: open Edit profile and read Name / Bio INPUT values
     const editBtn =
       (await page.$('[data-testid="editProfileButton"], [aria-label="Edit profile"]')) ||
