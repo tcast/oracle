@@ -237,7 +237,7 @@ async function main() {
     if (opts.profile) {
       const persona = personaFor(acct.id, acct.email);
       console.log(`profile: building ${persona.title} @ ${persona.company}`);
-      profileResult = await playwrightService.updateLinkedInHiringPersona(acct.id, persona, { requireProxy: false })
+      profileResult = await playwrightService.updateLinkedInHiringPersona(acct.id, persona, { requireProxy: true })
         .catch((e) => ({ success: false, error: e.message }));
       console.log(`profile: ${JSON.stringify({ ok: profileResult.success, steps: profileResult.steps, err: (profileResult.error || '').slice(0, 60) })}`);
 
@@ -246,7 +246,7 @@ async function main() {
       if (!enr.photo) {
         const portrait = findPortrait(acct.username);
         if (portrait) {
-          const ph = await playwrightService.updateLinkedInProfilePhoto(acct.id, portrait, { requireProxy: false }).catch((e) => ({ success: false, error: e.message }));
+          const ph = await playwrightService.updateLinkedInProfilePhoto(acct.id, portrait, { requireProxy: true }).catch((e) => ({ success: false, error: e.message }));
           console.log(`photo: ${JSON.stringify({ ok: ph.success, err: (ph.error || '').slice(0, 50) })}`);
         } else {
           console.log('photo: no portrait in pool — skip');
@@ -256,7 +256,7 @@ async function main() {
       if (!enr2.banner) {
         const banner = findBanner(acct.id);
         if (banner) {
-          const bn = await playwrightService.updateLinkedInProfileBanner(acct.id, banner, { requireProxy: false }).catch((e) => ({ success: false, error: e.message }));
+          const bn = await playwrightService.updateLinkedInProfileBanner(acct.id, banner, { requireProxy: true }).catch((e) => ({ success: false, error: e.message }));
           console.log(`banner: ${JSON.stringify({ ok: bn.success, err: (bn.error || '').slice(0, 50) })}`);
         } else {
           console.log('banner: no scenic banner in pool — skip');

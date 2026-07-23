@@ -2388,7 +2388,34 @@ class PlaywrightService {
       }).catch(() => false);
       if (switchedToAuthenticator) {
         console.log(`LinkedIn ${loginId}: switched from app-push to authenticator`);
-        await this.humanLikeDelay(2000, 3500);
+        // LinkedIn shows a blank spinner for several seconds before the PIN form.
+        // Do NOT race detectChallenge here — wait until pin input or authenticator copy appears.
+        let pinReady = false;
+        for (let i = 0; i < 20; i++) {
+          await this.humanLikeDelay(1500, 2200);
+          pinReady = await page
+            .evaluate(() => {
+              const text = (document.body?.innerText || '').slice(0, 2500);
+              const hasPin = !!document.querySelector(
+                'input[name="pin"], input#input__phone_verification_pin, input[id*="pin" i], input[autocomplete="one-time-code"]'
+              );
+              const hasAuthCopy = /Enter the code you see on your authenticator|authenticator app/i.test(text);
+              const stillSpinner =
+                !hasPin &&
+                !hasAuthCopy &&
+                !/Check your LinkedIn app/i.test(text) &&
+                (document.body?.innerText || '').trim().length < 40;
+              return hasPin || (hasAuthCopy && !stillSpinner);
+            })
+            .catch(() => false);
+          if (pinReady) {
+            console.log(`LinkedIn ${loginId}: authenticator PIN UI ready (wait ~${(i + 1) * 2}s)`);
+            break;
+          }
+        }
+        if (!pinReady) {
+          console.warn(`LinkedIn ${loginId}: authenticator PIN UI never appeared after app-push switch`);
+        }
       }
 
       // 2FA / PIN / authenticator challenge
