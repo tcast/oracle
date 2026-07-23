@@ -44,12 +44,15 @@ class PlaywrightService {
       try { profile = JSON.parse(profile); } catch { profile = null; }
     }
 
-    // Reassign if missing, or if we must force desktop but currently have mobile
+    // Reassign if missing, or if we must force desktop but currently have mobile.
+    // Exception: cookie imports that pinned an export UA (sticky_import_ua) —
+    // flipping Android→desktop mid-session is worse than a stable mobile spoof.
+    const stickyImportUa = !!(profile && profile.sticky_import_ua);
     const needsReassign =
       !profile ||
       !profile.userAgent ||
       !profile.viewport ||
-      (forceDesktop && profile.platform === 'android');
+      (forceDesktop && profile.platform === 'android' && !stickyImportUa);
 
     if (!needsReassign) {
       return profile;
@@ -201,6 +204,7 @@ class PlaywrightService {
       });
 
       const fp = {
+        userAgent,
         maxTouchPoints: profile.maxTouchPoints ?? (hasTouch ? 5 : 0),
         hardwareConcurrency: profile.hardwareConcurrency || 8,
         deviceMemory: profile.deviceMemory || 8,
@@ -212,6 +216,16 @@ class PlaywrightService {
 
       await context.addInitScript((fp) => {
         Object.defineProperty(navigator, 'webdriver', { get: () => false });
+
+        // Alpine/system Chromium often ignores context userAgent; pin it explicitly.
+        if (fp.userAgent) {
+          try {
+            Object.defineProperty(navigator, 'userAgent', { get: () => fp.userAgent });
+            Object.defineProperty(navigator, 'appVersion', {
+              get: () => fp.userAgent.replace(/^Mozilla\//, ''),
+            });
+          } catch (_) { /* ignore */ }
+        }
 
         Object.defineProperty(navigator, 'plugins', {
           get: () => (fp.isMobile ? [] : [
@@ -429,17 +443,28 @@ class PlaywrightService {
 
         // Prefer Android for mobile ProxyBase pools — except X, whose mobile web
         // aggressively pushes the app and breaks login/automation.
+        // Cookie imports with sticky_import_ua keep their export fingerprint.
         let preferMobile = false;
         let forceDesktop = !!forceDesktopOpt;
         try {
           const account = await this.getAccount(accountId);
-          forceDesktop =
-            forceDesktop ||
-            account.platform === 'x' ||
-            account.platform === 'instagram' ||
-            account.platform === 'linkedin' ||
-            account.platform === 'tiktok';
-          if (!forceDesktop) {
+          let dp = account.device_profile;
+          if (typeof dp === 'string') {
+            try { dp = JSON.parse(dp); } catch { dp = null; }
+          }
+          const stickyImportUa = !!(dp && dp.sticky_import_ua);
+          if (!stickyImportUa) {
+            forceDesktop =
+              forceDesktop ||
+              account.platform === 'x' ||
+              account.platform === 'instagram' ||
+              account.platform === 'linkedin' ||
+              account.platform === 'tiktok';
+          } else {
+            forceDesktop = false;
+            preferMobile = dp.platform === 'android';
+          }
+          if (!forceDesktop && !stickyImportUa) {
             const proxies = await proxyService.getAccountProxies(accountId, false);
             preferMobile = proxies.some((p) => proxyService.isMobileProxy(p));
           }
@@ -2686,7 +2711,7 @@ class PlaywrightService {
         return result.page;
       };
 
-      let page = await openBrowser(false);
+      let page = await openBrowser(!!requireProxy);
 
       // Prefer restored session (avoids LinkedIn captcha on re-login).
       // Fall back to fresh login only if /in/me/ lands on authwall.
@@ -2707,6 +2732,9 @@ class PlaywrightService {
       }
 
       if (!loggedIn) {
+        if (requireProxy) {
+          throw new Error('no_live_session — refusing password login (requireProxy cookie-only path)');
+        }
         await page.goto('https://www.linkedin.com/login', {
           waitUntil: 'domcontentloaded',
           timeout: 60000,
@@ -2994,7 +3022,7 @@ class PlaywrightService {
         return result.page;
       };
 
-      let page = await openBrowser(false);
+      let page = await openBrowser(!!requireProxy);
       let loggedIn = false;
       const restored = await this.restoreSession(page, 'linkedin', accountId);
       if (restored) {
@@ -3010,6 +3038,9 @@ class PlaywrightService {
       }
 
       if (!loggedIn) {
+        if (requireProxy) {
+          throw new Error('no_live_session — refusing password login (requireProxy cookie-only path)');
+        }
         await page.goto('https://www.linkedin.com/login', {
           waitUntil: 'domcontentloaded',
           timeout: 60000,
@@ -3620,7 +3651,14 @@ class PlaywrightService {
         return result.page;
       };
 
-      let page = await openBrowser(false);
+      let page;
+      // Always prefer proxy for LinkedIn profile writes when requireProxy is set;
+      // never hit LinkedIn from the host IP on live accounts.
+      if (requireProxy) {
+        page = await openBrowser(true);
+      } else {
+        page = await openBrowser(false);
+      }
       let loggedIn = false;
       const restored = await this.restoreSession(page, 'linkedin', accountId);
       if (restored) {
@@ -3632,8 +3670,11 @@ class PlaywrightService {
         if (!/authwall|\/login|\/signup|\/uas\//i.test(page.url())) loggedIn = true;
       }
       if (!loggedIn) {
+        if (requireProxy) {
+          throw new Error('no_live_session — refusing password login (requireProxy cookie-only path)');
+        }
         loggedIn = await this.performLogin(page, 'linkedin', loginEmail, password, extras);
-        if (!loggedIn && !requireProxy) {
+        if (!loggedIn) {
           page = await openBrowser(true);
           loggedIn = await this.performLogin(page, 'linkedin', loginEmail, password, extras);
         }
@@ -8229,7 +8270,7 @@ class PlaywrightService {
 
   async getAccount(accountId) {
     const result = await pool.query(
-      'SELECT id, username, email, credentials, platform, status, is_simulated FROM social_accounts WHERE id = $1',
+      'SELECT id, username, email, credentials, platform, status, is_simulated, device_profile FROM social_accounts WHERE id = $1',
       [accountId]
     );
     if (result.rows.length === 0) {
