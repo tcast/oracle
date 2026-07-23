@@ -100,10 +100,29 @@ async function enableFollowOnly(id, index) {
 
 async function disableOpsOrganic(id) {
   await organicCommentService.setAccountEnabled(id, false).catch(() => {});
+  // Hold flag stops brain enrollOrganicGap from flipping these back on.
+  await pool.query(
+    `UPDATE social_accounts
+     SET credentials = jsonb_set(
+           COALESCE(credentials, '{}'::jsonb),
+           '{organic_hold}',
+           'true'::jsonb,
+           true
+         ),
+         updated_at = NOW()
+     WHERE id = $1`,
+    [id]
+  );
   await pool
-    .query(`UPDATE organic_comment_jobs SET enabled = false, updated_at = NOW() WHERE social_account_id = $1`, [
-      id,
-    ])
+    .query(
+      `UPDATE organic_comment_jobs
+       SET enabled = false,
+           failure_class = 'manual_hold',
+           last_error = 'connect-only hold for new LinkedIn batch',
+           updated_at = NOW()
+       WHERE social_account_id = $1`,
+      [id]
+    )
     .catch(() => {});
 }
 

@@ -493,7 +493,8 @@ class AccountOpsBrainService {
          AND COALESCE(sa.is_simulated, false) = false
          AND lower(sa.platform) = ANY($1::text[])
          AND COALESCE(j.enabled, false) = false
-         AND COALESCE(j.failure_class, '') NOT IN ('banned', 'session_dead', 'bad_credentials')
+         AND COALESCE(j.failure_class, '') NOT IN ('banned', 'session_dead', 'bad_credentials', 'manual_hold')
+         AND COALESCE(sa.credentials->>'organic_hold', '') <> 'true'
          AND EXISTS (
            SELECT 1 FROM social_account_proxies sap
            JOIN proxies p ON p.id = sap.proxy_id
