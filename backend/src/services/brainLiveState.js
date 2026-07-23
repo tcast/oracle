@@ -166,17 +166,41 @@ class BrainLiveState extends EventEmitter {
       started_at: started?.started_at || null,
       finished_at,
       slot,
+      meta: action.meta && typeof action.meta === 'object' ? action.meta : undefined,
     };
     this.inFlight.delete(slot);
     this._pushRecent(evt);
     this.publish('action_end', { event: evt, action: { ...evt, status: 'done' } });
     try {
       const activityEventService = require('./activityEventService');
-      activityEventService.logBrainEvent({ ...evt, link: action.link || null }).catch(() => {});
+      activityEventService
+        .logBrainEvent({ ...evt, link: action.link || null, meta: action.meta || evt.meta })
+        .catch(() => {});
     } catch (_) {
       /* activity log must never break brain */
     }
     return evt;
+  }
+
+  /**
+   * Increment a short-lived Redis counter so brain can see error-class spikes.
+   * Key: brain:err:{platform}:{class} TTL 1h.
+   */
+  async bumpErrorClass(platform, failureClass) {
+    const plat = String(platform || 'unknown').toLowerCase();
+    const cls = String(failureClass || 'other').toLowerCase();
+    const key = `brain:err:${plat}:${cls}`;
+    const redis = this._redisClient();
+    if (!redis) return null;
+    try {
+      if (redis.status !== 'ready') await redis.connect().catch(() => {});
+      const n = await redis.incr(key);
+      if (n === 1) await redis.expire(key, 3600);
+      return n;
+    } catch (err) {
+      console.warn('bumpErrorClass failed:', err.message);
+      return null;
+    }
   }
 
   /** Full snapshot for GET /live and SSE connect. */

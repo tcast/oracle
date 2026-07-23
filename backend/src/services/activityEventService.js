@@ -183,6 +183,37 @@ class ActivityEventService {
     if (!link && action === 'profile_updated' && evt.username) {
       link = profileLink(platform, evt.username);
     }
+
+    let errorClass = evt.meta?.error_class || evt.error_class || null;
+    let proxySignal = evt.meta?.proxy_signal || null;
+    let proxyId = evt.meta?.proxy_id != null ? evt.meta.proxy_id : null;
+    const detailRaw = evt.reason || evt.detail || null;
+    if (!errorClass && detailRaw) {
+      try {
+        const { classifyFailure, proxySignalFromMessage } = require('./failureClassifier');
+        errorClass = classifyFailure(detailRaw);
+        proxySignal = proxySignal || proxySignalFromMessage(detailRaw);
+      } catch (_) {
+        /* classifier optional */
+      }
+    }
+
+    if (evt.account_id != null && proxyId == null) {
+      try {
+        const pr = await pool.query(
+          `SELECT proxy_id FROM social_account_proxies
+           WHERE social_account_id = $1 AND is_active = true
+           ORDER BY id DESC LIMIT 1`,
+          [evt.account_id]
+        );
+        proxyId = pr.rows[0]?.proxy_id ?? null;
+      } catch (_) {
+        /* ignore */
+      }
+    }
+
+    const detail = detailRaw ? String(detailRaw).slice(0, 500) : null;
+
     return this.log({
       occurred_at: evt.finished_at || evt.at || new Date(),
       platform,
@@ -191,11 +222,14 @@ class ActivityEventService {
       username: evt.username,
       result: status,
       link,
-      detail: evt.reason || evt.detail || null,
+      detail,
       meta: {
         brain_action: actionType,
         ms: evt.ms,
         slot: evt.slot,
+        error_class: errorClass,
+        proxy_signal: proxySignal,
+        proxy_id: proxyId,
         ...(evt.meta || {}),
       },
       source: 'brain',

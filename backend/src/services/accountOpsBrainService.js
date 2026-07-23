@@ -56,10 +56,19 @@ class AccountOpsBrainService {
   }
 
   _classifyResult(result) {
-    if (result?.skipped || result?.reason === 'profile_soft_skip_24h') {
+    if (
+      result?.skipped ||
+      result?.reason === 'profile_soft_skip_24h' ||
+      result?.reason === 'soft_skip' ||
+      (result?.failure_class &&
+        ['proxy_error', 'tunnel_flake'].includes(String(result.failure_class)))
+    ) {
       return {
         status: 'soft_skip',
-        reason: String(result.reason || result.error || 'skipped').slice(0, 160),
+        reason: String(result.reason || result.error || result.failure_class || 'skipped').slice(
+          0,
+          160
+        ),
       };
     }
     if (result?.success === false || result?.error) {
@@ -817,6 +826,8 @@ class AccountOpsBrainService {
     const lastAccept = account.last_accept_at ? new Date(account.last_accept_at).getTime() : 0;
     const lastDiscover = account.last_discover_at ? new Date(account.last_discover_at).getTime() : 0;
     const acceptsToday = account.accepts_today || 0;
+    const followCooldownActive =
+      account.follow_cooldown && new Date(account.follow_cooldown).getTime() > now;
     // Reddit has no follow-request inbox — accept only for X / LinkedIn.
     const acceptPlatform = platform === 'x' || platform === 'linkedin';
     const followPlatform = platform === 'x' || platform === 'linkedin' || platform === 'reddit';
@@ -824,6 +835,7 @@ class AccountOpsBrainService {
     if (
       acceptPlatform &&
       !quietFollow &&
+      !followCooldownActive &&
       acceptsToday < 10 &&
       (!lastAccept || now - lastAccept > sixHours) &&
       Math.random() < 0.35
@@ -834,6 +846,7 @@ class AccountOpsBrainService {
     if (
       followPlatform &&
       !quietFollow &&
+      !followCooldownActive &&
       (!lastDiscover || now - lastDiscover > 12 * 60 * 60 * 1000) &&
       Math.random() < 0.3
     ) {
@@ -844,7 +857,7 @@ class AccountOpsBrainService {
       followPlatform &&
       !quietFollow &&
       account.follow_enabled !== false &&
-      (!account.follow_cooldown || new Date(account.follow_cooldown).getTime() <= now) &&
+      !followCooldownActive &&
       (!account.follow_due || new Date(account.follow_due).getTime() <= now) &&
       (account.follows_today || 0) < (account.follow_target || 5);
 
@@ -1025,6 +1038,10 @@ class AccountOpsBrainService {
         ms: Date.now() - started,
       };
       const cls = this._classifyResult(out);
+      const endMeta = {};
+      if (out.failure_class) endMeta.error_class = out.failure_class;
+      if (out.proxy_signal) endMeta.proxy_signal = out.proxy_signal;
+      if (out.proxy_id != null) endMeta.proxy_id = out.proxy_id;
       brainLiveState.actionEnd({
         slot,
         account_id: account.id,
@@ -1043,10 +1060,63 @@ class AccountOpsBrainService {
             ? `https://www.reddit.com/user/${out.handle}/`
             : null) ||
           null,
+        meta: Object.keys(endMeta).length ? endMeta : undefined,
       });
+      if (out.failure_class && (cls.status === 'soft_skip' || cls.status === 'fail')) {
+        brainLiveState.bumpErrorClass(platform, out.failure_class).catch(() => {});
+      }
       return out;
     } catch (err) {
       const msg = err?.message || String(err);
+      const { classifyFailure, isTransientProxyFailure, proxySignalFromMessage } = require('./failureClassifier');
+      const failureClass = classifyFailure(msg);
+      // Proxy/tunnel flakes must never be treated as ban/session_dead.
+      if (isTransientProxyFailure(failureClass)) {
+        try {
+          const plat = this._platformKey(account);
+          const svc =
+            plat === 'linkedin'
+              ? linkedinFollowService
+              : plat === 'reddit'
+                ? redditFollowService
+                : xFollowService;
+          if (svc?.ensureJob && svc?.applyFailureQuarantine) {
+            const job = await svc.ensureJob(account.id);
+            await svc.applyFailureQuarantine(job, msg);
+          }
+        } catch (e) {
+          console.warn('Brain proxy soft-skip failed:', e.message);
+        }
+        const out = {
+          type: action.type,
+          accountId: account.id,
+          username: account.username,
+          platform: account.platform,
+          success: false,
+          skipped: true,
+          reason: 'soft_skip',
+          error: msg.slice(0, 300),
+          failure_class: failureClass,
+          proxy_signal: proxySignalFromMessage(msg),
+          ms: Date.now() - started,
+        };
+        brainLiveState.actionEnd({
+          slot,
+          account_id: account.id,
+          username: account.username,
+          platform,
+          action_type: actionType,
+          status: 'soft_skip',
+          reason: out.error,
+          ms: out.ms,
+          meta: {
+            error_class: failureClass,
+            proxy_signal: out.proxy_signal,
+          },
+        });
+        brainLiveState.bumpErrorClass(platform, failureClass).catch(() => {});
+        return out;
+      }
       if (/no_live_session|session_not_logged_in|cookie_session_dead/i.test(msg)) {
         try {
           // LinkedIn owned accounts with passwords: cookie expiry is recoverable via
@@ -1065,7 +1135,7 @@ class AccountOpsBrainService {
         } catch (e) {
           console.warn('Brain markDeadSession failed:', e.message);
         }
-      } else if (/banned|suspended|locked|challenge/i.test(msg)) {
+      } else if (/banned|suspended|locked/i.test(msg) && !/challenge/i.test(msg)) {
         try {
           await organicCommentService.markBannedAccount(account.id, `ops_brain: ${msg}`);
         } catch (e) {
@@ -1079,6 +1149,8 @@ class AccountOpsBrainService {
         platform: account.platform,
         success: false,
         error: msg.slice(0, 300),
+        failure_class: failureClass,
+        proxy_signal: proxySignalFromMessage(msg),
         ms: Date.now() - started,
       };
       brainLiveState.actionEnd({
@@ -1090,7 +1162,12 @@ class AccountOpsBrainService {
         status: 'fail',
         reason: out.error,
         ms: out.ms,
+        meta: {
+          error_class: failureClass,
+          proxy_signal: out.proxy_signal,
+        },
       });
+      brainLiveState.bumpErrorClass(platform, failureClass).catch(() => {});
       return out;
     } finally {
       lockedAccounts.delete(account.id);

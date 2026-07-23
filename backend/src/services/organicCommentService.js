@@ -6,7 +6,7 @@ const organicDiscoveryService = require('./organicDiscoveryService');
 const commentingService = require('./commentingService');
 const { scoreAiLikeness, scoreSpamSignals } = require('./campaignReputationService');
 const { generationCompletionOptions } = require('../config/openaiModels');
-const { classifyFailure, cooldownUntil } = require('./failureClassifier');
+const { classifyFailure, cooldownUntil, isTransientProxyFailure } = require('./failureClassifier');
 
 const BAD_OPENERS = [
   /^great post[!.,\s]/i,
@@ -548,7 +548,27 @@ Write only the comment text.`;
       return { failureClass, consecutive, until, disable: true };
     }
 
-    // Transient login/proxy flakes: quarantine only, do not permanently kill.
+    // Transient proxy/tunnel flakes: short soft-skip, do not burn the account.
+    if (isTransientProxyFailure(failureClass)) {
+      await pool.query(
+        `UPDATE organic_comment_jobs
+         SET status = 'idle',
+             last_error = $2,
+             failure_class = $3,
+             consecutive_failures = $4,
+             cooldown_until = $5,
+             next_due_at = $5,
+             updated_at = NOW()
+         WHERE id = $1`,
+        [job.id, errorMessage, failureClass, consecutive, until]
+      );
+      console.warn(
+        `Account job ${job.social_account_id} soft-skip ${failureClass} until ${until.toISOString()}`
+      );
+      return { failureClass, consecutive, until, disable: false, soft_skip: true };
+    }
+
+    // Transient login flakes: quarantine only, do not permanently kill.
 
     await pool.query(
       `UPDATE organic_comment_jobs

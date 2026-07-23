@@ -1,7 +1,7 @@
 const pool = require('./db');
 const playwrightService = require('./playwrightService');
 const proxyService = require('./proxyService');
-const { classifyFailure, cooldownUntil } = require('./failureClassifier');
+const { classifyFailure, cooldownUntil, isTransientProxyFailure } = require('./failureClassifier');
 
 /**
  * Reddit outbound follow campaign.
@@ -306,7 +306,7 @@ class RedditFollowService {
       failureClass === 'banned';
 
     // Tunnel / proxy flakes: soft-skip, do not long-quarantine.
-    if (failureClass === 'proxy_error') {
+    if (isTransientProxyFailure(failureClass)) {
       return this.softSkipJob(job, errorMessage);
     }
 

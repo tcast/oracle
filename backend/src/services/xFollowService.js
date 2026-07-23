@@ -1,7 +1,13 @@
 const pool = require('./db');
 const playwrightService = require('./playwrightService');
 const proxyService = require('./proxyService');
-const { classifyFailure, cooldownUntil } = require('./failureClassifier');
+const {
+  classifyFailure,
+  cooldownUntil,
+  isTransientProxyFailure,
+  softSkipMinutes,
+  proxySignalFromMessage,
+} = require('./failureClassifier');
 
 class XFollowService {
   async getSettings() {
@@ -284,37 +290,53 @@ class XFollowService {
    * Deduped insert into x_follow_targets.
    */
   async discoverTargetsForAccount(account, { limit = 12 } = {}) {
-    const keywords = this.getDiscoveryKeywords(account);
-    const seeds = await pool.query(
-      `SELECT handle FROM x_follow_targets
-       WHERE enabled = true AND category IN ('sports','dfs','tech','discovered')
-       ORDER BY priority ASC, random()
-       LIMIT 3`
-    );
-    const result = await playwrightService.discoverXFollowTargets(account.id, {
-      keywords,
-      seedHandles: seeds.rows.map((r) => r.handle),
-      limit,
-      requireProxy: true,
-    });
-    const inserted = await this.insertDiscoveredTargets(result.targets || [], {
-      category: 'discovered',
-      priority: 75,
-    });
-    await pool.query(
-      `UPDATE x_follow_jobs
-       SET last_discover_at = NOW(), updated_at = NOW()
-       WHERE social_account_id = $1`,
-      [account.id]
-    ).catch(() => {});
-    return {
-      success: true,
-      accountId: account.id,
-      keywords,
-      found: (result.targets || []).length,
-      inserted,
-      sample: (result.targets || []).slice(0, 5).map((t) => t.handle),
-    };
+    const job = await this.ensureJob(account.id);
+    try {
+      const keywords = this.getDiscoveryKeywords(account);
+      const seeds = await pool.query(
+        `SELECT handle FROM x_follow_targets
+         WHERE enabled = true AND category IN ('sports','dfs','tech','discovered')
+         ORDER BY priority ASC, random()
+         LIMIT 3`
+      );
+      const result = await playwrightService.discoverXFollowTargets(account.id, {
+        keywords,
+        seedHandles: seeds.rows.map((r) => r.handle),
+        limit,
+        requireProxy: true,
+      });
+      const inserted = await this.insertDiscoveredTargets(result.targets || [], {
+        category: 'discovered',
+        priority: 75,
+      });
+      await pool.query(
+        `UPDATE x_follow_jobs
+         SET last_discover_at = NOW(), updated_at = NOW()
+         WHERE social_account_id = $1`,
+        [account.id]
+      ).catch(() => {});
+      return {
+        success: true,
+        accountId: account.id,
+        keywords,
+        found: (result.targets || []).length,
+        inserted,
+        sample: (result.targets || []).slice(0, 5).map((t) => t.handle),
+      };
+    } catch (error) {
+      const msg = error.message || String(error);
+      const q = await this.applyFailureQuarantine(job, msg);
+      return {
+        success: false,
+        skipped: isTransientProxyFailure(q.failureClass),
+        reason: isTransientProxyFailure(q.failureClass) ? 'soft_skip' : 'error',
+        accountId: account.id,
+        error: msg,
+        failure_class: q.failureClass,
+        proxy_signal: proxySignalFromMessage(msg),
+        next_due_at: q.until,
+      };
+    }
   }
 
   /**
@@ -340,40 +362,55 @@ class XFollowService {
       return { skipped: true, reason: 'accept_daily_cap', acceptsToday };
     }
 
-    const room = Math.min(maxAccept, dailyCap - acceptsToday);
-    const result = await playwrightService.acceptXFollowRequests(account.id, {
-      maxAccept: room,
-      requireProxy: true,
-    });
+    try {
+      const room = Math.min(maxAccept, dailyCap - acceptsToday);
+      const result = await playwrightService.acceptXFollowRequests(account.id, {
+        maxAccept: room,
+        requireProxy: true,
+      });
 
-    const n = result.accepted || 0;
-    if (n > 0) {
-      await pool.query(
-        `UPDATE x_follow_jobs
-         SET accepts_today = COALESCE(accepts_today, 0) + $2,
-             accepts_day_key = CURRENT_DATE,
-             last_accept_at = NOW(),
-             updated_at = NOW()
-         WHERE social_account_id = $1`,
-        [account.id, n]
-      ).catch(() => {});
-    } else {
-      await pool.query(
-        `UPDATE x_follow_jobs
-         SET last_accept_at = NOW(), updated_at = NOW()
-         WHERE social_account_id = $1`,
-        [account.id]
-      ).catch(() => {});
+      const n = result.accepted || 0;
+      if (n > 0) {
+        await pool.query(
+          `UPDATE x_follow_jobs
+           SET accepts_today = COALESCE(accepts_today, 0) + $2,
+               accepts_day_key = CURRENT_DATE,
+               last_accept_at = NOW(),
+               updated_at = NOW()
+           WHERE social_account_id = $1`,
+          [account.id, n]
+        ).catch(() => {});
+      } else {
+        await pool.query(
+          `UPDATE x_follow_jobs
+           SET last_accept_at = NOW(), updated_at = NOW()
+           WHERE social_account_id = $1`,
+          [account.id]
+        ).catch(() => {});
+      }
+
+      return {
+        success: true,
+        accountId: account.id,
+        accepted: n,
+        empty: !!result.empty,
+        screenshots: result.screenshots || [],
+        acceptsToday: acceptsToday + n,
+      };
+    } catch (error) {
+      const msg = error.message || String(error);
+      const q = await this.applyFailureQuarantine(job, msg);
+      return {
+        success: false,
+        skipped: isTransientProxyFailure(q.failureClass),
+        reason: isTransientProxyFailure(q.failureClass) ? 'soft_skip' : 'error',
+        accountId: account.id,
+        error: msg,
+        failure_class: q.failureClass,
+        proxy_signal: proxySignalFromMessage(msg),
+        next_due_at: q.until,
+      };
     }
-
-    return {
-      success: true,
-      accountId: account.id,
-      accepted: n,
-      empty: !!result.empty,
-      screenshots: result.screenshots || [],
-      acceptsToday: acceptsToday + n,
-    };
   }
 
   /**
@@ -426,6 +463,33 @@ class XFollowService {
     return result.rows[0] || null;
   }
 
+  async softSkipJob(job, reason, failureClass = 'proxy_error') {
+    const softMins = softSkipMinutes(failureClass);
+    const until = new Date(Date.now() + softMins * 60 * 1000);
+    const consecutive = (job.consecutive_failures || 0) + 1;
+    await pool.query(
+      `UPDATE x_follow_jobs
+       SET status = 'idle',
+           last_error = $2,
+           failure_class = $3,
+           consecutive_failures = $4,
+           cooldown_until = $5,
+           next_due_at = $5,
+           updated_at = NOW()
+       WHERE id = $1`,
+      [job.id, String(reason).slice(0, 1000), failureClass, consecutive, until]
+    );
+    return {
+      skipped: true,
+      reason: 'soft_skip',
+      error: reason,
+      failureClass,
+      consecutive,
+      until,
+      disable: false,
+    };
+  }
+
   async applyFailureQuarantine(job, errorMessage) {
     const failureClass = classifyFailure(errorMessage);
     const consecutive = (job.consecutive_failures || 0) + 1;
@@ -434,6 +498,26 @@ class XFollowService {
       failureClass === 'bad_credentials' ||
       failureClass === 'session_dead' ||
       failureClass === 'banned';
+
+    // Tunnel / proxy flakes: soft-skip 15–30m, never mark session_dead / ban.
+    if (isTransientProxyFailure(failureClass)) {
+      const soft = await this.softSkipJob(job, errorMessage, failureClass);
+      try {
+        const oxylabsStickyService = require('./oxylabsStickyService');
+        const rotated = await oxylabsStickyService.rotateStickyForAccount(job.social_account_id, {
+          failureClass,
+        });
+        soft.proxy_rotated = !!rotated?.rotated;
+        soft.rotate_reason = rotated?.reason || null;
+      } catch (e) {
+        console.warn('X Oxylabs rotate after proxy flake failed:', e.message);
+      }
+      console.warn(
+        `X follow job ${job.social_account_id} soft-skip ${failureClass} until ${soft.until.toISOString()}` +
+          (soft.proxy_rotated ? ' (sticky rotated)' : '')
+      );
+      return soft;
+    }
 
     if (failureClass === 'session_dead') {
       try {

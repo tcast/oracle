@@ -102,9 +102,11 @@ class OxylabsStickyService {
 
   /**
    * Create or refresh a sticky Oxylabs proxy for one account and bind 1:1.
+   * @param {number} accountId
+   * @param {{ replace?: boolean, sessid?: string }} [opts]
    * @returns {{ proxyId, created, updated, assigned }}
    */
-  async ensureStickyForAccount(accountId, { replace = false } = {}) {
+  async ensureStickyForAccount(accountId, { replace = false, sessid = null, rotateMeta = null } = {}) {
     const creds = await this.resolveCredentials();
     if (!creds.username || !creds.password) {
       const err = new Error('Oxylabs credentials missing (OXYLABS_USERNAME/PASSWORD)');
@@ -119,10 +121,10 @@ class OxylabsStickyService {
     if (!acct.rows[0]) throw new Error(`account ${accountId} not found`);
 
     const { username: acctName, platform } = acct.rows[0];
-    const sessid = `acct${accountId}`;
+    const stickyId = sessid || `acct${accountId}`;
     const server = `${creds.host}:${creds.port}`;
-    const proxyUsername = buildUsername(creds.username, creds.country, sessid, creds.sesstime);
-    const name = `Oxylabs ${creds.country} sticky ${sessid}`;
+    const proxyUsername = buildUsername(creds.username, creds.country, stickyId, creds.sesstime);
+    const name = `Oxylabs ${creds.country} sticky ${stickyId}`;
 
     const existing = await pool.query(
       `SELECT id FROM proxies WHERE provider = $1 AND username = $2 AND server = $3 LIMIT 1`,
@@ -133,7 +135,7 @@ class OxylabsStickyService {
       provider: PROVIDER,
       product: 'residential',
       sticky: true,
-      sessid,
+      sessid: stickyId,
       sesstime_min: creds.sesstime,
       country: creds.country,
       host: creds.host,
@@ -141,6 +143,7 @@ class OxylabsStickyService {
       bound_account_id: accountId,
       bound_platform: platform,
       minted_on_demand: true,
+      ...(rotateMeta && typeof rotateMeta === 'object' ? rotateMeta : {}),
     };
 
     let proxyId;
@@ -192,6 +195,59 @@ class OxylabsStickyService {
       account: acctName,
       platform,
     };
+  }
+
+  /**
+   * Mint a NEW Oxylabs sticky sessid for an X account (exit IP rotation).
+   * Cap: one rotate per account per calendar day for a given failure_class.
+   * Does not re-login — only rebinds proxy for the next soft-skip window.
+   * Daily-cap marker lives on proxies.metadata (social_accounts has no metadata col).
+   */
+  async rotateStickyForAccount(accountId, { failureClass = 'proxy_error' } = {}) {
+    const dayKey = new Date().toISOString().slice(0, 10);
+
+    const acct = await pool.query(
+      `SELECT id, platform, username FROM social_accounts WHERE id = $1`,
+      [accountId]
+    );
+    const row = acct.rows[0];
+    if (!row) throw new Error(`account ${accountId} not found`);
+    const plat = String(row.platform || '').toLowerCase();
+    if (plat !== 'x' && plat !== 'twitter') {
+      return { rotated: false, reason: 'not_x' };
+    }
+
+    const already = await pool.query(
+      `SELECT p.id
+       FROM proxies p
+       JOIN social_account_proxies sap ON sap.proxy_id = p.id
+       WHERE sap.social_account_id = $1
+         AND p.metadata->>'rotate_day' = $2
+         AND p.metadata->>'rotate_failure_class' = $3
+       LIMIT 1`,
+      [accountId, dayKey, failureClass]
+    );
+    if (already.rows[0]) {
+      return { rotated: false, reason: 'daily_cap', day: dayKey, failureClass };
+    }
+
+    const suffix = `${dayKey.replace(/-/g, '')}${Math.floor(Math.random() * 90 + 10)}`;
+    const sessid = `acct${accountId}r${suffix}`.slice(0, 64);
+    const result = await this.ensureStickyForAccount(accountId, {
+      replace: true,
+      sessid,
+      rotateMeta: {
+        rotate_day: dayKey,
+        rotate_failure_class: failureClass,
+        rotated_at: new Date().toISOString(),
+        rotated_from: failureClass,
+      },
+    });
+
+    console.warn(
+      `Oxylabs sticky rotated account=${accountId} (@${row.username}) sessid=${sessid} class=${failureClass}`
+    );
+    return { rotated: true, ...result, sessid, failureClass, day: dayKey };
   }
 
   /**
