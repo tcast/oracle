@@ -22,7 +22,8 @@ function classifyFailure(message = '') {
   if (
     /err_http_response_code_failure|err_tunnel_connection_failed|err_ssl_protocol_error|err_connection_reset|err_connection_closed|err_connection_refused|err_connection_aborted/i.test(
       msg
-    )
+    ) ||
+    /connect tunnel failed|tunnel failed.*\b40[0-9]\b|\b407\b.*proxy|proxy.*\b407\b/i.test(msg)
   ) {
     return 'tunnel_flake';
   }
