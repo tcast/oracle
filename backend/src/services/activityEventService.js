@@ -131,16 +131,21 @@ class ActivityEventService {
       const result = normalizeResult(event.result);
       const meta = event.meta && typeof event.meta === 'object' ? event.meta : {};
       const occurredAt = event.occurred_at ? new Date(event.occurred_at) : new Date();
+      const source = event.source || null;
+      const sourceId = event.source_id != null ? Number(event.source_id) : null;
+
+      if (source && sourceId != null) {
+        const existing = await pool.query(
+          `SELECT id FROM activity_events WHERE source = $1 AND source_id = $2 LIMIT 1`,
+          [source, sourceId]
+        );
+        if (existing.rows.length) return null;
+      }
 
       const inserted = await pool.query(
         `INSERT INTO activity_events
            (occurred_at, platform, action, account_id, username, result, link, detail, meta, source, source_id)
-         SELECT $1::timestamptz, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11
-         WHERE $10::text IS NULL OR $11::bigint IS NULL
-            OR NOT EXISTS (
-              SELECT 1 FROM activity_events ae
-              WHERE ae.source = $10 AND ae.source_id = $11
-            )
+         VALUES ($1::timestamptz, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11)
          RETURNING *`,
         [
           occurredAt.toISOString(),
@@ -152,12 +157,13 @@ class ActivityEventService {
           event.link || null,
           event.detail ? String(event.detail).slice(0, 2000) : null,
           JSON.stringify(meta),
-          event.source || null,
-          event.source_id != null ? Number(event.source_id) : null,
+          source,
+          sourceId,
         ]
       );
       return inserted.rows[0] || null;
     } catch (err) {
+      if (/duplicate key|unique constraint/i.test(err.message || '')) return null;
       console.warn('activityEvent log failed:', err.message);
       return null;
     }
