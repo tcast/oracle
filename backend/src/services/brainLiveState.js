@@ -170,6 +170,12 @@ class BrainLiveState extends EventEmitter {
     this.inFlight.delete(slot);
     this._pushRecent(evt);
     this.publish('action_end', { event: evt, action: { ...evt, status: 'done' } });
+    try {
+      const activityEventService = require('./activityEventService');
+      activityEventService.logBrainEvent({ ...evt, link: action.link || null }).catch(() => {});
+    } catch (_) {
+      /* activity log must never break brain */
+    }
     return evt;
   }
 

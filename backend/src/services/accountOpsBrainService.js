@@ -972,6 +972,7 @@ class AccountOpsBrainService {
           status: cls.status,
           reason: cls.reason,
           ms: out.ms,
+          link: `https://x.com/${account.username}`,
         });
         return out;
       }
@@ -1033,6 +1034,15 @@ class AccountOpsBrainService {
         status: cls.status,
         reason: cls.reason,
         ms: out.ms,
+        link:
+          out.link ||
+          out.comment?.post_url ||
+          out.thread?.post_url ||
+          (out.handle && platform === 'x' ? `https://x.com/${out.handle}` : null) ||
+          (out.handle && platform === 'reddit'
+            ? `https://www.reddit.com/user/${out.handle}/`
+            : null) ||
+          null,
       });
       return out;
     } catch (err) {

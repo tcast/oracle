@@ -530,14 +530,15 @@ class LinkedInFollowService {
           ? 'pending'
           : 'followed';
 
-      await pool.query(
+      const insertedFollow = await pool.query(
         `INSERT INTO linkedin_follows
            (social_account_id, proxy_id, handle, category, status, profile_url)
          VALUES ($1,$2,$3,$4,$5,$6)
          ON CONFLICT (social_account_id, handle) DO UPDATE
            SET status = EXCLUDED.status,
                proxy_id = EXCLUDED.proxy_id,
-               error = NULL`,
+               error = NULL
+         RETURNING *`,
         [account.id, proxies[0].id, target.handle, target.category, status, followResult.profileUrl || profileUrl]
       );
 
@@ -557,6 +558,23 @@ class LinkedInFollowService {
         [job.id, followsToday, next]
       );
 
+      const followRow = insertedFollow.rows[0];
+      const followLink = followResult.profileUrl || profileUrl;
+      try {
+        const activityEventService = require('./activityEventService');
+        activityEventService
+          .logFollow({
+            account,
+            platform: 'linkedin',
+            row: followRow,
+            handle: target.handle,
+            profileUrl: followLink,
+          })
+          .catch(() => {});
+      } catch (_) {
+        /* ignore */
+      }
+
       return {
         success: true,
         accountId: account.id,
@@ -565,6 +583,7 @@ class LinkedInFollowService {
         status,
         followsToday,
         nextDue: next,
+        link: followLink,
       };
     } catch (error) {
       const msg = error.message || String(error);

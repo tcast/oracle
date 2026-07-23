@@ -409,6 +409,22 @@ Write only the comment text.`;
       [accountId]
     );
     console.warn(`Account ${accountId} marked session_dead — ${msg.slice(0, 120)}`);
+    try {
+      const acct = await pool.query('SELECT id, username, platform FROM social_accounts WHERE id = $1', [accountId]);
+      const row = acct.rows[0];
+      const activityEventService = require('./activityEventService');
+      activityEventService
+        .logAccountStatus({
+          accountId,
+          username: row?.username,
+          platform: row?.platform,
+          action: 'session_dead',
+          detail: msg.slice(0, 500),
+        })
+        .catch(() => {});
+    } catch (_) {
+      /* ignore */
+    }
     return { accountId, status: 'inactive', failureClass: 'session_dead' };
   }
 
@@ -452,6 +468,22 @@ Write only the comment text.`;
       [accountId]
     );
     console.warn(`Account ${accountId} marked banned — ${msg.slice(0, 120)}`);
+    try {
+      const acct = await pool.query('SELECT id, username, platform FROM social_accounts WHERE id = $1', [accountId]);
+      const row = acct.rows[0];
+      const activityEventService = require('./activityEventService');
+      activityEventService
+        .logAccountStatus({
+          accountId,
+          username: row?.username,
+          platform: row?.platform,
+          action: 'banned',
+          detail: msg.slice(0, 500),
+        })
+        .catch(() => {});
+    } catch (_) {
+      /* ignore */
+    }
     return { accountId, status: 'banned', failureClass: 'banned' };
   }
 
@@ -757,12 +789,26 @@ Write only the comment text.`;
       );
       settled = true;
 
+      try {
+        const activityEventService = require('./activityEventService');
+        activityEventService
+          .logOrganicComment({
+            account,
+            comment: inserted.rows[0],
+            platform,
+          })
+          .catch(() => {});
+      } catch (_) {
+        /* ignore */
+      }
+
       return {
         success: true,
         comment: inserted.rows[0],
         thread,
         comments_today: commentsToday,
         next_due_at: next,
+        link: inserted.rows[0]?.post_url || thread?.post_url || null,
       };
     } catch (error) {
       const msg = error.message || String(error);

@@ -32,6 +32,7 @@ const accountStatsRouter = require('./routes/accountStats');
 const nocRouter = require('./routes/noc');
 const opsRouter = require('./routes/ops');
 const brainRouter = require('./routes/brain');
+const activityRouter = require('./routes/activity');
 const commentingService = require('./services/commentingService');
 const playwrightService = require('./services/playwrightService');
 const subredditService = require('./services/subredditService');
@@ -1177,6 +1178,7 @@ app.use('/api/account-stats', accountStatsRouter);
 app.use('/api/noc', nocRouter);
 app.use('/api/ops', opsRouter);
 app.use('/api/brain', brainRouter);
+app.use('/api/activity', activityRouter);
 app.use('/api/email-accounts', emailAccountsRouter);
 app.use('/api/campaign-builder', campaignBuilderRouter);
 

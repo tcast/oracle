@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import CreateAccountsForm from './CreateAccountsForm';
 import ImportAccountsForm from './ImportAccountsForm';
 import OrganicCommentsPanel from './OrganicCommentsPanel';
+import ActivityLogPanel from './ActivityLogPanel';
 import CapacityAlerts from './CapacityAlerts';
 import api from '../utils/api';
 
@@ -487,9 +488,7 @@ const SocialAccounts = () => {
         <OrganicCommentsPanel showControls showSchedule showLog={false} />
       )}
 
-      {tab === 'log' && (
-        <OrganicCommentsPanel showControls={false} showSchedule={false} showLog />
-      )}
+      {tab === 'log' && <ActivityLogPanel />}
 
       {tab === 'users' && (
         <>
