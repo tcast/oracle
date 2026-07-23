@@ -6,9 +6,10 @@
  * open a browser, log in, or touch LinkedIn in any way. First login is handled
  * separately, gently, by build-linkedin-fresh.js.
  *
- * Line format (colon-separated):
+ * Line formats (colon-separated; password may contain ':'):
  *   email:password:totp_secret
- * (password may itself contain ':'; email is the first field, totp the last.)
+ *   email:linkedin_password:email_password
+ * Last field is treated as TOTP when it looks like base32; otherwise email_password.
  *
  * Proxies: bound 1:1 from the same pool existing LinkedIn accounts already use
  * (ProxyBase residential US) — never the X Oxylabs pool. Only fresh, unassigned,
@@ -21,7 +22,7 @@ require('dotenv').config();
 const fs = require('fs');
 const pool = require('../services/db');
 const proxyService = require('../services/proxyService');
-const { assertImportCredentials } = require('../utils/credentialGate');
+const { assertImportCredentials, isBase32Totp } = require('../utils/credentialGate');
 
 const PROXY_PROVIDER = process.env.LINKEDIN_PROXY_PROVIDER || 'ProxyBase';
 const BATCH_TAG = process.env.LINKEDIN_IMPORT_BATCH || '2026-07-22';
@@ -31,15 +32,26 @@ function parseLine(line) {
   if (!raw || raw.startsWith('#')) return null;
   const parts = raw.split(':');
   if (parts.length < 3) {
-    throw new Error(`Expected email:password:totp_secret, got ${parts.length} fields`);
+    throw new Error(`Expected email:password:totp_or_email_password, got ${parts.length} fields`);
   }
   const email = parts[0].trim();
-  const totp_secret = parts[parts.length - 1].trim();
+  const last = parts[parts.length - 1].trim();
   const password = parts.slice(1, parts.length - 1).join(':');
   if (!/@/.test(email)) throw new Error(`Invalid email: ${email}`);
-  const row = { email, password, totp_secret };
-  const gate = assertImportCredentials(row, { requireTotp: true, preferEmailAccess: true });
-  row.totp_secret = gate.totp_secret; // normalized base32
+
+  if (isBase32Totp(last)) {
+    const row = { email, password, totp_secret: last };
+    const gate = assertImportCredentials(row, { requireTotp: true, preferEmailAccess: true });
+    row.totp_secret = gate.totp_secret; // normalized base32
+    return row;
+  }
+
+  const row = { email, password, email_password: last };
+  assertImportCredentials(row, {
+    requireTotp: false,
+    requireEmailPassword: true,
+    preferEmailAccess: true,
+  });
   return row;
 }
 
@@ -71,10 +83,11 @@ async function upsertAccount(row) {
   const credentials = {
     password: row.password,
     email: row.email,
-    totp_secret: row.totp_secret,
     source: 'manual_import',
     import_batch: BATCH_TAG,
   };
+  if (row.totp_secret) credentials.totp_secret = row.totp_secret;
+  if (row.email_password) credentials.email_password = row.email_password;
 
   const existing = await pool.query(
     `SELECT id, credentials FROM social_accounts

@@ -5,6 +5,7 @@ const proxyService = require('./proxyService');
 const { buildStickyProfile } = require('./deviceProfiles');
 const { classifyFailure } = require('./failureClassifier');
 const { generateTotp, totpSecondsRemaining } = require('../utils/totp');
+const emailInboxService = require('./emailInboxService');
 
 chromium.use(stealth);
 
@@ -2188,6 +2189,92 @@ class PlaywrightService {
     return true;
   }
 
+  /**
+   * LinkedIn email OTP when we have inbox password but no authenticator secret.
+   * Inline Outlook/Hotmail via emailInboxService (IMAP → Outlook web fallback).
+   */
+  async submitLinkedInEmailCode(page, loginId, extras = {}) {
+    const email = extras.email || loginId;
+    const emailPassword = extras.emailPassword;
+    if (!email || !emailPassword) return false;
+
+    // Prefer email delivery over app-push when LinkedIn offers a switcher.
+    await page
+      .evaluate(() => {
+        const candidates = [...document.querySelectorAll('a, button, [role="button"], span, label')];
+        const link = candidates.find((el) =>
+          /email|send (a )?code|verify (with|via) email|get a code by email/i.test(
+            (el.innerText || el.textContent || '').trim()
+          )
+        );
+        if (link) link.click();
+      })
+      .catch(() => {});
+    await this.humanLikeDelay(2000, 3500);
+
+    const afterDate = new Date(Date.now() - 2 * 60 * 1000);
+    const provider = /hotmail/i.test(email)
+      ? 'hotmail'
+      : /outlook|live\./i.test(email)
+        ? 'outlook'
+        : null;
+    const inboxAccount = {
+      email,
+      password: emailPassword,
+      provider,
+      metadata: {},
+      status: 'active',
+    };
+
+    console.log(`LinkedIn email-code challenge for ${loginId} — polling inbox`);
+    const verified = await emailInboxService.pollForVerification(inboxAccount, {
+      timeoutMs: 120000,
+      intervalMs: 8000,
+      afterDate,
+      fromIncludes: ['linkedin'],
+      subjectIncludes: ['linkedin', 'verification', 'confirm', 'code', 'security'],
+      limit: 12,
+    });
+    const code = verified?.code || verified?.codes?.[0];
+    if (!code || !/^\d{4,8}$/.test(String(code))) {
+      throw new Error(`no LinkedIn email code found (scanned=${verified?.scanned || 0})`);
+    }
+
+    let pinInput = await page
+      .waitForSelector(
+        'input[name="pin"], input#input__phone_verification_pin, input[id*="pin" i], input[autocomplete="one-time-code"], input[type="tel"], input[inputmode="numeric"]',
+        { timeout: 15000, state: 'visible' }
+      )
+      .catch(() => null);
+    if (!pinInput) {
+      const handles = await page.$$('input[type="text"], input[type="tel"], input[type="number"]');
+      for (const h of handles) {
+        if (await h.isVisible().catch(() => false)) {
+          pinInput = h;
+          break;
+        }
+      }
+    }
+    if (!pinInput) throw new Error('LinkedIn email-code input missing');
+
+    console.log(`LinkedIn email-code for ${loginId} — submitting ${String(code).length}-digit code`);
+    await pinInput.click({ force: true });
+    await pinInput.fill('');
+    await pinInput.type(String(code), { delay: 60 });
+    await this.humanLikeDelay(400, 900);
+    await page.evaluate(() => {
+      const buttons = [...document.querySelectorAll('button, [role="button"]')];
+      const match = buttons.find((b) =>
+        /^(Submit|Continue|Next|Verify|Confirm|Sign in)$/i.test((b.innerText || '').trim())
+      );
+      if (match) match.click();
+      else document.querySelector('button[type="submit"]')?.click();
+    });
+    await this.humanLikeDelay(3000, 5000);
+    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+    return true;
+  }
+
   async linkedInLogin(page, email, password, extras = {}) {
     const loginId = email || 'unknown';
     try {
@@ -2462,8 +2549,20 @@ class PlaywrightService {
           totpResult = await submitTotpOnce();
         }
         await page.screenshot({ path: `/tmp/linkedin-post-totp-${loginId}-${Date.now()}.png` }).catch(() => {});
+      } else if (
+        (challenge.pin || challenge.totp || challenge.appPush || challenge.challengeDialog) &&
+        extras.emailPassword
+      ) {
+        const emailOk = await this.submitLinkedInEmailCode(page, loginId, extras).catch((e) => {
+          console.warn(`LinkedIn email-code path failed for ${loginId}: ${e.message}`);
+          return false;
+        });
+        if (!emailOk) {
+          await page.screenshot({ path: `/tmp/linkedin-email-code-fail-${Date.now()}.png` }).catch(() => {});
+          return false;
+        }
       } else if (challenge.pin || challenge.totp || challenge.appPush || challenge.challengeDialog) {
-        console.log(`LinkedIn challenge without TOTP secret for ${loginId}: ${challenge.snippet}`);
+        console.log(`LinkedIn challenge without TOTP/email password for ${loginId}: ${challenge.snippet}`);
         await page.screenshot({ path: `/tmp/linkedin-challenge-${Date.now()}.png` }).catch(() => {});
         return false;
       }
@@ -8634,6 +8733,7 @@ class PlaywrightService {
       const extras = {
         totpSecret: creds.totp_secret || creds.totp || creds.twofa,
         emailPassword: creds.email_password,
+        email: creds.email || account.email || loginEmail,
         profileUrl: creds.profile_url,
       };
 
