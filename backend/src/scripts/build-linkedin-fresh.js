@@ -39,7 +39,7 @@ const X_PHOTO_DIR = process.env.X_PHOTO_DIR || path.join(__dirname, '../../priva
 const LI_BANNER_DIR = process.env.LINKEDIN_BANNER_DIR || path.join(__dirname, '../../private/linkedin-banners');
 const X_BANNER_DIR = process.env.X_BANNER_DIR || path.join(__dirname, '../../private/x-banners');
 
-const TITLES = [
+const HIRING_TITLES = [
   ['Talent Acquisition Specialist', 'Talent Acquisition | Screening beyond the resume'],
   ['Technical Recruiter', 'Technical Recruiter | Real signal over keyword-perfect resumes'],
   ['People Operations Specialist', 'People Ops | Hiring processes candidates actually finish'],
@@ -49,15 +49,36 @@ const TITLES = [
   ['Talent Sourcer', 'Talent Sourcer | From Easy Apply noise to real shortlists'],
   ['Recruiting Operations Specialist', 'RecOps | Systems that make TA teams faster'],
 ];
-const COMPANIES = [
+const HIRING_COMPANIES = [
   'Northline Talent', 'BrightPath People', 'Harbor & Co. Recruiting',
   'Summit Staff Partners', 'Clearview People Ops', 'Cedarline Talent Group',
 ];
-const ABOUTS = [
+const HIRING_ABOUTS = [
   `I help hiring teams move faster without lowering the bar. Most of my week is turning noisy applicant pools into a short list worth a live conversation.\n\nLately I've leaned on async video screening so candidates can show how they think before we burn calendar time.`,
   `Recruiting in 2026 means every resume looks "perfect." I focus on communication, problem-solving, and real evidence of skill — not keyword stuffing.\n\nStructured pre-screens (video + scored responses) help hiring managers only meet people who can explain their work.`,
   `I design hiring workflows candidates complete and recruiters trust. Clear steps, less back-and-forth, better interviews.\n\nBig believer in async pre-screens so we stop guessing from resumes.`,
   `I run TA for growing teams that can't afford weeks of resume theater. Goal is simple: fewer, better interviews.\n\nWe screen with structured journeys so the strongest candidates rise first.`,
+];
+
+const TECH_TITLES = [
+  ['Software Engineer', 'Software Engineer | Shipping reliable products, not slideware'],
+  ['Full-Stack Developer', 'Full-Stack Developer | APIs, UIs, and the glue in between'],
+  ['Backend Engineer', 'Backend Engineer | Systems that stay up when traffic spikes'],
+  ['Founder', 'Founder | Building useful tools for operators who move fast'],
+  ['Product Engineer', 'Product Engineer | From messy requirements to something people use'],
+  ['Engineering Manager', 'Engineering Manager | Small teams, clear ownership, fewer meetings'],
+  ['DevOps Engineer', 'DevOps | CI/CD and infra that developers do not hate'],
+  ['Indie Hacker', 'Indie Hacker | Shipping small products, learning in public'],
+];
+const TECH_COMPANIES = [
+  'Harborline Systems', 'Northbeam Labs', 'Clearstack Software',
+  'Summit Forge', 'Brightline Apps', 'Cedarcode Studio',
+];
+const TECH_ABOUTS = [
+  `I build software for teams that need it to work on Monday, not someday. Comfortable across the stack, strongest when the problem is messy and the feedback loop is short.\n\nCurrently deep in product engineering — shipping features, fixing the boring reliability stuff, and keeping deploys boring.`,
+  `Engineer / builder. I like turning half-specified ideas into working tools. Backend-heavy with enough frontend to ship end-to-end.\n\nLately focused on practical systems: auth, data pipelines, and admin surfaces operators actually use.`,
+  `I start and ship small products. Less pitch decks, more working demos. Background in software engineering; now spending more time on founding and early product.\n\nIf it helps a real workflow, I want to build it.`,
+  `Technical founder energy, engineer habits. I write code, talk to users, and cut scope until something ships.\n\nInterested in tools for hiring, ops, and teams that outgrow spreadsheets.`,
 ];
 
 function humanName(email) {
@@ -67,11 +88,27 @@ function humanName(email) {
   return handle.charAt(0).toUpperCase() + handle.slice(1);
 }
 
-function personaFor(accountId, email) {
-  const [title, headline] = TITLES[accountId % TITLES.length];
-  const company = COMPANIES[(accountId + 1) % COMPANIES.length];
-  const about = ABOUTS[accountId % ABOUTS.length];
-  return { name: humanName(email), title, headline, company, about };
+function personaLaneFrom(account) {
+  const creds =
+    account?.credentials && typeof account.credentials === 'object'
+      ? account.credentials
+      : {};
+  const lane = String(creds.persona_lane || creds.lane || 'hiring').toLowerCase();
+  if (/tech|developer|engineer|founder|entrepreneur/.test(lane)) return 'tech';
+  return 'hiring';
+}
+
+function personaFor(account) {
+  const accountId = account.id;
+  const email = account.email;
+  const lane = personaLaneFrom(account);
+  const titles = lane === 'tech' ? TECH_TITLES : HIRING_TITLES;
+  const companies = lane === 'tech' ? TECH_COMPANIES : HIRING_COMPANIES;
+  const abouts = lane === 'tech' ? TECH_ABOUTS : HIRING_ABOUTS;
+  const [title, headline] = titles[accountId % titles.length];
+  const company = companies[(accountId + 1) % companies.length];
+  const about = abouts[accountId % abouts.length];
+  return { name: humanName(email), title, headline, company, about, lane };
 }
 
 function findPortrait(username) {
@@ -138,7 +175,7 @@ async function markBlocked(accountId, classification, message) {
 async function selectAccounts({ ids, limit, batch }) {
   if (ids && ids.length) {
     const { rows } = await pool.query(
-      `SELECT id, email, username, warmup_status, profile_enrichment
+      `SELECT id, email, username, warmup_status, profile_enrichment, credentials
        FROM social_accounts
        WHERE platform = 'linkedin' AND id = ANY($1::int[])
        ORDER BY id`,
@@ -148,7 +185,7 @@ async function selectAccounts({ ids, limit, batch }) {
   }
   // Fresh, proxied, not yet logged in / not blocked.
   const { rows } = await pool.query(
-    `SELECT sa.id, sa.email, sa.username, sa.warmup_status, sa.profile_enrichment
+    `SELECT sa.id, sa.email, sa.username, sa.warmup_status, sa.profile_enrichment, sa.credentials
      FROM social_accounts sa
      WHERE sa.platform = 'linkedin'
        AND sa.credentials->>'import_batch' = $1
@@ -235,11 +272,41 @@ async function main() {
     // Clean login.
     let profileResult = null;
     if (opts.profile) {
-      const persona = personaFor(acct.id, acct.email);
-      console.log(`profile: building ${persona.title} @ ${persona.company}`);
+      const persona = personaFor(acct);
+      console.log(`profile: building [${persona.lane}] ${persona.title} @ ${persona.company}`);
       profileResult = await playwrightService.updateLinkedInHiringPersona(acct.id, persona, { requireProxy: true })
         .catch((e) => ({ success: false, error: e.message }));
       console.log(`profile: ${JSON.stringify({ ok: profileResult.success, steps: profileResult.steps, err: (profileResult.error || '').slice(0, 60) })}`);
+      if (profileResult?.success) {
+        await pool.query(
+          `UPDATE social_accounts
+           SET credentials = jsonb_set(
+                 COALESCE(credentials, '{}'::jsonb),
+                 '{hiring_persona}',
+                 $2::jsonb,
+                 true
+               ),
+               persona_traits = COALESCE(persona_traits, '{}'::jsonb) || $3::jsonb,
+               updated_at = NOW()
+           WHERE id = $1`,
+          [
+            acct.id,
+            JSON.stringify({
+              title: persona.title,
+              headline: persona.headline,
+              company: persona.company,
+              lane: persona.lane,
+            }),
+            JSON.stringify({
+              lane: persona.lane,
+              expertise:
+                persona.lane === 'tech'
+                  ? ['software engineering', 'product', 'startups', 'developers']
+                  : ['recruiting', 'talent acquisition', 'hiring', 'HR'],
+            }),
+          ]
+        ).catch(() => {});
+      }
 
       // Re-read enrichment to decide photo/banner.
       const enr = (await pool.query(`SELECT profile_enrichment FROM social_accounts WHERE id=$1`, [acct.id])).rows[0]?.profile_enrichment || {};

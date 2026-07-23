@@ -179,7 +179,13 @@ class LinkedInFollowService {
   }
 
   getDiscoveryKeywords(account) {
-    const keywords = ['recruiter', 'talent acquisition', 'HR', 'hiring manager'];
+    const creds =
+      account.credentials && typeof account.credentials === 'object' ? account.credentials : {};
+    const lane = String(creds.persona_lane || creds.lane || '').toLowerCase();
+    const tech = /tech|developer|engineer|founder|entrepreneur/.test(lane);
+    const keywords = tech
+      ? ['software engineer', 'developer', 'founder', 'CTO', 'product engineer', 'startup']
+      : ['recruiter', 'talent acquisition', 'HR', 'hiring manager'];
     let traits = account.persona_traits;
     if (typeof traits === 'string') {
       try {
@@ -192,8 +198,6 @@ class LinkedInFollowService {
     for (const exp of Array.isArray(traits.expertise) ? traits.expertise : []) {
       keywords.push(String(exp));
     }
-    const creds =
-      account.credentials && typeof account.credentials === 'object' ? account.credentials : {};
     const hp = creds.hiring_persona && typeof creds.hiring_persona === 'object' ? creds.hiring_persona : {};
     if (hp.headline) keywords.push(String(hp.headline).split('|')[0].trim());
     if (hp.title) keywords.push(String(hp.title));
