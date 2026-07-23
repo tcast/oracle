@@ -6,34 +6,66 @@
  * open a browser, log in, or touch LinkedIn in any way. First login is handled
  * separately, gently, by build-linkedin-fresh.js.
  *
- * Line formats (colon-separated; password may contain ':'):
+ * Line formats (colon-separated):
+ *   email:li_password:email_password:totp_secret:https://www.linkedin.com/in/...
  *   email:password:totp_secret
  *   email:linkedin_password:email_password
- * Last field is treated as TOTP when it looks like base32; otherwise email_password.
  *
- * Proxies: bound 1:1 from the same pool existing LinkedIn accounts already use
- * (ProxyBase residential US) — never the X Oxylabs pool. Only fresh, unassigned,
- * healthy proxies are used; burned accounts' proxies are left alone.
+ * Proxies: default Oxylabs sticky residential (1:1 sessid per account). Override
+ * with LINKEDIN_PROXY_PROVIDER=ProxyBase to bind from the free ProxyBase pool.
  *
  * Usage (in container):
- *   node src/scripts/import-linkedin-fresh-batch.js /app/private/linkedin-accounts-2026-07-22.txt
+ *   LINKEDIN_IMPORT_BATCH=... node src/scripts/import-linkedin-fresh-batch.js /app/private/...
  */
 require('dotenv').config();
 const fs = require('fs');
 const pool = require('../services/db');
 const proxyService = require('../services/proxyService');
+const oxylabsStickyService = require('../services/oxylabsStickyService');
 const { assertImportCredentials, isBase32Totp } = require('../utils/credentialGate');
 
-const PROXY_PROVIDER = process.env.LINKEDIN_PROXY_PROVIDER || 'ProxyBase';
+const PROXY_PROVIDER = process.env.LINKEDIN_PROXY_PROVIDER || 'Oxylabs';
 const BATCH_TAG = process.env.LINKEDIN_IMPORT_BATCH || '2026-07-22';
+
+function slugFromProfile(url) {
+  const m = String(url || '').match(/linkedin\.com\/in\/([^\/?#]+)/i);
+  return m ? decodeURIComponent(m[1]) : null;
+}
 
 function parseLine(line) {
   const raw = String(line || '').trim();
   if (!raw || raw.startsWith('#')) return null;
   const parts = raw.split(':');
   if (parts.length < 3) {
-    throw new Error(`Expected email:password:totp_or_email_password, got ${parts.length} fields`);
+    throw new Error(`Expected email:password:…, got ${parts.length} fields`);
   }
+
+  // Vendor dump: email:li_pass:email_pass:totp:https://linkedin.com/in/...
+  const profileJoined = parts.length >= 5 ? parts.slice(4).join(':') : '';
+  if (/linkedin\.com\/in\//i.test(profileJoined)) {
+    const email = parts[0].trim();
+    const password = parts[1];
+    const email_password = parts[2];
+    const totp_secret = parts[3];
+    const profile_url = profileJoined.trim();
+    if (!/@/.test(email)) throw new Error(`Invalid email: ${email}`);
+    const row = {
+      email,
+      password,
+      email_password,
+      totp_secret,
+      profile_url,
+      username: slugFromProfile(profile_url),
+    };
+    const gate = assertImportCredentials(row, {
+      requireTotp: true,
+      requireEmailPassword: true,
+      preferEmailAccess: true,
+    });
+    row.totp_secret = gate.totp_secret;
+    return row;
+  }
+
   const email = parts[0].trim();
   const last = parts[parts.length - 1].trim();
   const password = parts.slice(1, parts.length - 1).join(':');
@@ -79,7 +111,7 @@ async function pickFreshProxyId(client) {
 }
 
 async function upsertAccount(row) {
-  const username = row.email.split('@')[0];
+  const username = row.username || row.email.split('@')[0];
   const credentials = {
     password: row.password,
     email: row.email,
@@ -88,6 +120,7 @@ async function upsertAccount(row) {
   };
   if (row.totp_secret) credentials.totp_secret = row.totp_secret;
   if (row.email_password) credentials.email_password = row.email_password;
+  if (row.profile_url) credentials.profile_url = row.profile_url;
 
   const existing = await pool.query(
     `SELECT id, credentials FROM social_accounts
@@ -130,6 +163,12 @@ async function bindProxyIfMissing(accountId) {
     [accountId]
   );
   if (has.rows.length) return { proxyId: null, already: true };
+
+  // Oxylabs: mint a dedicated sticky sessid (unlimited concurrent; safest for LI/X).
+  if (/^oxylabs$/i.test(PROXY_PROVIDER)) {
+    const minted = await oxylabsStickyService.ensureStickyForAccount(accountId);
+    return { proxyId: minted.proxyId, already: false, oxylabs: true };
+  }
 
   const client = await pool.connect();
   try {

@@ -210,6 +210,14 @@ async function main() {
 
     if (!login.success) {
       const cls = login.classification || 'login_failed';
+      // Tunnel/proxy flakes are soft — do NOT mark the account inactive/blocked.
+      const soft = cls === 'connect_error' || /tunnel_flake|ERR_HTTP_RESPONSE|ERR_TUNNEL|CONNECT tunnel|proxy/i.test(String(login.error || ''));
+      if (soft) {
+        console.warn(`soft-skip #${acct.id}: ${cls} — account left active/pending for later`);
+        results.push({ id: acct.id, email: acct.email, login: false, classification: cls, profile: 'soft_skip' });
+        if (i < accounts.length - 1) await spaceOut(opts.spaceMin);
+        continue;
+      }
       await markBlocked(acct.id, cls, login.error);
       blocks += 1;
       results.push({ id: acct.id, email: acct.email, login: false, classification: cls, profile: null });
