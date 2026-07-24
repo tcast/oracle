@@ -569,6 +569,8 @@ Write only the comment text.`;
     }
 
     // Transient login flakes: quarantine only, do not permanently kill.
+    // After repeated login failures, pause the job so it stops burning tick slots.
+    const pauseLoginLoop = failureClass === 'login_failed' && consecutive >= 5;
 
     await pool.query(
       `UPDATE organic_comment_jobs
@@ -578,10 +580,20 @@ Write only the comment text.`;
            consecutive_failures = $4,
            cooldown_until = $5,
            next_due_at = $5,
-           enabled = CASE WHEN $6 THEN false ELSE enabled END,
+           enabled = CASE WHEN $6 OR $7 THEN false ELSE enabled END,
            updated_at = NOW()
        WHERE id = $1`,
-      [job.id, errorMessage, failureClass, consecutive, until, disable]
+      [
+        job.id,
+        pauseLoginLoop
+          ? `${errorMessage} | paused_after_${consecutive}_login_failures`
+          : errorMessage,
+        failureClass,
+        consecutive,
+        until,
+        disable,
+        pauseLoginLoop,
+      ]
     );
 
     console.warn(

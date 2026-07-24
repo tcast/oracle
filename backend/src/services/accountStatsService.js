@@ -179,6 +179,18 @@ class AccountStatsService {
          VALUES ($1, 'error', $2)`,
         [accountId, error]
       );
+      // Deleted / missing Reddit profile — stop treating it as an active worker.
+      if (/HTTP 404/i.test(String(error))) {
+        try {
+          const organicCommentService = require('./organicCommentService');
+          await organicCommentService.markBannedAccount(
+            accountId,
+            `stats_audit: ${String(error).slice(0, 200)}`
+          );
+        } catch (e) {
+          console.warn(`stats audit ban #${accountId} failed:`, e.message);
+        }
+      }
       return;
     }
 
