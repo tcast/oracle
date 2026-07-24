@@ -38,6 +38,13 @@ function classifyFailure(message = '') {
   ) {
     return 'challenge';
   }
+  // LinkedIn government-ID / identity walls — terminal; never retry-spam.
+  if (
+    /id_verification|government-?id|verify your identity|identity.?verif/i.test(msg) ||
+    /linkedin_id_verification_restricted|id_verification_restricted/i.test(msg)
+  ) {
+    return 'id_verification';
+  }
   // Platform ban / suspension / deleted — terminal, distinct from dead cookies.
   if (
     /account_suspended|account is suspended|has been suspended|account.?banned|\bbanned\b/i.test(msg) ||
@@ -75,6 +82,7 @@ function cooldownHoursFor(failureClass, consecutiveFailures = 1) {
     security_block: 48,
     bad_credentials: 72,
     banned: 8760, // ~1 year — terminal until replaced
+    id_verification: 8760, // ~1 year — terminal until manual review
     session_dead: 8760, // ~1 year — terminal until replaced
     challenge: 24,
     proxy_error: 0.5, // 30m — soft; prefer softSkipMinutes for jitter

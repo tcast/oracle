@@ -354,13 +354,38 @@ class LinkedInFollowService {
     const disable =
       failureClass === 'bad_credentials' ||
       failureClass === 'session_dead' ||
-      failureClass === 'banned';
+      failureClass === 'banned' ||
+      failureClass === 'id_verification';
 
     if (failureClass === 'session_dead') {
       try {
         await organicCommentService.markDeadSessionAccount(job.social_account_id, errorMessage);
       } catch (e) {
         console.warn('LI follow markDeadSession failed:', e.message);
+      }
+    }
+
+    if (failureClass === 'id_verification') {
+      try {
+        await pool.query(
+          `UPDATE social_accounts
+           SET status = 'inactive',
+               warmup_status = 'id_verification_required',
+               credentials = COALESCE(credentials, '{}'::jsonb) || jsonb_build_object(
+                 'login_block', jsonb_build_object(
+                   'at', NOW()::text,
+                   'message', $2::text,
+                   'classification', 'id_verification_required'
+                 ),
+                 'session_dead', 'true',
+                 'session_dead_reason', 'id_verification_on_follow'
+               ),
+               updated_at = NOW()
+           WHERE id = $1`,
+          [job.social_account_id, String(errorMessage || 'id_verification_restricted').slice(0, 300)]
+        );
+      } catch (e) {
+        console.warn('LI follow mark ID-wall failed:', e.message);
       }
     }
 
@@ -557,10 +582,17 @@ class LinkedInFollowService {
              failure_class = NULL,
              cooldown_until = NULL,
              last_error = NULL,
+             last_discover_at = NOW(),
              updated_at = NOW()
          WHERE id = $1`,
         [job.id, followsToday, next]
       );
+      // Keep Social Accounts "last used" honest — connects are real account use.
+      await pool
+        .query(`UPDATE social_accounts SET last_used_at = NOW(), updated_at = NOW() WHERE id = $1`, [
+          account.id,
+        ])
+        .catch(() => {});
 
       const followRow = insertedFollow.rows[0];
       const followLink = followResult.profileUrl || profileUrl;
