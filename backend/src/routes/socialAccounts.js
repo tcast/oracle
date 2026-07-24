@@ -69,6 +69,11 @@ router.get('/', async (req, res) => {
         dislikes_count,
         stats_audited_at,
         stats_audit_error,
+        credentials->>'persona_lane' AS persona_lane,
+        credentials->'hiring_persona'->>'title' AS persona_title,
+        credentials->'hiring_persona'->>'headline' AS persona_headline,
+        credentials->'login_block'->>'classification' AS login_block,
+        credentials->>'profile_url' AS profile_url,
         CASE 
           WHEN credentials->>'password' = 'default_password' THEN true 
           ELSE false 
@@ -81,22 +86,39 @@ router.get('/', async (req, res) => {
     const result = await pool.query(query, params);
 
     // Format the response
+    const { categoryLabel, linkedInCategoryFromCreds } = require('../services/profileEnrichment');
     const accounts = result.rows.map(account => {
       const persona_traits = typeof account.persona_traits === 'string'
         ? JSON.parse(account.persona_traits)
         : account.persona_traits;
-      const profile_enrichment = formatForApi(
+      let profile_enrichment = formatForApi(
         typeof account.profile_enrichment === 'string'
           ? JSON.parse(account.profile_enrichment)
           : account.profile_enrichment
       );
+      // Correct stale LinkedIn HR labels when persona_lane says tech.
+      if (
+        account.platform === 'linkedin' &&
+        account.persona_lane &&
+        (!profile_enrichment.category || profile_enrichment.category === 'hr_talent')
+      ) {
+        const derived = linkedInCategoryFromCreds({
+          persona_lane: account.persona_lane,
+          hiring_persona: { title: account.persona_title, lane: account.persona_lane },
+        });
+        if (derived && derived !== profile_enrichment.category) {
+          profile_enrichment = formatForApi({ ...profile_enrichment, category: derived });
+        }
+      }
       return {
         ...account,
         persona_traits,
         profile_enrichment,
         built_out: profile_enrichment.built_out,
         job_category: profile_enrichment.category,
-        job_category_label: profile_enrichment.category_label,
+        job_category_label:
+          profile_enrichment.category_label ||
+          (account.persona_title ? account.persona_title : null),
       };
     });
 

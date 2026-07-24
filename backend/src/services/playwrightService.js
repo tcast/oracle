@@ -4073,14 +4073,17 @@ class PlaywrightService {
       await page.screenshot({ path: `/tmp/linkedin-persona-about-${accountId}.png` }).catch(() => {});
 
       // Store persona on account credentials for later organic posting
+      const lane = String(persona.lane || creds.persona_lane || 'hiring').toLowerCase();
       const nextCreds = {
         ...creds,
+        persona_lane: lane,
         hiring_persona: {
           headline: persona.headline,
           title: persona.title,
           company: persona.company,
           about: persona.about,
-          product: 'InsightHire',
+          lane,
+          product: lane === 'tech' ? null : 'InsightHire',
           updated_at: new Date().toISOString(),
         },
       };
@@ -4103,7 +4106,10 @@ class PlaywrightService {
         const text = (document.body?.innerText || '').slice(0, 2500);
         return {
           url: location.href,
-          hasHeadlineHint: /Talent|Recruit|People Ops|HR Director|Sourcer|Hiring/i.test(text),
+          hasHeadlineHint:
+            /Talent|Recruit|People Ops|HR Director|Sourcer|Hiring|Software Engineer|Developer|Founder|DevOps|Engineering|Indie Hacker|Product Engineer|Backend|Full-Stack/i.test(
+              text
+            ),
           snippet: text.split('\n').map((l) => l.trim()).filter(Boolean).slice(0, 12).join(' | '),
         };
       }).catch(() => ({}));
@@ -4111,16 +4117,16 @@ class PlaywrightService {
       const success = steps.includes('headline') || steps.includes('about') || snapshot.hasHeadlineHint;
       if (success) {
         try {
-          const { updateEnrichment } = require('./profileEnrichment');
+          const { updateEnrichment, linkedInCategoryFromCreds } = require('./profileEnrichment');
           await updateEnrichment(
             accountId,
             {
               headline: steps.includes('headline') || steps.includes('industry') || !!snapshot.hasHeadlineHint,
               about: steps.includes('about'),
               experience: steps.includes('experience'),
-              category: 'hr_talent',
+              category: linkedInCategoryFromCreds(nextCreds),
             },
-            { source: 'linkedin_hiring_persona' }
+            { source: 'linkedin_persona' }
           );
         } catch (enrichErr) {
           console.warn(`LinkedIn #${accountId}: enrichment update failed:`, enrichErr.message);

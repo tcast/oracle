@@ -107,9 +107,24 @@ const SocialAccounts = () => {
   const columns = COLUMNS_BY_PLATFORM[platformTab] || COLUMNS_BY_PLATFORM.all;
 
   const HIDDEN_STATUSES = new Set(['banned', 'inactive', 'session_dead']);
+  const HIDDEN_WARMUPS = new Set([
+    'id_verification_required',
+    'session_dead',
+    'login_failed',
+    'banned',
+    'failed',
+  ]);
   const visibleAccounts = showBanned
     ? accounts
-    : accounts.filter((a) => !HIDDEN_STATUSES.has(String(a.status || '').toLowerCase()));
+    : accounts.filter((a) => {
+        const st = String(a.status || '').toLowerCase();
+        const warm = String(a.warmup_status || '').toLowerCase();
+        const block = String(a.login_block || '').toLowerCase();
+        if (HIDDEN_STATUSES.has(st)) return false;
+        if (HIDDEN_WARMUPS.has(warm)) return false;
+        if (HIDDEN_WARMUPS.has(block)) return false;
+        return true;
+      });
 
   const knownPlatforms = PLATFORM_ORDER.filter((p) => filterOptions.platforms.includes(p));
   const extraPlatforms = filterOptions.platforms.filter((p) => !PLATFORM_ORDER.includes(p));
@@ -216,10 +231,21 @@ const SocialAccounts = () => {
         ? 'Partial'
         : 'None');
 
-  const categoryDisplay = (account) =>
-    account.job_category_label ||
-    account.profile_enrichment?.category_label ||
-    '—';
+  const categoryDisplay = (account) => {
+    const lane = String(account.persona_lane || '').toLowerCase();
+    const title = account.persona_title || '';
+    const label =
+      account.job_category_label ||
+      account.profile_enrichment?.category_label ||
+      null;
+    if (lane === 'tech' || /tech_/.test(String(account.job_category || ''))) {
+      return title ? `Tech · ${title}` : label || 'Tech';
+    }
+    if (lane === 'hiring' || account.job_category === 'hr_talent') {
+      return title ? `HR · ${title}` : label || 'HR / Talent';
+    }
+    return label || title || '—';
+  };
 
   const usernameLink = (account) => {
     if (account.platform === 'reddit') {
@@ -235,9 +261,11 @@ const SocialAccounts = () => {
       );
     }
     if (account.platform === 'linkedin') {
+      const href =
+        account.profile_url || `https://www.linkedin.com/in/${account.username}/`;
       return (
         <a
-          href={`https://www.linkedin.com/in/${account.username}/`}
+          href={href}
           target="_blank"
           rel="noreferrer"
           className="text-whisper-700 hover:underline"

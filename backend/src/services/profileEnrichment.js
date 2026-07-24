@@ -12,7 +12,22 @@ const pool = require('./db');
 
 const CATEGORY_LABELS = {
   hr_talent: 'HR / Talent',
+  tech_engineering: 'Tech / Engineering',
+  tech_founder: 'Tech / Founder',
 };
+
+function linkedInCategoryFromCreds(creds = {}) {
+  const lane = String(creds.persona_lane || creds.lane || creds.hiring_persona?.lane || '').toLowerCase();
+  const title = String(creds.hiring_persona?.title || '').toLowerCase();
+  const tech =
+    /tech|developer|engineer|founder|entrepreneur/.test(lane) ||
+    /engineer|developer|founder|devops|indie|cto|product engineer/.test(title);
+  if (!tech) return 'hr_talent';
+  if (/founder|indie|entrepreneur/.test(title) || /founder|entrepreneur/.test(lane)) {
+    return 'tech_founder';
+  }
+  return 'tech_engineering';
+}
 
 function emptyEnrichment() {
   return {
@@ -140,7 +155,11 @@ function deriveEnrichment({
       patch.headline = true;
       patch.about = !!(hp.about || hp.headline);
       patch.experience = !!(hp.title || hp.company);
-      patch.category = patch.category || 'hr_talent';
+      // Never default tech personas to HR — lane/title decide category.
+      const derived = linkedInCategoryFromCreds(creds);
+      if (!patch.category || patch.category === 'hr_talent' || derived !== 'hr_talent') {
+        patch.category = derived;
+      }
     }
     if (creds.profile_enrichment?.photo || hasPhotoFile) {
       patch.photo = true;
@@ -189,6 +208,7 @@ module.exports = {
   normalizeEnrichment,
   categoryLabel,
   categoryFromExpertise,
+  linkedInCategoryFromCreds,
   updateEnrichment,
   deriveEnrichment,
   formatForApi,
