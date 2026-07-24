@@ -504,8 +504,13 @@ class RedditFollowService {
         ]
       );
 
-      const followsToday = job.follows_today + 1;
-      const next = this.computeNextDue(settings, followsToday);
+      // "Already following" is a no-op — don't burn the daily connect cap on it.
+      // Re-due soon so the account can try a different target; still one calm session.
+      const isAlready = status === 'already';
+      const followsToday = isAlready ? job.follows_today : job.follows_today + 1;
+      const next = isAlready
+        ? new Date(Date.now() + (12 + Math.floor(Math.random() * 20)) * 60 * 1000)
+        : this.computeNextDue(settings, followsToday);
       await pool.query(
         `UPDATE reddit_follow_jobs
          SET follows_today = $2,
@@ -514,10 +519,10 @@ class RedditFollowService {
              consecutive_failures = 0,
              failure_class = NULL,
              cooldown_until = NULL,
-             last_error = NULL,
+             last_error = $4,
              updated_at = NOW()
          WHERE id = $1`,
-        [job.id, followsToday, next]
+        [job.id, followsToday, next, isAlready ? 'already_following_skipped_cap' : null]
       );
 
       const followRow = insertedFollow.rows[0];
@@ -551,17 +556,24 @@ class RedditFollowService {
     } catch (error) {
       const msg = error.message || String(error);
       if (
-        /err_tunnel|err_timed_out|err_proxy|tunnel_connection|net::err_|proxy|has been closed|Target closed|browser.*closed|Follow button not found/i.test(
+        /err_tunnel|err_timed_out|err_proxy|tunnel_connection|net::err_|proxy|has been closed|Target closed|browser.*closed|Follow button not found|target unavailable/i.test(
           msg
         ) &&
         !/banned|suspended|locked|session_dead|bad_credentials/i.test(msg)
       ) {
-        if (/Follow button not found/i.test(msg)) {
-          await pool.query(
-            `UPDATE reddit_follow_targets SET enabled = false, notes = COALESCE(notes,'') || ' | no_follow_button'
-             WHERE lower(handle) = lower($1)`,
-            [target.handle]
-          ).catch(() => {});
+        if (/Follow button not found|target unavailable/i.test(msg)) {
+          await pool
+            .query(
+              `UPDATE reddit_follow_targets
+               SET enabled = false,
+                   notes = COALESCE(notes,'') || $2
+               WHERE lower(handle) = lower($1)`,
+              [
+                target.handle,
+                /target unavailable/i.test(msg) ? ' | target_unavailable' : ' | no_follow_button',
+              ]
+            )
+            .catch(() => {});
         }
         const soft = await this.softSkipJob(job, msg);
         return { ...soft, accountId: account.id, handle: target.handle };
